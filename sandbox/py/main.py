@@ -45,7 +45,7 @@ def main() -> None:
 
 
             if result.score >= 0:
-                scores.append(result.score)
+                scores.append((t.task_id, result.score))
 
                 style = CLI_GREEN if result.score == 1 else CLI_RED
 
@@ -55,10 +55,15 @@ def main() -> None:
     except ConnectError as e:
         print(f"{e.code}: {e.message}")
 
-    # total score
-    avg_score = sum(scores) / len(scores) * 100.0
+    # print scores as table
+    if scores:
+        for tid, score in scores:
+            style = CLI_GREEN if score == 1 else CLI_RED
+            print(f"{tid}: {style}{score:0.2f}{CLI_CLR}")
 
-    print(f"\nAvg score: {avg_score:.1f}%\n")
+        # print average
+        total = sum([t[1] for t in scores]) / len(scores) * 100.0
+        print(f"FINAL: {total:0.2f}%")
 
 
 if __name__ == "__main__":
