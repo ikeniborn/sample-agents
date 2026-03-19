@@ -3,16 +3,14 @@ name = "bitgn-sandbox-py"
 version = "0.1.0"
 description = "Runnable Python sample for the BitGN sandbox benchmark"
 readme = "README.md"
-requires-python = ">=3.14"
+requires-python = ">=3.12"
 dependencies = [
-    "bitgn-api-connectrpc-python==0.8.1.1.20260316101438+5e72a3f6bebf",
-    "bitgn-api-protocolbuffers-python==34.0.0.1.20260316101438+5e72a3f6bebf",
+    "connect-python>=0.8.1",
+    "protobuf>=4.25.0",
+    "httpx>=0.27.0",
     "openai>=2.26.0",
     "pydantic>=2.12.5",
 ]
-
-[[tool.uv.index]]
-url = "https://buf.build/gen/python"
 
 [tool.uv]
 # AICODE-NOTE: `harness_core/sdk-tests/sdk-python.sh` rewrites the Buf SDK pins

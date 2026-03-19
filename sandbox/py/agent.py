@@ -1,5 +1,7 @@
 import json
+import os
 import time
+from pathlib import Path
 from typing import Annotated, List, Literal, Union
 
 from annotated_types import Ge, Le, MaxLen, MinLen
@@ -19,7 +21,34 @@ from bitgn.vm.mini_pb2 import (
 )
 from connectrpc.errors import ConnectError
 
-client = OpenAI()
+
+def _load_secrets(path: str = ".secrets") -> None:
+    """Load KEY=VALUE pairs from secrets file into os.environ (if not already set)."""
+    secrets_file = Path(path)
+    if not secrets_file.exists():
+        return
+    for line in secrets_file.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        value = value.strip()
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+_load_secrets()
+
+_OPENROUTER_KEY = os.environ.get("OPENROUTER_API_KEY")
+
+if _OPENROUTER_KEY:
+    client = OpenAI(
+        base_url="https://openrouter.ai/api/v1",
+        api_key=_OPENROUTER_KEY,
+    )
+else:
+    client = OpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
 
 class ReportTaskCompletion(BaseModel):
@@ -171,6 +200,7 @@ def run_agent(model: str, harness_url: str, task_text: str):
         )
 
         # now execute the tool by dispatching command to our handler
+        txt = ""
         try:
             result = dispatch(vm, job.function)
             mappe = MessageToDict(result)
@@ -180,6 +210,9 @@ def run_agent(model: str, harness_url: str, task_text: str):
             txt = str(e.message)
             # print to console as ascii red
             print(f"{CLI_RED}ERR {e.code}: {e.message}{CLI_CLR}")
+        except Exception as e:
+            txt = f"error: {e}"
+            print(f"{CLI_RED}ERR: {e}{CLI_CLR}")
 
         # was this the completion?
         if isinstance(job.function, ReportTaskCompletion):

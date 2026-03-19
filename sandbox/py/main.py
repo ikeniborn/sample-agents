@@ -9,7 +9,7 @@ from agent import run_agent
 
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 
-MODEL_ID = "gpt-4.1-2025-04-14"
+MODEL_ID = "nvidia/nemotron-3-super-120b-a12b:free"
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
