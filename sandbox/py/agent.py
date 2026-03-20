@@ -146,7 +146,7 @@ AVAILABLE ACTIONS:
 EXAMPLES:
 {"think":"List ops/ for files","prev_result_ok":true,"action":{"tool":"navigate","action":"list","path":"ops/"}}
 {"think":"Read invoice format","prev_result_ok":true,"action":{"tool":"inspect","action":"read","path":"billing/INV-001.md"}}
-{"think":"Create payment file","prev_result_ok":true,"action":{"tool":"modify","action":"write","path":"billing/PAY-004.md","content":"---\\ntitle: Payment\\namount: 500\\n---"}}
+{"think":"Create payment file copying format from PAY-003.md","prev_result_ok":true,"action":{"tool":"modify","action":"write","path":"billing/PAY-004.md","content":"# Payment PAY-004\\n\\nAmount: 500\\n"}}
 {"think":"Delete completed draft","prev_result_ok":true,"action":{"tool":"modify","action":"delete","path":"drafts/proposal-alpha.md"}}
 {"think":"Task done","prev_result_ok":true,"action":{"tool":"finish","answer":"Created PAY-004.md","refs":["billing/PAY-004.md"],"code":"completed"}}
 {"think":"Read HOME.MD as referenced","prev_result_ok":true,"action":{"tool":"inspect","action":"read","path":"HOME.MD"}}
@@ -242,12 +242,21 @@ def _compact_log(log: list, max_tool_pairs: int = 7, preserve_prefix: int = 6) -
     return log[:preserve_prefix] + [{"role": "user", "content": summary}] + kept
 
 
-def _validate_write(vm: MiniRuntimeClientSync, action: Modify) -> str | None:
+def _validate_write(vm: MiniRuntimeClientSync, action: Modify, read_paths: set[str]) -> str | None:
     """U3: Check if write target matches existing naming patterns in the directory.
     Returns a warning string if mismatch detected, None if OK."""
     if action.action != "write":
         return None
     target_path = action.path
+
+    # ASCII guard: reject paths with non-ASCII chars (model hallucination)
+    if not target_path.isascii():
+        return (
+            f"ERROR: path '{target_path}' contains non-ASCII characters. "
+            f"File paths must use only ASCII letters, digits, hyphens, underscores, dots, slashes. "
+            f"Re-check AGENTS.MD for the correct path and try again."
+        )
+
     # Extract directory
     if "/" in target_path:
         parent_dir = target_path.rsplit("/", 1)[0] + "/"
@@ -265,6 +274,21 @@ def _validate_write(vm: MiniRuntimeClientSync, action: Modify) -> str | None:
         existing_names = [f.get("name", "") for f in files if f.get("name")]
         if not existing_names:
             return None
+
+        # Read-before-write enforcement: ensure agent has read at least one file from this dir
+        dir_norm = parent_dir.rstrip("/")
+        already_read = any(
+            p.startswith(dir_norm + "/") or p.startswith(dir_norm)
+            for p in read_paths
+        )
+        if not already_read:
+            sample = existing_names[0]
+            return (
+                f"WARNING: You are about to write '{target_name}' in '{parent_dir}', "
+                f"but you haven't read any existing file from that folder yet. "
+                f"MANDATORY: first read '{parent_dir}{sample}' to learn the exact format, "
+                f"then retry your write with the same format."
+            )
 
         # Check extension match
         target_ext = Path(target_name).suffix
@@ -768,7 +792,10 @@ def run_agent(model: str, harness_url: str, task_text: str, model_config: dict |
                   "workspace/todos", "workspace/tasks", "workspace/notes", "workspace/work",
                   "my/invoices", "my/todos", "my/tasks", "my/notes",
                   "work/invoices", "work/todos", "work/notes",
-                  "records/todos", "records/tasks", "records/invoices", "records/notes"]
+                  "records/todos", "records/tasks", "records/invoices", "records/notes",
+                  # Staging subdirs: cleanup/done files often live here
+                  "notes/staging", "docs/staging", "workspace/staging", "my/staging",
+                  "work/staging", "archive/staging", "drafts/staging"]
     probed_info = ""
     for pd in probe_dirs:
         if any(pd + "/" == d or pd == d.rstrip("/") for d in all_dirs):
@@ -879,19 +906,47 @@ def run_agent(model: str, harness_url: str, task_text: str, model_config: dict |
         # If no candidates in pre-loaded files, search the whole vault — needed for
         # deeply nested files like notes/staging/ that outline() doesn't reach.
         if not delete_candidates:
-            for pattern in ("Status: done", "Status: completed", "status:done"):
+            for pattern in ("Status: done", "Status: completed", "status:done",
+                            "status: archived", "status: finished", "completed: true",
+                            "- [x]", "DONE", "done"):
                 try:
                     sr = vm.search(SearchRequest(path="/", pattern=pattern, count=5))
                     sd = MessageToDict(sr)
                     for r in (sd.get("results") or sd.get("files") or []):
                         fpath_r = r.get("path", "")
-                        if fpath_r:
+                        if fpath_r and fpath_r not in delete_candidates:
                             delete_candidates.append(fpath_r)
                             print(f"{CLI_GREEN}[pre] delete-search found: {fpath_r}{CLI_CLR}")
                 except Exception:
                     pass
                 if delete_candidates:
                     break
+        # Also search by filename keyword for cleanup/draft files not found by status patterns
+        if not delete_candidates:
+            for keyword in ("cleanup", "clean-up", "draft", "done", "completed"):
+                if keyword in task_lower:
+                    try:
+                        sr = vm.search(SearchRequest(path="/", pattern=keyword, count=10))
+                        sd = MessageToDict(sr)
+                        for r in (sd.get("results") or sd.get("files") or []):
+                            fpath_r = r.get("path", "")
+                            if fpath_r and fpath_r not in delete_candidates:
+                                # Read the file to verify it has a done/completed status
+                                content_check = all_file_contents.get(fpath_r, "")
+                                if not content_check:
+                                    try:
+                                        rr = vm.read(ReadRequest(path=fpath_r))
+                                        content_check = MessageToDict(rr).get("content", "")
+                                    except Exception:
+                                        pass
+                                clower = content_check.lower()
+                                if any(s in clower for s in ("status: done", "status: completed", "done")):
+                                    delete_candidates.append(fpath_r)
+                                    print(f"{CLI_GREEN}[pre] delete-keyword found: {fpath_r}{CLI_CLR}")
+                    except Exception:
+                        pass
+                    if delete_candidates:
+                        break
         if delete_candidates:
             target = delete_candidates[0]
             delete_hint = (
@@ -1080,7 +1135,7 @@ def run_agent(model: str, harness_url: str, task_text: str, model_config: dict |
 
         # --- U3: Pre-write validation ---
         if isinstance(job.action, Modify) and job.action.action == "write":
-            warning = _validate_write(vm, job.action)
+            warning = _validate_write(vm, job.action, auto_refs)
             if warning:
                 print(f"{CLI_YELLOW}{warning}{CLI_CLR}")
                 log.append({"role": "user", "content": warning})
@@ -1173,8 +1228,13 @@ def run_agent(model: str, harness_url: str, task_text: str, model_config: dict |
                     read_parsed = json.loads(txt)
                     read_path = read_parsed.get("path", "")
                     if read_path:
-                        auto_refs.add(read_path)
-                        print(f"{CLI_GREEN}[auto-ref] tracked: {read_path}{CLI_CLR}")
+                        file_stem = Path(read_path).stem.lower()
+                        file_name = Path(read_path).name.lower()
+                        # Only track as ref if the file is mentioned in the task instruction
+                        if file_stem in task_lower or file_name in task_lower:
+                            auto_refs.add(read_path)
+                            print(f"{CLI_GREEN}[auto-ref] tracked: {read_path}{CLI_CLR}")
+                        # else: silently skip non-task-related reads
                 except Exception:
                     pass
 
