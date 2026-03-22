@@ -1632,6 +1632,11 @@ def run_agent(model: str, harness_url: str, task_text: str, model_config: dict |
                     if _f28_m3:
                         _f28_ans = _f28_m3.group(1)
                         print(f"{CLI_GREEN}[FIX-47b] extracted keyword '{_f28_ans}' from redirect target '{agents_md_redirect_target}'{CLI_CLR}")
+                # FIX-28b: If direct_finish_required, use the MISSING-AMOUNT keyword directly
+                if not _f28_ans and direct_finish_required:
+                    _f28_dfr_kw = next((kw for kw in _missing_amount_kws if kw in _agents_txt_fix16), None)
+                    if _f28_dfr_kw:
+                        _f28_ans = _f28_dfr_kw
                 # Always force-finish after 3 intercepts (use extracted keyword or fallback)
                 if not _f28_ans:
                     _f28_ans = "Unable to complete task"
@@ -2356,6 +2361,21 @@ def run_agent(model: str, harness_url: str, task_text: str, model_config: dict |
                     if answer != _f56_kw:
                         print(f"{CLI_YELLOW}[FIX-56] redirect: correcting '{answer[:30]}' → '{_f56_kw}'{CLI_CLR}")
                         answer = _f56_kw
+            # FIX-62: Direct AGENTS.MD keyword answer (no redirect). 2b model ignores AGENTS.MD keyword.
+            # When AGENTS.MD itself says "answer with 'X'" and it's a question task, auto-correct.
+            _f62_triggered = False
+            if (not agents_md_redirect_target and not pre_phase_action_done
+                    and not confirmed_writes and not direct_finish_required):
+                _f62_kw_m = re.search(
+                    r"(?:respond|answer|reply)\s+with\s+['\"]([A-Za-z0-9][A-Za-z0-9 \-_]{0,30})['\"]",
+                    _agents_txt_fix16, re.IGNORECASE
+                )
+                if _f62_kw_m:
+                    _f62_kw = _f62_kw_m.group(1)
+                    if answer != _f62_kw:
+                        print(f"{CLI_YELLOW}[FIX-62] AGENTS.MD keyword: correcting '{answer[:30]}' → '{_f62_kw}'{CLI_CLR}")
+                        answer = _f62_kw
+                    _f62_triggered = True  # refs should be limited to AGENTS.MD only
             # FIX-32: If answer is verbose (>40 chars, no file path), extract keyword from think field.
             # Handles case where model knows 'MISSING-TOTAL' in think but outputs verbose explanation.
             if len(answer) > 40 and "/" not in answer:
@@ -2380,6 +2400,10 @@ def run_agent(model: str, harness_url: str, task_text: str, model_config: dict |
             if agents_md_redirect_target:
                 merged_refs = [agents_md_redirect_target]
                 print(f"{CLI_YELLOW}[FIX-8] refs filtered to redirect target: {merged_refs}{CLI_CLR}")
+            # FIX-62b: When FIX-62 triggered, refs should be only AGENTS.MD (not hallucinated paths)
+            if _f62_triggered:
+                merged_refs = ["AGENTS.MD"]
+                print(f"{CLI_YELLOW}[FIX-62b] refs filtered to AGENTS.MD only{CLI_CLR}")
             job.action.refs = merged_refs
             # Update the log entry
             log[-1] = {"role": "assistant", "content": job.model_dump_json(exclude_defaults=True)}
