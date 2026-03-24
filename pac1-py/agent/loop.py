@@ -5,11 +5,13 @@ from google.protobuf.json_format import MessageToDict
 from connectrpc.errors import ConnectError
 from pydantic import ValidationError
 
+from pathlib import Path as _Path
+
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
-from bitgn.vm.pcm_pb2 import AnswerRequest, Outcome
+from bitgn.vm.pcm_pb2 import AnswerRequest, ListRequest, Outcome
 
 from .dispatch import CLI_RED, CLI_GREEN, CLI_CLR, CLI_YELLOW, CLI_BLUE, client, dispatch
-from .models import NextStep, ReportTaskCompletion
+from .models import NextStep, ReportTaskCompletion, Req_Delete, Req_List
 from .prephase import PrephaseResult
 
 
@@ -79,6 +81,8 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
     max_tokens = cfg.get("max_completion_tokens", 16384)
     max_steps = 30
     _transient_kws = ("503", "502", "NoneType", "overloaded", "unavailable", "server error")
+
+    listed_dirs: set[str] = set()
 
     for i in range(max_steps):
         step = f"step_{i + 1}"
@@ -177,12 +181,29 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             "content": f"{step_summary}\nAction: {action_name}({action_args})",
         })
 
+        # FIX-63: auto-list parent dir before first delete from it
+        if isinstance(job.function, Req_Delete):
+            parent = str(_Path(job.function.path).parent)
+            if parent not in listed_dirs:
+                print(f"{CLI_YELLOW}[FIX-63] Auto-listing {parent} before delete{CLI_CLR}")
+                try:
+                    _lr = vm.list(ListRequest(name=parent))
+                    _lr_raw = json.dumps(MessageToDict(_lr), indent=2) if _lr else "{}"
+                    listed_dirs.add(parent)
+                    log.append({"role": "user", "content": f"[FIX-63] Directory listing of {parent} (auto):\nResult of Req_List: {_lr_raw}"})
+                except Exception as _le:
+                    print(f"{CLI_RED}[FIX-63] Auto-list failed: {_le}{CLI_CLR}")
+
+        # Track listed dirs
+        if isinstance(job.function, Req_List):
+            listed_dirs.add(job.function.path)
+
         try:
             result = dispatch(vm, job.function)
             raw = json.dumps(MessageToDict(result), indent=2) if result else "{}"
             txt = _format_result(result, raw)
             # For delete/write/mkdir operations, make feedback explicit about the path
-            from .models import Req_Delete, Req_Write, Req_MkDir, Req_Move
+            from .models import Req_Write, Req_MkDir, Req_Move
             if isinstance(job.function, Req_Delete) and not txt.startswith("ERROR"):
                 txt = f"DELETED: {job.function.path}"
             elif isinstance(job.function, Req_Write) and not txt.startswith("ERROR"):
