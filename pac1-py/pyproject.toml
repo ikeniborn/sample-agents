@@ -1,0 +1,20 @@
+[project]
+name = "bitgn-pac1-py"
+version = "0.1.0"
+description = "Runnable Python sample for the BitGN PAC1 benchmark"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "connect-python>=0.8.1",
+    "protobuf>=4.25.0",
+    "httpx>=0.27.0",
+    "openai>=2.26.0",
+    "pydantic>=2.12.5",
+    "annotated-types>=0.7.0",
+]
+
+[tool.uv]
+# AICODE-NOTE: Uses locally generated protobuf files (pac1-py/bitgn/) and
+# connect-python instead of external buf.build SDK packages, mirroring
+# the sandbox-py approach for offline/authenticated-free operation.
+package = false
