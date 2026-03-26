@@ -1,19 +1,13 @@
 # Ограничения
 
-- Для тестирования использовать только модели OpenRouter
-  - anthropic/claude-haiku-4.5
-  - qwen/qwen3.5-9b
+Целевой каталог агента pac1-py
 
-**Запрещено** Использовать паттерн хардкода при доработке агента. Исправлять системно.
+# Разработка
+Использовать паттерн хардкода при доработке агента. 
 
 # Тестирование
 
-- Запуск: 
+Пример запуска агента
 ```bash
-cd pac1-py && MODEL_ID="anthropic/claude-haiku-4.5" uv run python main.py
+TZ=Europe/Moscow ts=$(TZ=Europe/Moscow date +"%Y%m%d_%H%M%S") && logfile="/home/ikeniborn/Documents/Project/sample-agents/tmp/${ts}_qwen3.5-9b.log" && echo "Лог: $logfile" && TASK_TIMEOUT_S=900 uv run python main.py t01 2>&1 | tee "$logfile"
 ```
-
-# Сбор логов
-
-Собирать вывод в /home/ikeniborn/Documents/Project/sample-agents/tmp из stdout в отдельный файл для каждого запуска с маской по дате и времени запуска по московскому часовому поясу с названием модели.
-По завершению в конйе файла формируй итоговую статистику с оценкой и пробелемами по каждому заданию в табличном виде.

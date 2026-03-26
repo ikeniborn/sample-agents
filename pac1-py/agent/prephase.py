@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
-from bitgn.vm.pcm_pb2 import ReadRequest, TreeRequest
+from bitgn.vm.pcm_pb2 import ContextRequest, ReadRequest, TreeRequest
 
 from .dispatch import CLI_BLUE, CLI_CLR, CLI_GREEN, CLI_YELLOW
 
@@ -94,6 +94,18 @@ def run_prephase(
     )
 
     log.append({"role": "user", "content": "\n".join(prephase_parts)})
+
+    # Step 3: context — task-level metadata from the harness
+    print(f"{CLI_BLUE}[prephase] context...{CLI_CLR}", end=" ")
+    try:
+        ctx_result = vm.context(ContextRequest())
+        if ctx_result.content:
+            log.append({"role": "user", "content": f"TASK CONTEXT:\n{ctx_result.content}"})
+            print(f"{CLI_GREEN}ok{CLI_CLR}")
+        else:
+            print(f"{CLI_YELLOW}empty{CLI_CLR}")
+    except Exception as e:
+        print(f"{CLI_YELLOW}not available: {e}{CLI_CLR}")
 
     # preserve_prefix: always kept during log compaction
     preserve_prefix = list(log)

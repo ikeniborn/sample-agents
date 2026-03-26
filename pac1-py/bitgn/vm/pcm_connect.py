@@ -10,6 +10,7 @@ from bitgn.vm.pcm_pb2 import (
     MkDirRequest, MkDirResponse,
     MoveRequest, MoveResponse,
     AnswerRequest, AnswerResponse,
+    ContextRequest, ContextResponse,
 )
 
 _SERVICE = "bitgn.vm.pcm.PcmRuntime"
@@ -48,3 +49,6 @@ class PcmRuntimeClientSync:
 
     def answer(self, req: AnswerRequest) -> AnswerResponse:
         return self._c.call(_SERVICE, "Answer", req, AnswerResponse)
+
+    def context(self, req: ContextRequest) -> ContextResponse:
+        return self._c.call(_SERVICE, "Context", req, ContextResponse)

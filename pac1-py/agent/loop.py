@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import time
 
 from google.protobuf.json_format import MessageToDict
@@ -13,17 +14,18 @@ from bitgn.vm.pcm_pb2 import AnswerRequest, ListRequest, Outcome
 
 from .dispatch import (
     CLI_RED, CLI_GREEN, CLI_CLR, CLI_YELLOW, CLI_BLUE,
-    anthropic_client, ollama_client,
+    anthropic_client, openrouter_client, ollama_client,
     is_claude_model, get_anthropic_model_id,
     dispatch,
+    probe_structured_output, get_response_format,
 )
 from .models import NextStep, ReportTaskCompletion, Req_Delete, Req_List, Req_Read, Req_Write, Req_MkDir, Req_Move
 from .prephase import PrephaseResult
 
 
-TASK_TIMEOUT_S = 180  # 3 minutes per task
+TASK_TIMEOUT_S = int(os.environ.get("TASK_TIMEOUT_S", "180"))  # default 3 min, override via env
 
-_TRANSIENT_KWS = ("503", "502", "NoneType", "overloaded", "unavailable", "server error")
+_TRANSIENT_KWS = ("503", "502", "429", "NoneType", "overloaded", "unavailable", "server error", "rate limit", "rate-limit")
 
 
 # ---------------------------------------------------------------------------
@@ -114,29 +116,163 @@ def _to_anthropic_messages(log: list) -> tuple[str, list]:
 
 
 # ---------------------------------------------------------------------------
-# LLM call: Anthropic primary, Ollama fallback
+# JSON extraction from free-form text (fallback when SO not supported)
 # ---------------------------------------------------------------------------
 
-def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextStep | None, int]:
-    """Call LLM: tries Anthropic SDK for Claude models, falls back to Ollama."""
+def _extract_json_from_text(text: str) -> dict | None:
+    """Extract first valid JSON object from free-form model output (already de-thought).
+    Tries: ```json fenced block → bracket-matched first {…}."""
+    # Try ```json ... ``` fenced block
+    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Bracket-match from the first { to its balanced closing }
+    start = text.find("{")
+    if start != -1:
+        depth = 0
+        for idx in range(start, len(text)):
+            if text[idx] == "{":
+                depth += 1
+            elif text[idx] == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        return json.loads(text[start:idx + 1])
+                    except (json.JSONDecodeError, ValueError):
+                        break
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# LLM call: Anthropic primary, OpenRouter/Ollama fallback
+# ---------------------------------------------------------------------------
+
+def _call_openai_tier(
+    oai_client,
+    model: str,
+    log: list,
+    max_tokens: int,
+    label: str,
+    extra_body: dict | None = None,
+    response_format: dict | None = None,
+) -> tuple[NextStep | None, int, int, int, int]:
+    """Shared retry loop for OpenAI-compatible tiers (OpenRouter, Ollama).
+    response_format=None means model does not support it — use text extraction fallback.
+    Returns (result, elapsed_ms, input_tokens, output_tokens, thinking_tokens)."""
+    for attempt in range(4):
+        raw = ""
+        elapsed_ms = 0
+        try:
+            started = time.time()
+            create_kwargs: dict = dict(
+                model=model,
+                messages=log,
+                max_completion_tokens=max_tokens,
+            )
+            if response_format is not None:
+                create_kwargs["response_format"] = response_format
+            if extra_body:
+                create_kwargs["extra_body"] = extra_body
+            resp = oai_client.chat.completions.create(**create_kwargs)
+            elapsed_ms = int((time.time() - started) * 1000)
+            raw = resp.choices[0].message.content or ""
+        except Exception as e:
+            err_str = str(e)
+            is_transient = any(kw.lower() in err_str.lower() for kw in _TRANSIENT_KWS)
+            if is_transient and attempt < 3:
+                print(f"{CLI_YELLOW}[FIX-27][{label}] Transient error (attempt {attempt + 1}): {e} — retrying in 4s{CLI_CLR}")
+                time.sleep(4)
+                continue
+            print(f"{CLI_RED}[{label}] Error: {e}{CLI_CLR}")
+            break
+        else:
+            in_tok = getattr(getattr(resp, "usage", None), "prompt_tokens", 0)
+            out_tok = getattr(getattr(resp, "usage", None), "completion_tokens", 0)
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            print(f"{CLI_YELLOW}[{label}] RAW: {raw[:500]}{CLI_CLR}")
+            if response_format is not None:
+                try:
+                    parsed = json.loads(raw)
+                except (json.JSONDecodeError, ValueError) as e:
+                    print(f"{CLI_RED}[{label}] JSON decode failed: {e}{CLI_CLR}")
+                    break
+            else:
+                parsed = _extract_json_from_text(raw)
+                if parsed is None:
+                    print(f"{CLI_RED}[{label}] JSON extraction from text failed{CLI_CLR}")
+                    break
+                print(f"{CLI_YELLOW}[{label}] JSON extracted from free-form text{CLI_CLR}")
+            # FIX-W1: auto-wrap bare function objects (model returns {"tool":...} without outer NextStep)
+            if isinstance(parsed, dict) and "tool" in parsed and "current_state" not in parsed:
+                print(f"{CLI_YELLOW}[FIX-W1] Auto-wrapping bare function object{CLI_CLR}")
+                parsed = {
+                    "current_state": "continuing",
+                    "plan_remaining_steps_brief": ["execute action"],
+                    "task_completed": False,
+                    "function": parsed,
+                }
+            # FIX-W2: strip thinking-only wrapper (model returns {"reasoning":...} without NextStep fields)
+            elif isinstance(parsed, dict) and "reasoning" in parsed and "current_state" not in parsed:
+                print(f"{CLI_YELLOW}[FIX-W2] Stripping bare reasoning wrapper, using list action{CLI_CLR}")
+                parsed = {
+                    "current_state": "reasoning stripped",
+                    "plan_remaining_steps_brief": ["explore vault"],
+                    "task_completed": False,
+                    "function": {"tool": "list", "path": "/"},
+                }
+            # FIX-W3: truncate plan_remaining_steps_brief to MaxLen(5)
+            if isinstance(parsed, dict) and isinstance(parsed.get("plan_remaining_steps_brief"), list):
+                steps = [s for s in parsed["plan_remaining_steps_brief"] if s]  # drop empty strings
+                if not steps:
+                    steps = ["continue"]
+                parsed["plan_remaining_steps_brief"] = steps[:5]
+            try:
+                return NextStep.model_validate(parsed), elapsed_ms, in_tok, out_tok, 0
+            except ValidationError as e:
+                print(f"{CLI_RED}[{label}] JSON parse failed: {e}{CLI_CLR}")
+                break
+    return None, 0, 0, 0, 0
+
+
+def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextStep | None, int, int, int, int]:
+    """Call LLM: Anthropic SDK (tier 1) → OpenRouter (tier 2) → Ollama (tier 3).
+    Returns (result, elapsed_ms, input_tokens, output_tokens, thinking_tokens)."""
 
     # --- Anthropic SDK ---
     if is_claude_model(model) and anthropic_client is not None:
         ant_model = get_anthropic_model_id(model)
+        thinking_budget = cfg.get("thinking_budget", 0)
         for attempt in range(4):
             raw = ""
             elapsed_ms = 0
             try:
                 started = time.time()
                 system, messages = _to_anthropic_messages(log)
-                response = anthropic_client.messages.create(
+                create_kwargs: dict = dict(
                     model=ant_model,
                     system=system,
                     messages=messages,
                     max_tokens=max_tokens,
                 )
+                if thinking_budget:
+                    create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+                response = anthropic_client.messages.create(**create_kwargs)
                 elapsed_ms = int((time.time() - started) * 1000)
-                raw = response.content[0].text if response.content else ""
+                think_tok = 0
+                for block in response.content:
+                    if block.type == "thinking":
+                        # Estimate thinking tokens (rough: chars / 4)
+                        think_tok += len(getattr(block, "thinking", "")) // 4
+                    elif block.type == "text":
+                        raw = block.text
+                in_tok = getattr(getattr(response, "usage", None), "input_tokens", 0)
+                out_tok = getattr(getattr(response, "usage", None), "output_tokens", 0)
+                print(f"{CLI_YELLOW}[Anthropic] tokens in={in_tok} out={out_tok} think≈{think_tok}{CLI_CLR}")
             except Exception as e:
                 err_str = str(e)
                 is_transient = any(kw.lower() in err_str.lower() for kw in _TRANSIENT_KWS)
@@ -147,45 +283,32 @@ def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextSt
                 print(f"{CLI_RED}[Anthropic] Error: {e}{CLI_CLR}")
                 break
             else:
-                # API succeeded — parse JSON; don't fall back to Ollama on parse errors
                 try:
-                    return NextStep.model_validate_json(raw), elapsed_ms
+                    return NextStep.model_validate_json(raw), elapsed_ms, in_tok, out_tok, think_tok
                 except (ValidationError, ValueError) as e:
                     print(f"{CLI_RED}[Anthropic] JSON parse failed: {e}{CLI_CLR}")
-                    return None, elapsed_ms
+                    return None, elapsed_ms, in_tok, out_tok, think_tok
 
-        print(f"{CLI_YELLOW}[Anthropic] Falling back to Ollama{CLI_CLR}")
+        _next = "OpenRouter" if openrouter_client is not None else "Ollama"
+        print(f"{CLI_YELLOW}[Anthropic] Falling back to {_next}{CLI_CLR}")
 
-    # --- Ollama fallback (OpenAI-compatible) ---
+    # --- OpenRouter (cloud, tier 2) ---
+    if openrouter_client is not None:
+        # Detect structured output capability (static hint → probe → fallback)
+        so_hint = cfg.get("response_format_hint")
+        so_mode = probe_structured_output(openrouter_client, model, hint=so_hint)
+        or_fmt = get_response_format(so_mode)  # None if mode="none"
+        if so_mode == "none":
+            print(f"{CLI_YELLOW}[OpenRouter] Model {model} does not support response_format — using text extraction{CLI_CLR}")
+        result = _call_openai_tier(openrouter_client, model, log, cfg.get("max_completion_tokens", max_tokens), "OpenRouter", response_format=or_fmt)
+        if result[0] is not None:
+            return result
+        print(f"{CLI_YELLOW}[OpenRouter] Falling back to Ollama{CLI_CLR}")
+
+    # --- Ollama fallback (local, tier 3) ---
     ollama_model = cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
-    ollama_max_tokens = cfg.get("max_completion_tokens", max_tokens)
-
-    for attempt in range(4):
-        try:
-            started = time.time()
-            resp = ollama_client.chat.completions.create(
-                model=ollama_model,
-                response_format={"type": "json_object"},
-                messages=log,
-                max_completion_tokens=ollama_max_tokens,
-            )
-            elapsed_ms = int((time.time() - started) * 1000)
-            raw = resp.choices[0].message.content or ""
-            try:
-                return NextStep.model_validate_json(raw), elapsed_ms
-            except (ValidationError, ValueError) as e:
-                raise RuntimeError(f"JSON parse failed: {e}") from e
-        except Exception as e:
-            err_str = str(e)
-            is_transient = any(kw.lower() in err_str.lower() for kw in _TRANSIENT_KWS)
-            if is_transient and attempt < 3:
-                print(f"{CLI_YELLOW}[FIX-27][Ollama] Transient error (attempt {attempt + 1}): {e} — retrying in 4s{CLI_CLR}")
-                time.sleep(4)
-                continue
-            print(f"{CLI_RED}[Ollama] Error: {e}{CLI_CLR}")
-            break
-
-    return None, 0
+    extra = {"think": cfg["ollama_think"]} if "ollama_think" in cfg else None
+    return _call_openai_tier(ollama_client, ollama_model, log, cfg.get("max_completion_tokens", max_tokens), "Ollama", extra_body=extra, response_format=get_response_format("json_schema"))
 
 
 # ---------------------------------------------------------------------------
@@ -193,7 +316,8 @@ def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextSt
 # ---------------------------------------------------------------------------
 
 def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
-             pre: PrephaseResult, cfg: dict) -> None:
+             pre: PrephaseResult, cfg: dict) -> dict:
+    """Run main agent loop. Returns token usage stats dict."""
     log = pre.log
     preserve_prefix = pre.preserve_prefix
 
@@ -202,6 +326,9 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
 
     task_start = time.time()
     listed_dirs: set[str] = set()
+    total_in_tok = 0
+    total_out_tok = 0
+    total_think_tok = 0
 
     for i in range(max_steps):
         # --- Task timeout check ---
@@ -225,13 +352,26 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
         log = _compact_log(log, max_tool_pairs=5, preserve_prefix=preserve_prefix)
 
         # --- LLM call ---
-        job, elapsed_ms = _call_llm(log, model, max_tokens, cfg)
+        job, elapsed_ms, in_tok, out_tok, think_tok = _call_llm(log, model, max_tokens, cfg)
+        total_in_tok += in_tok
+        total_out_tok += out_tok
+        total_think_tok += think_tok
 
         # JSON parse retry hint (for Ollama json_object mode)
         if job is None and not is_claude_model(model):
             print(f"{CLI_YELLOW}[retry] Adding JSON correction hint{CLI_CLR}")
-            log.append({"role": "user", "content": "Your previous response was invalid JSON or missing required fields. Respond with a single valid JSON object containing: current_state, plan_remaining_steps, task_completed, function."})
-            job, elapsed_ms = _call_llm(log, model, max_tokens, cfg)
+            log.append({"role": "user", "content": (
+                'Your previous response was invalid. Respond with EXACTLY this JSON structure '
+                '(all 4 fields required, correct types):\n'
+                '{"current_state":"<string>","plan_remaining_steps_brief":["<string>"],'
+                '"task_completed":false,"function":{"tool":"list","path":"/"}}\n'
+                'RULES: current_state=string, plan_remaining_steps_brief=array of strings, '
+                'task_completed=boolean (true/false not string), function=object with "tool" key inside.'
+            )})
+            job, elapsed_ms, in_tok, out_tok, think_tok = _call_llm(log, model, max_tokens, cfg)
+            total_in_tok += in_tok
+            total_out_tok += out_tok
+            total_think_tok += think_tok
             log.pop()
 
         if job is None:
@@ -246,7 +386,7 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
                 pass
             break
 
-        step_summary = job.plan_remaining_steps[0] if job.plan_remaining_steps else "(no steps)"
+        step_summary = job.plan_remaining_steps_brief[0] if job.plan_remaining_steps_brief else "(no steps)"
         print(f"{step_summary} ({elapsed_ms} ms)\n  {job.function}")
 
         # Record what the agent decided to do
@@ -273,6 +413,19 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
         # Track listed dirs
         if isinstance(job.function, Req_List):
             listed_dirs.add(job.function.path)
+
+        # FIX-W4: reject wildcard delete paths early with instructive message
+        if isinstance(job.function, Req_Delete) and ("*" in job.function.path):
+            wc_parent = job.function.path.rstrip("/*").rstrip("/") or "/"
+            print(f"{CLI_YELLOW}[FIX-W4] Wildcard delete rejected: {job.function.path}{CLI_CLR}")
+            log.append({
+                "role": "user",
+                "content": (
+                    f"ERROR: Wildcards not supported. You must delete files one by one.\n"
+                    f"List '{wc_parent}' first, then delete each file individually by its exact path."
+                ),
+            })
+            continue
 
         try:
             result = dispatch(vm, job.function)
@@ -323,3 +476,5 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
 
         # Inject result as a user message
         log.append({"role": "user", "content": f"Result of {action_name}: {txt}"})
+
+    return {"input_tokens": total_in_tok, "output_tokens": total_out_tok, "thinking_tokens": total_think_tok}

@@ -6,7 +6,7 @@ You are a personal knowledge management assistant using file-system tools only.
 ## Output format
 Respond with a SINGLE JSON object. The action MUST be inside "function" key:
 
-{"current_state":"<one sentence>","plan_remaining_steps":["step1","step2"],"task_completed":false,"function":{"tool":"list","path":"/some/dir"}}
+{"current_state":"<one sentence>","plan_remaining_steps_brief":["step1","step2"],"task_completed":false,"function":{"tool":"list","path":"/some/dir"}}
 
 The "function" field contains the tool action. Examples:
 - list: {"tool":"list","path":"/dir"}
@@ -97,5 +97,5 @@ When processing inbox messages:
 - Email WITH explicit recipient + subject + body → write to outbox (supported). Do NOT return NONE_UNSUPPORTED.
 
 IMPORTANT: There is NO "ask_clarification" tool. Clarification = report_completion with OUTCOME_NONE_CLARIFICATION:
-{"current_state":"ambiguous","plan_remaining_steps":[],"task_completed":true,"function":{"tool":"report_completion","completed_steps_laconic":[],"message":"Target 'that card' is ambiguous.","grounding_refs":[],"outcome":"OUTCOME_NONE_CLARIFICATION"}}
+{"current_state":"ambiguous","plan_remaining_steps_brief":["report clarification"],"task_completed":true,"function":{"tool":"report_completion","completed_steps_laconic":[],"message":"Target 'that card' is ambiguous.","grounding_refs":[],"outcome":"OUTCOME_NONE_CLARIFICATION"}}
 """

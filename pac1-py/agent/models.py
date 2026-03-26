@@ -1,5 +1,6 @@
-from typing import List, Literal, Union
+from typing import Annotated, List, Literal, Union
 
+from annotated_types import Ge, Le, MaxLen, MinLen
 from pydantic import BaseModel, Field
 
 
@@ -59,18 +60,22 @@ class Req_Tree(BaseModel):
     root: str = Field("", description="tree root, empty means repository root")
 
 
+class Req_Context(BaseModel):
+    tool: Literal["context"]
+
+
 class Req_Find(BaseModel):
     tool: Literal["find"]
     name: str
     root: str = "/"
     kind: Literal["all", "files", "dirs"] = "all"
-    limit: int = 10
+    limit: Annotated[int, Ge(1), Le(20)] = 10
 
 
 class Req_Search(BaseModel):
     tool: Literal["search"]
     pattern: str
-    limit: int = 10
+    limit: Annotated[int, Ge(1), Le(20)] = 10
     root: str = "/"
 
 
@@ -113,9 +118,9 @@ class Req_Move(BaseModel):
 
 class NextStep(BaseModel):
     current_state: str
-    plan_remaining_steps: List[str] = Field(
+    plan_remaining_steps_brief: Annotated[List[str], MinLen(1), MaxLen(5)] = Field(
         ...,
-        description="briefly list the next 1-3 useful steps",
+        description="briefly explain the next useful steps",
     )
     task_completed: bool
     # AICODE-NOTE: Keep this union aligned with the public PCM runtime surface
@@ -124,6 +129,7 @@ class NextStep(BaseModel):
     # only the runtime events that the harness persisted.
     function: Union[
         ReportTaskCompletion,
+        Req_Context,
         Req_Tree,
         Req_Find,
         Req_Search,

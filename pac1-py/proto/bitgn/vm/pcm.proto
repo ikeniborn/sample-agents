@@ -21,6 +21,7 @@ service PcmRuntime {
   rpc MkDir(MkDirRequest) returns (MkDirResponse);
   rpc Move(MoveRequest) returns (MoveResponse);
   rpc Answer(AnswerRequest) returns (AnswerResponse);
+  rpc Context(ContextRequest) returns (ContextResponse);
 }
 
 // Tree: recursive node structure
@@ -135,3 +136,10 @@ message AnswerRequest {
 }
 
 message AnswerResponse {}
+
+// Context: task-level context provided by the harness
+message ContextRequest {}
+
+message ContextResponse {
+  string content = 1;
+}
