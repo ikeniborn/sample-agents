@@ -1,6 +1,8 @@
+import json
 import os
 import textwrap
 import time
+from pathlib import Path
 
 from bitgn.harness_connect import HarnessServiceClientSync
 from bitgn.harness_pb2 import EndTrialRequest, EvalPolicy, GetBenchmarkRequest, StartPlaygroundRequest, StatusRequest
@@ -11,53 +13,39 @@ from agent.classifier import ModelRouter
 
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/pac1-dev"
-MODEL_ID = os.getenv("MODEL_ID") or "qwen3.5:cloud"
 
-MODEL_CONFIGS: dict[str, dict] = {
-    # Anthropic Claude models (primary: Anthropic SDK; fallback: OpenRouter)
-    # response_format_hint used when falling back to OpenRouter tier
-    "anthropic/claude-haiku-4.5":  {"max_completion_tokens": 16384, "thinking_budget": 2000, "response_format_hint": "json_object"},
-    "anthropic/claude-sonnet-4.6": {"max_completion_tokens": 16384, "thinking_budget": 4000, "response_format_hint": "json_object"},
-    "anthropic/claude-opus-4.6":   {"max_completion_tokens": 16384, "thinking_budget": 8000, "response_format_hint": "json_object"},
-    # Open models via OpenRouter
-    "qwen/qwen3.5-9b":             {"max_completion_tokens": 4000,  "response_format_hint": "json_object"},
-    "meta-llama/llama-3.3-70b-instruct": {"max_completion_tokens": 4000, "response_format_hint": "json_object"},
-    # Ollama local fallback models
-    "qwen3.5:9b":    {"max_completion_tokens": 4000, "ollama_think": True},
-    "qwen3.5:4b":    {"max_completion_tokens": 4000, "ollama_think": False},
-    "qwen3.5:2b":    {"max_completion_tokens": 4000, "ollama_think": False},
-    "qwen3.5:0.8b":  {"max_completion_tokens": 4000, "ollama_think": False},
-    # Ollama cloud models
-    "qwen3.5:cloud": {"max_completion_tokens": 4000, "ollama_think": True},
-    "qwen3.5:397b-cloud": {"max_completion_tokens": 4000, "ollama_think": True},
-    # FIX-85: cloud-hosted Ollama-format models (name:tag routing, served via OLLAMA_BASE_URL)
-    "deepseek-v3.1:671b-cloud":  {"max_completion_tokens": 4000, "ollama_think": False},
-    "deepseek-r1:671b-cloud":    {"max_completion_tokens": 4000, "ollama_think": True},
-    "deepseek-v3:685b-cloud":    {"max_completion_tokens": 4000, "ollama_think": False},
-}
+_MODELS_JSON = Path(__file__).parent / "models.json"
+_raw = json.loads(_MODELS_JSON.read_text())
+MODEL_CONFIGS: dict[str, dict] = {k: v for k, v in _raw.items() if not k.startswith("_")}
 
-# Multi-model routing: MODEL_DEFAULT/THINK/TOOL/LONG_CONTEXT override MODEL_ID
-_model_default  = os.getenv("MODEL_DEFAULT")     or MODEL_ID
-_model_think    = os.getenv("MODEL_THINK")        or MODEL_ID
-_model_tool     = os.getenv("MODEL_TOOL")         or MODEL_ID
-_model_long_ctx = os.getenv("MODEL_LONG_CONTEXT") or MODEL_ID
-_model_classifier = os.getenv("MODEL_CLASSIFIER") or ""  # FIX-86: optional lightweight model for task classification
+# FIX-91: все типы задаются явно — MODEL_ID как fallback упразднён.
+# Каждая переменная обязательна; если не задана — ValueError при старте.
+def _require_env(name: str) -> str:
+    v = os.getenv(name)
+    if not v:
+        raise ValueError(f"Env var {name} is required but not set. Check .env or environment.")
+    return v
+
+_model_classifier = _require_env("MODEL_CLASSIFIER")
+_model_default    = _require_env("MODEL_DEFAULT")
+_model_think      = _require_env("MODEL_THINK")
+_model_long_ctx   = _require_env("MODEL_LONG_CONTEXT")
 
 # FIX-88: always use ModelRouter — classification runs for every task,
 # logs always show [MODEL_ROUTER] lines, stats always show Тип/Модель columns.
 EFFECTIVE_MODEL: ModelRouter = ModelRouter(
     default=_model_default,
     think=_model_think,
-    tool=_model_tool,
     long_context=_model_long_ctx,
     classifier=_model_classifier,
     configs=MODEL_CONFIGS,
 )
-_is_multi = any(v != MODEL_ID for v in [_model_default, _model_think, _model_tool, _model_long_ctx])
 print(
-    f"[MODEL_ROUTER] {'Multi' if _is_multi else 'Single'}-model mode: "
-    f"default={_model_default}, think={_model_think}, tool={_model_tool}, longContext={_model_long_ctx}"
-    + (f", classifier={_model_classifier}" if _model_classifier else "")
+    f"[MODEL_ROUTER] Multi-model mode:\n"
+    f"  classifier  = {_model_classifier}\n"
+    f"  default     = {_model_default}\n"
+    f"  think       = {_model_think}\n"
+    f"  longContext = {_model_long_ctx}"
 )
 
 CLI_RED = "\x1B[31m"
@@ -97,8 +85,7 @@ def main() -> None:
 
             token_stats: dict = {"input_tokens": 0, "output_tokens": 0}
             try:
-                token_stats = run_agent(EFFECTIVE_MODEL, trial.harness_url, trial.instruction,
-                                        model_config=MODEL_CONFIGS.get(MODEL_ID))
+                token_stats = run_agent(EFFECTIVE_MODEL, trial.harness_url, trial.instruction)
             except Exception as exc:
                 print(exc)
 
@@ -133,7 +120,7 @@ def main() -> None:
         W = 140
         sep = "=" * W
         print(f"\n{sep}")
-        _title = "ИТОГОВАЯ СТАТИСТИКА (multi-model)" if _is_multi else "ИТОГОВАЯ СТАТИСТИКА"
+        _title = "ИТОГОВАЯ СТАТИСТИКА"
         print(f"{_title:^{W}}")
         print(sep)
         print(f"{'Задание':<10} {'Оценка':>7} {'Время':>8}  {'Вход(tok)':>10} {'Выход(tok)':>10}  {'Тип':<11} {'Модель':<34}  Проблемы")
@@ -143,7 +130,7 @@ def main() -> None:
             issues = "; ".join(detail) if score < 1.0 else "—"
             in_t = ts.get("input_tokens", 0)
             out_t = ts.get("output_tokens", 0)
-            m = ts.get("model_used", MODEL_ID)
+            m = ts.get("model_used", "—")
             m_short = m.split("/")[-1] if "/" in m else m
             t_type = ts.get("task_type", "—")
             print(f"{task_id:<10} {score:>7.2f} {elapsed:>7.1f}s  {in_t:>10,} {out_t:>10,}  {t_type:<11} {m_short:<34}  {issues}")

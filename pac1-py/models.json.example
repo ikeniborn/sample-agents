@@ -1,0 +1,42 @@
+{
+  "_comment": "Model capability configs. Key = model ID (must match MODEL_* env vars). Copy to models.json.",
+  "_fields": {
+    "max_completion_tokens": "Max tokens the model may generate per step",
+    "thinking_budget":       "Token budget for extended thinking (Anthropic only); omit to disable",
+    "response_format_hint":  "Hint for OpenRouter tier: 'json_object' or 'json_schema'",
+    "ollama_think":          "Enable <think> blocks for Ollama models that support reasoning"
+  },
+
+  "_section_ollama_local": "--- Ollama local (OLLAMA_BASE_URL=http://localhost:11434/v1) ---",
+
+  "qwen3.5:0.8b":  {"max_completion_tokens": 2000, "ollama_think": false},
+  "qwen3.5:2b":    {"max_completion_tokens": 2000, "ollama_think": false},
+  "qwen3.5:4b":    {"max_completion_tokens": 4000, "ollama_think": false},
+  "qwen3.5:9b":    {"max_completion_tokens": 4000, "ollama_think": true},
+  "qwen3.5:32b":   {"max_completion_tokens": 4000, "ollama_think": true},
+
+  "llama3.2:3b":   {"max_completion_tokens": 4000, "ollama_think": false},
+  "llama3.3:70b":  {"max_completion_tokens": 4000, "ollama_think": false},
+
+  "deepseek-r1:7b":  {"max_completion_tokens": 4000, "ollama_think": true},
+  "deepseek-r1:14b": {"max_completion_tokens": 4000, "ollama_think": true},
+  "deepseek-r1:32b": {"max_completion_tokens": 4000, "ollama_think": true},
+
+  "_section_ollama_cloud": "--- Ollama cloud endpoint (OLLAMA_BASE_URL=https://your-cloud/v1) ---",
+
+  "qwen3.5:cloud":          {"max_completion_tokens": 4000, "ollama_think": true},
+  "qwen3.5:397b-cloud":     {"max_completion_tokens": 4000, "ollama_think": true},
+  "deepseek-v3.1:671b-cloud": {"max_completion_tokens": 4000, "ollama_think": false},
+  "deepseek-r1:671b-cloud":   {"max_completion_tokens": 4000, "ollama_think": true},
+
+  "_section_openrouter": "--- OpenRouter (OPENROUTER_API_KEY required) ---",
+
+  "qwen/qwen3.5-9b":                   {"max_completion_tokens": 4000, "response_format_hint": "json_object"},
+  "meta-llama/llama-3.3-70b-instruct": {"max_completion_tokens": 4000, "response_format_hint": "json_object"},
+
+  "_section_anthropic": "--- Anthropic (ANTHROPIC_API_KEY required) ---",
+
+  "anthropic/claude-haiku-4.5":  {"max_completion_tokens": 16384, "thinking_budget": 2000, "response_format_hint": "json_object"},
+  "anthropic/claude-sonnet-4.6": {"max_completion_tokens": 16384, "thinking_budget": 4000, "response_format_hint": "json_object"},
+  "anthropic/claude-opus-4.6":   {"max_completion_tokens": 16384, "thinking_budget": 8000, "response_format_hint": "json_object"}
+}

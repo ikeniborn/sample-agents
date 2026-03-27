@@ -121,5 +121,5 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **Fix-87** (FIX-88 is next).
+Current fix counter: **Fix-93** (FIX-94 is next).
 Each hardcoded fix gets a sequential label `FIX-N` in code comments.

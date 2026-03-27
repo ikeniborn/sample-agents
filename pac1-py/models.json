@@ -1,0 +1,33 @@
+{
+  "_comment": "Model capability configs. Key = model ID as used in env vars. Loaded by main.py at startup.",
+  "_fields": {
+    "max_completion_tokens": "Max tokens the model may generate per step",
+    "thinking_budget": "Token budget for extended thinking (Anthropic only); omit to disable",
+    "response_format_hint": "Hint for OpenRouter tier: 'json_object' or 'json_schema'",
+    "ollama_think": "Enable <think> blocks for Ollama models that support it"
+  },
+  "qwen3.5:cloud": {
+    "max_completion_tokens": 4000,
+    "ollama_think": false
+  },
+  "qwen3.5:397b-cloud": {
+    "max_completion_tokens": 4000,
+    "ollama_think": true
+  },
+  "deepseek-v3.1:671b-cloud": {
+    "max_completion_tokens": 4000,
+    "ollama_think": true
+  },
+  "deepseek-r1:671b-cloud": {
+    "max_completion_tokens": 4000,
+    "ollama_think": false
+  },
+  "gpt-oss:20b-cloud": {
+    "max_completion_tokens": 4000,
+    "ollama_think": false
+  },
+  "nemotron-3-nano:30b-cloud": {
+    "max_completion_tokens": 4000,
+    "ollama_think": false
+  }
+}

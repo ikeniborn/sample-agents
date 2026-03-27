@@ -7,23 +7,22 @@ from dataclasses import dataclass, field
 
 _JSON_TYPE_RE = re.compile(r'\{[^}]*"type"\s*:\s*"(\w+)"[^}]*\}')  # FIX-82: extract type from partial/wrapped JSON
 
+from typing import TYPE_CHECKING
+
 from .dispatch import call_llm_raw
+
+if TYPE_CHECKING:
+    from .prephase import PrephaseResult
 
 # Task type literals
 TASK_DEFAULT = "default"
 TASK_THINK = "think"
-TASK_TOOL = "tool"
 TASK_LONG_CONTEXT = "longContext"
 
 
 _THINK_WORDS = re.compile(
     r"\b(distill|analyze|analyse|summarize|summarise|compare|evaluate|review|infer|"
     r"explain|interpret|assess|what does|what is the|why does|how does|what should)\b",
-    re.IGNORECASE,
-)
-
-_TOOL_WORDS = re.compile(
-    r"\b(delete|remove|move|rename|copy|discard|trash|purge)\b",  # FIX-82: added discard/trash/purge
     re.IGNORECASE,
 )
 
@@ -36,7 +35,7 @@ _PATH_RE = re.compile(r"/[a-zA-Z0-9_\-\.]+")
 
 
 def classify_task(task_text: str) -> str:
-    """Classify task text into one of: default, think, tool, longContext."""
+    """Classify task text into one of: default, think, longContext."""
     # longContext: many file paths OR explicit bulk keywords
     path_count = len(_PATH_RE.findall(task_text))
     if path_count >= 3 or _LONG_CONTEXT_WORDS.search(task_text):
@@ -45,10 +44,6 @@ def classify_task(task_text: str) -> str:
     # think: analysis/reasoning keywords
     if _THINK_WORDS.search(task_text):
         return TASK_THINK
-
-    # tool: file manipulation keywords
-    if _TOOL_WORDS.search(task_text):
-        return TASK_TOOL
 
     return TASK_DEFAULT
 
@@ -60,18 +55,17 @@ def classify_task(task_text: str) -> str:
 _CLASSIFY_SYSTEM = (
     "You are a task router. Classify the task into exactly one type. "
     'Reply ONLY with valid JSON: {"type": "<type>"} where <type> is one of: '
-    "think, tool, longContext, default.\n"
+    "think, longContext, default.\n"
     "think = analysis/reasoning/summarize/compare/evaluate/explain/distill\n"
-    "tool = delete/remove/move/rename/copy/discard/trash/purge files or folders\n"
     "longContext = batch/all files/multiple files/3+ explicit file paths\n"
-    "default = everything else (read, write, create, capture, standard tasks)"
+    "default = everything else (read, write, create, capture, delete, move, standard tasks)"
 )
 
-_VALID_TYPES = frozenset({TASK_THINK, TASK_TOOL, TASK_LONG_CONTEXT, TASK_DEFAULT})
+_VALID_TYPES = frozenset({TASK_THINK, TASK_LONG_CONTEXT, TASK_DEFAULT})
 
 
 def classify_task_llm(task_text: str, model: str, model_config: dict) -> str:
-    """FIX-75: Use LLM (default model) to classify task type before agent start.
+    """FIX-75: Use LLM (classifier model) to classify task type before agent start.
     Uses FIX-76 call_llm_raw() for 3-tier routing + retry; falls back to regex.
     FIX-79: treat empty string same as None (empty response after retries).
     FIX-81: truncate to 150 chars — enough for task verb, avoids injection tail.
@@ -110,15 +104,14 @@ class ModelRouter:
     """Routes tasks to appropriate models based on task type classification."""
     default: str
     think: str
-    tool: str
     long_context: str
-    classifier: str = ""  # FIX-86: model for LLM classification; empty = use default
+    # FIX-90: classifier is a first-class routing tier — dedicated model for classification only
+    classifier: str
     configs: dict[str, dict] = field(default_factory=dict)
 
     def _select_model(self, task_type: str) -> str:
         return {
             TASK_THINK: self.think,
-            TASK_TOOL: self.tool,
             TASK_LONG_CONTEXT: self.long_context,
         }.get(task_type, self.default)
 
@@ -130,11 +123,64 @@ class ModelRouter:
         return model_id, self.configs.get(model_id, {}), task_type
 
     def resolve_llm(self, task_text: str) -> tuple[str, dict, str]:
-        """FIX-75: Use default model LLM to classify task, then return (model_id, config, task_type).
+        """FIX-75: Use classifier model to classify task, then return (model_id, config, task_type).
         Falls back to regex-based resolve() if LLM classification fails."""
-        # FIX-86: use dedicated classifier model if configured, else fall back to default
-        _cls_model = self.classifier or self.default
-        task_type = classify_task_llm(task_text, _cls_model, self.configs.get(_cls_model, {}))
+        task_type = classify_task_llm(task_text, self.classifier, self.configs.get(self.classifier, {}))
         model_id = self._select_model(task_type)
         print(f"[MODEL_ROUTER][FIX-75] LLM type={task_type} → model={model_id}")
         return model_id, self.configs.get(model_id, {}), task_type
+
+    def model_for_type(self, task_type: str) -> tuple[str, dict]:
+        """FIX-89: Return (model_id, config) for an already-known task_type."""
+        model_id = self._select_model(task_type)
+        return model_id, self.configs.get(model_id, {})
+
+
+# ---------------------------------------------------------------------------
+# FIX-89: Post-prephase reclassification using vault context
+# ---------------------------------------------------------------------------
+
+# Bulk-scope words in task text
+_BULK_TASK_RE = re.compile(
+    r"\b(all|every|each|batch|multiple|entire|whole)\b",
+    re.IGNORECASE,
+)
+
+
+def _count_tree_files(prephase_log: list) -> int:
+    """Extract tree text from prephase log and count file entries (non-directory lines)."""
+    for msg in prephase_log:
+        if msg.get("role") == "user" and "VAULT STRUCTURE:" in msg.get("content", ""):
+            tree_block = msg["content"]
+            break
+    else:
+        return 0
+    # File lines: contain └/├/─ and do NOT end with /
+    file_lines = [
+        ln for ln in tree_block.splitlines()
+        if ("─" in ln or "└" in ln or "├" in ln) and not ln.rstrip().endswith("/")
+    ]
+    return len(file_lines)
+
+
+def reclassify_with_prephase(task_type: str, task_text: str, pre: PrephaseResult) -> str:
+    """FIX-89: Refine task_type using vault context loaded during prephase.
+    Called after run_prephase(). Returns adjusted task_type string.
+
+    Signal — LONG_CONTEXT upgrade:
+      Vault tree has many file entries (>= 8) AND task text uses bulk-scope words
+      (all/every/each/batch). Applies to DEFAULT and THINK; LONG_CONTEXT stays as-is.
+    """
+    task_lower = task_text.lower()
+
+    # Signal: large vault + bulk-scope task → longContext
+    if task_type in (TASK_DEFAULT, TASK_THINK) and _BULK_TASK_RE.search(task_lower):
+        file_count = _count_tree_files(pre.log)
+        if file_count >= 8:
+            print(
+                f"[MODEL_ROUTER][FIX-89] {file_count} files in vault tree + bulk task "
+                f"→ override '{task_type}' → 'longContext'"
+            )
+            return TASK_LONG_CONTEXT
+
+    return task_type
