@@ -191,6 +191,13 @@ _TRANSIENT_KWS_RAW = (
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
 
+def is_ollama_model(model: str) -> bool:
+    """FIX-83: True for Ollama-format models (name:tag, no slash).
+    Examples: qwen3.5:9b, deepseek-v3.1:671b-cloud, qwen3.5:cloud.
+    These must be routed directly to Ollama tier, skipping OpenRouter."""
+    return ":" in model and "/" not in model
+
+
 def call_llm_raw(
     system: str,
     user_msg: str,
@@ -317,13 +324,6 @@ def get_anthropic_model_id(model: str) -> str:
     """Map alias (e.g. 'anthropic/claude-haiku-4.5') to Anthropic API model ID."""
     clean = model.removeprefix("anthropic/").lower()
     return _ANTHROPIC_MODEL_MAP.get(clean, clean)
-
-
-def is_ollama_model(model: str) -> bool:
-    """FIX-83: True for Ollama-format models (name:tag, no slash).
-    Examples: qwen3.5:9b, deepseek-v3.1:671b-cloud, qwen3.5:cloud.
-    These must be routed directly to Ollama tier, skipping OpenRouter."""
-    return ":" in model and "/" not in model
 
 
 # ---------------------------------------------------------------------------
