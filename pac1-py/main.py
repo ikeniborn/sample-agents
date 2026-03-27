@@ -43,20 +43,22 @@ _model_tool     = os.getenv("MODEL_TOOL")         or MODEL_ID
 _model_long_ctx = os.getenv("MODEL_LONG_CONTEXT") or MODEL_ID
 _model_classifier = os.getenv("MODEL_CLASSIFIER") or ""  # FIX-86: optional lightweight model for task classification
 
-if any(v != MODEL_ID for v in [_model_default, _model_think, _model_tool, _model_long_ctx]):
-    EFFECTIVE_MODEL: str | ModelRouter = ModelRouter(
-        default=_model_default,
-        think=_model_think,
-        tool=_model_tool,
-        long_context=_model_long_ctx,
-        classifier=_model_classifier,
-        configs=MODEL_CONFIGS,
-    )
-    print(f"[MODEL_ROUTER] Multi-model mode: default={_model_default}, think={_model_think}, "
-          f"tool={_model_tool}, longContext={_model_long_ctx}"
-          f"{f', classifier={_model_classifier}' if _model_classifier else ''}")
-else:
-    EFFECTIVE_MODEL = MODEL_ID
+# FIX-88: always use ModelRouter — classification runs for every task,
+# logs always show [MODEL_ROUTER] lines, stats always show Тип/Модель columns.
+EFFECTIVE_MODEL: ModelRouter = ModelRouter(
+    default=_model_default,
+    think=_model_think,
+    tool=_model_tool,
+    long_context=_model_long_ctx,
+    classifier=_model_classifier,
+    configs=MODEL_CONFIGS,
+)
+_is_multi = any(v != MODEL_ID for v in [_model_default, _model_think, _model_tool, _model_long_ctx])
+print(
+    f"[MODEL_ROUTER] {'Multi' if _is_multi else 'Single'}-model mode: "
+    f"default={_model_default}, think={_model_think}, tool={_model_tool}, longContext={_model_long_ctx}"
+    + (f", classifier={_model_classifier}" if _model_classifier else "")
+)
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
@@ -129,13 +131,14 @@ def main() -> None:
             total_think += ts.get("thinking_tokens", 0)
 
         # Summary table for log (no color codes)
-        is_multi = isinstance(EFFECTIVE_MODEL, ModelRouter)
+        is_multi = True  # FIX-88: always ModelRouter → always show Тип/Модель columns
 
         if is_multi:
             W = 155
             sep = "=" * W
             print(f"\n{sep}")
-            print(f"{'ИТОГОВАЯ СТАТИСТИКА (multi-model)':^{W}}")
+            _title = "ИТОГОВАЯ СТАТИСТИКА (multi-model)" if _is_multi else "ИТОГОВАЯ СТАТИСТИКА"
+            print(f"{_title:^{W}}")
             print(sep)
             print(f"{'Задание':<10} {'Оценка':>7} {'Время':>8}  {'Вход(tok)':>10} {'Выход(tok)':>10} {'Думать(~tok)':>12}  {'Тип':<11} {'Модель':<34}  Проблемы")
             print("-" * W)
