@@ -1,0 +1,273 @@
+---
+# pac1-py Architecture Overview
+# Generated: 2026-03-26
+# Architecture-documentation skill v1.3.0
+
+metadata:
+  project: pac1-py
+  description: >
+    PAC1 benchmark agent for the BitGN harness. A file-system agent that
+    manages a personal knowledge vault via PCM runtime tools, using a
+    discovery-first prompt strategy and a three-tier LLM dispatch stack
+    (Anthropic SDK → OpenRouter → Ollama).
+  complexity: standard
+  patterns:
+    - layered
+    - three-tier-fallback
+    - discovery-first
+  requires_python: ">=3.12"
+  fix_counter: 77  # FIX-78 is next
+
+components:
+  - id: main
+    name: Benchmark Runner
+    type: entry_point
+    path: main.py
+    layer: presentation
+    description: >
+      Connects to api.bitgn.com, iterates tasks in the benchmark, invokes
+      run_agent(), calls EndTrial, and prints a stats summary table.
+      Hosts MODEL_CONFIGS and constructs ModelRouter when multi-model env
+      vars differ from MODEL_ID.
+
+  - id: agent-init
+    name: Agent Entry Point
+    type: module
+    path: agent/__init__.py
+    layer: business
+    description: >
+      Universal agent entry point. Creates PcmRuntimeClientSync, resolves
+      model (via ModelRouter.resolve_llm or direct), runs prephase then
+      loop, returns token stats dict.
+
+  - id: classifier
+    name: Task Classifier & ModelRouter
+    type: module
+    path: agent/classifier.py
+    layer: business
+    description: >
+      Classifies task text into one of: default / think / tool / longContext
+      using regex patterns (classify_task) or an LLM call (classify_task_llm,
+      FIX-75). ModelRouter selects the appropriate model ID per task type.
+
+  - id: dispatch
+    name: LLM Dispatch & PCM Bridge
+    type: module
+    path: agent/dispatch.py
+    layer: infrastructure
+    description: >
+      Three-tier LLM routing: Anthropic SDK (tier 1) → OpenRouter (tier 2) →
+      Ollama (tier 3). Holds LLM clients, capability detection
+      (probe_structured_output, _STATIC_HINTS), outcome mapping, and
+      dispatch() which translates Pydantic models to PCM runtime RPC calls.
+      Also exposes call_llm_raw() (FIX-76) for lightweight classification calls.
+
+  - id: loop
+    name: Agent Main Loop
+    type: module
+    path: agent/loop.py
+    layer: business
+    description: >
+      30-step agentic loop. Per step: compact log, call LLM (_call_llm),
+      parse NextStep, run adaptive stall detection (FIX-74), dispatch tool
+      to PCM runtime, inject result back into log. Handles task timeout,
+      JSON retry hints, and FIX-63/71/73/W1-W4 hardcoded fixes.
+
+  - id: prephase
+    name: Pre-phase Explorer
+    type: module
+    path: agent/prephase.py
+    layer: business
+    description: >
+      Pre-loop phase: tree -L 2 /, reads AGENTS.MD (tries three candidate
+      paths), optionally filters AGENTS.MD to relevant sections, injects
+      vault layout + context into the message log. Returns PrephaseResult
+      with log and preserve_prefix (never compacted).
+
+  - id: prompt
+    name: System Prompt
+    type: config
+    path: agent/prompt.py
+    layer: business
+    description: >
+      Discovery-first system prompt. Zero hardcoded vault paths. Encodes
+      tool schema, output format, quick rules (clarification / unsupported /
+      security), delete workflow, inbox workflow, outbox seq.json rule,
+      and working rules 1-11.
+
+  - id: models
+    name: Pydantic Models
+    type: data_model
+    path: agent/models.py
+    layer: business
+    description: >
+      Pydantic schemas for: NextStep (agent output), all 10 PCM request
+      types (Req_Tree / Req_Find / Req_Search / Req_List / Req_Read /
+      Req_Write / Req_Delete / Req_MkDir / Req_Move / Req_Context),
+      ReportTaskCompletion, and VaultContext.
+
+  - id: bitgn-harness
+    name: BitGN Harness Client
+    type: external_client
+    path: bitgn/
+    layer: infrastructure
+    description: >
+      Locally generated protobuf/connect-python stubs for the BitGN harness
+      RPC (HarnessServiceClientSync) and PCM runtime
+      (PcmRuntimeClientSync). Provides GetBenchmark, StartPlayground,
+      EndTrial, Status RPCs plus vault tools (tree/find/search/list/read/
+      write/delete/mkdir/move/answer/context).
+
+dependencies:
+  # Intra-package
+  - from: main
+    to: agent-init
+    type: required
+    description: calls run_agent()
+
+  - from: main
+    to: classifier
+    type: required
+    description: instantiates ModelRouter
+
+  - from: main
+    to: bitgn-harness
+    type: required
+    description: HarnessServiceClientSync for benchmark control
+
+  - from: agent-init
+    to: classifier
+    type: required
+    description: ModelRouter.resolve_llm()
+
+  - from: agent-init
+    to: prephase
+    type: required
+    description: run_prephase()
+
+  - from: agent-init
+    to: loop
+    type: required
+    description: run_loop()
+
+  - from: agent-init
+    to: prompt
+    type: required
+    description: imports system_prompt string
+
+  - from: agent-init
+    to: bitgn-harness
+    type: required
+    description: PcmRuntimeClientSync passed to prephase and loop
+
+  - from: classifier
+    to: dispatch
+    type: required
+    description: calls call_llm_raw() (FIX-76) for LLM-based classification
+
+  - from: loop
+    to: dispatch
+    type: required
+    description: calls _call_llm(), dispatch(), imports helpers and clients
+
+  - from: loop
+    to: models
+    type: required
+    description: NextStep, all Req_* classes for parse and isinstance checks
+
+  - from: loop
+    to: prephase
+    type: required
+    description: receives PrephaseResult (log, preserve_prefix)
+
+  - from: loop
+    to: bitgn-harness
+    type: required
+    description: PcmRuntimeClientSync passed in; ConnectError handling
+
+  - from: prephase
+    to: dispatch
+    type: required
+    description: imports CLI color constants
+
+  - from: prephase
+    to: bitgn-harness
+    type: required
+    description: tree/read/context RPCs in pre-loop phase
+
+  - from: dispatch
+    to: models
+    type: required
+    description: all Req_* + ReportTaskCompletion for isinstance dispatch
+
+  - from: dispatch
+    to: bitgn-harness
+    type: required
+    description: PcmRuntimeClientSync, PCM protobuf request/response types
+
+  # External libraries
+  - from: dispatch
+    to: anthropic-sdk
+    type: required
+    description: Tier 1 LLM backend (Claude models, native thinking blocks)
+
+  - from: dispatch
+    to: openrouter
+    type: optional
+    description: Tier 2 LLM backend (cloud models via OpenAI-compatible API)
+
+  - from: dispatch
+    to: ollama
+    type: optional
+    description: Tier 3 LLM backend (local models via OpenAI-compatible API)
+
+quality_attributes:
+  - attribute: Resilience
+    description: >
+      Three-tier LLM fallback with FIX-27 retry (4 attempts, 4s sleep)
+      on transient 503/502/429 errors across all tiers.
+
+  - attribute: Stall-resistance
+    description: >
+      FIX-74 adaptive stall detection: repeated action fingerprint (3x),
+      repeated path error (2x), or 6 steps without write/delete/move/mkdir
+      each trigger a corrective hint and a retry LLM call.
+
+  - attribute: Token-efficiency
+    description: >
+      Sliding-window log compaction (keep prefix + last 5 pairs). AGENTS.MD
+      filtered to budget (2500 chars) with relevance scoring. Thinking
+      tokens tracked per task.
+
+  - attribute: Correctness
+    description: >
+      FIX-77 injects missing task_completed field; FIX-W1/W2 auto-wrap bare
+      JSON; FIX-W3 truncates over-length plan arrays. JSON retry hint on
+      parse failure for non-Claude models.
+
+  - attribute: Security
+    description: >
+      Inbox domain/company verification workflow. Security injection
+      detection via prompt quick rules → OUTCOME_DENIED_SECURITY first step.
+      Wildcard delete rejected by FIX-W4.
+
+env_vars:
+  MODEL_ID:
+    default: "qwen3.5:cloud"
+    description: Base model ID; overridden by MODEL_DEFAULT/THINK/TOOL/LONG_CONTEXT for multi-model routing
+  MODEL_DEFAULT: optional, per-type model override
+  MODEL_THINK: optional, per-type model override
+  MODEL_TOOL: optional, per-type model override
+  MODEL_LONG_CONTEXT: optional, per-type model override
+  TASK_TIMEOUT_S:
+    default: 180
+    description: Per-task timeout in seconds
+  BENCHMARK_HOST:
+    default: "https://api.bitgn.com"
+  BENCHMARK_ID:
+    default: "bitgn/pac1-dev"
+  ANTHROPIC_API_KEY: in .secrets
+  OPENROUTER_API_KEY: in .secrets
+  OLLAMA_BASE_URL:
+    default: "http://localhost:11434/v1"
+  OLLAMA_MODEL: optional local model override

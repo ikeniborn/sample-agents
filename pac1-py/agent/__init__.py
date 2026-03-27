@@ -13,12 +13,15 @@ def run_agent(model: str | ModelRouter, harness_url: str, task_text: str, model_
     Returns token usage stats dict: {input_tokens, output_tokens, thinking_tokens}."""
     vm = PcmRuntimeClientSync(harness_url)
 
+    task_type: str | None = None
     if isinstance(model, ModelRouter):
-        model, cfg = model.resolve_llm(task_text)  # FIX-75: LLM-based pre-classification
+        model, cfg, task_type = model.resolve_llm(task_text)  # FIX-75: LLM-based pre-classification
     else:
         cfg = model_config or {}
 
     pre = run_prephase(vm, task_text, system_prompt)
     stats = run_loop(vm, model, task_text, pre, cfg)
     stats["model_used"] = model
+    if task_type is not None:
+        stats["task_type"] = task_type
     return stats

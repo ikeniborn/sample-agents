@@ -235,6 +235,10 @@ def _call_openai_tier(
                 if not steps:
                     steps = ["continue"]
                 parsed["plan_remaining_steps_brief"] = steps[:5]
+            # FIX-77: inject missing task_completed=False (required field sometimes dropped by model)
+            if isinstance(parsed, dict) and "task_completed" not in parsed:
+                print(f"{CLI_YELLOW}[FIX-77] Missing task_completed — defaulting to false{CLI_CLR}")
+                parsed["task_completed"] = False
             try:
                 return NextStep.model_validate(parsed), elapsed_ms, in_tok, out_tok, think_tok
             except ValidationError as e:

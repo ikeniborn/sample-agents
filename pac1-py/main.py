@@ -30,6 +30,10 @@ MODEL_CONFIGS: dict[str, dict] = {
     # Ollama cloud models
     "qwen3.5:cloud": {"max_completion_tokens": 4000, "ollama_think": True},
     "qwen3.5:397b-cloud": {"max_completion_tokens": 4000, "ollama_think": True},
+    # FIX-85: cloud-hosted Ollama-format models (name:tag routing, served via OLLAMA_BASE_URL)
+    "deepseek-v3.1:671b-cloud":  {"max_completion_tokens": 4000, "ollama_think": False},
+    "deepseek-r1:671b-cloud":    {"max_completion_tokens": 4000, "ollama_think": True},
+    "deepseek-v3:685b-cloud":    {"max_completion_tokens": 4000, "ollama_think": False},
 }
 
 # Multi-model routing: MODEL_DEFAULT/THINK/TOOL/LONG_CONTEXT override MODEL_ID
@@ -37,6 +41,7 @@ _model_default  = os.getenv("MODEL_DEFAULT")     or MODEL_ID
 _model_think    = os.getenv("MODEL_THINK")        or MODEL_ID
 _model_tool     = os.getenv("MODEL_TOOL")         or MODEL_ID
 _model_long_ctx = os.getenv("MODEL_LONG_CONTEXT") or MODEL_ID
+_model_classifier = os.getenv("MODEL_CLASSIFIER") or ""  # FIX-86: optional lightweight model for task classification
 
 if any(v != MODEL_ID for v in [_model_default, _model_think, _model_tool, _model_long_ctx]):
     EFFECTIVE_MODEL: str | ModelRouter = ModelRouter(
@@ -44,10 +49,12 @@ if any(v != MODEL_ID for v in [_model_default, _model_think, _model_tool, _model
         think=_model_think,
         tool=_model_tool,
         long_context=_model_long_ctx,
+        classifier=_model_classifier,
         configs=MODEL_CONFIGS,
     )
     print(f"[MODEL_ROUTER] Multi-model mode: default={_model_default}, think={_model_think}, "
-          f"tool={_model_tool}, longContext={_model_long_ctx}")
+          f"tool={_model_tool}, longContext={_model_long_ctx}"
+          f"{f', classifier={_model_classifier}' if _model_classifier else ''}")
 else:
     EFFECTIVE_MODEL = MODEL_ID
 
@@ -125,12 +132,12 @@ def main() -> None:
         is_multi = isinstance(EFFECTIVE_MODEL, ModelRouter)
 
         if is_multi:
-            W = 140
+            W = 155
             sep = "=" * W
             print(f"\n{sep}")
             print(f"{'ИТОГОВАЯ СТАТИСТИКА (multi-model)':^{W}}")
             print(sep)
-            print(f"{'Задание':<10} {'Оценка':>7} {'Время':>8}  {'Вход(tok)':>10} {'Выход(tok)':>10} {'Думать(~tok)':>12}  {'Модель':<34}  Проблемы")
+            print(f"{'Задание':<10} {'Оценка':>7} {'Время':>8}  {'Вход(tok)':>10} {'Выход(tok)':>10} {'Думать(~tok)':>12}  {'Тип':<11} {'Модель':<34}  Проблемы")
             print("-" * W)
             model_totals: dict[str, dict] = {}
             for task_id, score, detail, elapsed, ts in scores:
@@ -140,7 +147,8 @@ def main() -> None:
                 think_t = ts.get("thinking_tokens", 0)
                 m = ts.get("model_used", MODEL_ID)
                 m_short = m.split("/")[-1] if "/" in m else m
-                print(f"{task_id:<10} {score:>7.2f} {elapsed:>7.1f}s  {in_t:>10,} {out_t:>10,} {think_t:>12,}  {m_short:<34}  {issues}")
+                t_type = ts.get("task_type", "—")
+                print(f"{task_id:<10} {score:>7.2f} {elapsed:>7.1f}s  {in_t:>10,} {out_t:>10,} {think_t:>12,}  {t_type:<11} {m_short:<34}  {issues}")
                 if m not in model_totals:
                     model_totals[m] = {"in": 0, "out": 0, "think": 0, "count": 0}
                 model_totals[m]["in"] += in_t
@@ -154,8 +162,8 @@ def main() -> None:
             avg_out = total_out // n if n else 0
             avg_think = total_think // n if n else 0
             print(sep)
-            print(f"{'ИТОГО':<10} {total:>6.2f}% {total_elapsed:>7.1f}s  {total_in:>10,} {total_out:>10,} {total_think:>12,}")
-            print(f"{'СРЕДНЕЕ':<10} {'':>7} {avg_elapsed:>7.1f}s  {avg_in:>10,} {avg_out:>10,} {avg_think:>12,}")
+            print(f"{'ИТОГО':<10} {total:>6.2f}% {total_elapsed:>7.1f}s  {total_in:>10,} {total_out:>10,} {total_think:>12,}  {'':11} {'':34}")
+            print(f"{'СРЕДНЕЕ':<10} {'':>7} {avg_elapsed:>7.1f}s  {avg_in:>10,} {avg_out:>10,} {avg_think:>12,}  {'':11} {'':34}")
             print(sep)
             if len(model_totals) > 1:
                 print(f"\n{'─' * 80}")

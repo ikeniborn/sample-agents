@@ -5,6 +5,8 @@ import json
 import re
 from dataclasses import dataclass, field
 
+_JSON_TYPE_RE = re.compile(r'\{[^}]*"type"\s*:\s*"(\w+)"[^}]*\}')  # FIX-82: extract type from partial/wrapped JSON
+
 from .dispatch import call_llm_raw
 
 # Task type literals
@@ -21,7 +23,7 @@ _THINK_WORDS = re.compile(
 )
 
 _TOOL_WORDS = re.compile(
-    r"\b(delete|remove|move|rename|copy)\b",
+    r"\b(delete|remove|move|rename|copy|discard|trash|purge)\b",  # FIX-82: added discard/trash/purge
     re.IGNORECASE,
 )
 
@@ -60,7 +62,7 @@ _CLASSIFY_SYSTEM = (
     'Reply ONLY with valid JSON: {"type": "<type>"} where <type> is one of: '
     "think, tool, longContext, default.\n"
     "think = analysis/reasoning/summarize/compare/evaluate/explain/distill\n"
-    "tool = delete/remove/move/rename/copy files\n"
+    "tool = delete/remove/move/rename/copy/discard/trash/purge files or folders\n"
     "longContext = batch/all files/multiple files/3+ explicit file paths\n"
     "default = everything else (read, write, create, capture, standard tasks)"
 )
@@ -70,14 +72,25 @@ _VALID_TYPES = frozenset({TASK_THINK, TASK_TOOL, TASK_LONG_CONTEXT, TASK_DEFAULT
 
 def classify_task_llm(task_text: str, model: str, model_config: dict) -> str:
     """FIX-75: Use LLM (default model) to classify task type before agent start.
-    Uses FIX-76 call_llm_raw() for 3-tier routing + retry; falls back to regex."""
-    user_msg = f"Task: {task_text[:600]}"
+    Uses FIX-76 call_llm_raw() for 3-tier routing + retry; falls back to regex.
+    FIX-79: treat empty string same as None (empty response after retries).
+    FIX-81: truncate to 150 chars — enough for task verb, avoids injection tail.
+    FIX-82: JSON regex-extraction fallback if json.loads fails."""
+    user_msg = f"Task: {task_text[:150]}"  # FIX-81: 600→150 to avoid injection content
     try:
-        raw = call_llm_raw(_CLASSIFY_SYSTEM, user_msg, model, model_config, max_tokens=500)
-        if raw is None:
-            print("[MODEL_ROUTER][FIX-75] All LLM tiers failed, falling back to regex")
+        raw = call_llm_raw(_CLASSIFY_SYSTEM, user_msg, model, model_config, max_tokens=50)
+        if not raw:  # FIX-79: catch both None and "" (empty string after retry exhaustion)
+            print("[MODEL_ROUTER][FIX-75] All LLM tiers failed or empty, falling back to regex")
             return classify_task(task_text)
-        detected = str(json.loads(raw).get("type", "")).strip()
+        # Try strict JSON parse first
+        try:
+            detected = str(json.loads(raw).get("type", "")).strip()
+        except (json.JSONDecodeError, AttributeError):
+            # FIX-82: JSON parse failed — try regex extraction from response text
+            m = _JSON_TYPE_RE.search(raw)
+            detected = m.group(1).strip() if m else ""
+            if detected:
+                print(f"[MODEL_ROUTER][FIX-82] Extracted type via regex from: {raw!r}")
         if detected in _VALID_TYPES:
             print(f"[MODEL_ROUTER][FIX-75] LLM classified task as '{detected}'")
             return detected
@@ -103,17 +116,17 @@ class ModelRouter:
             TASK_LONG_CONTEXT: self.long_context,
         }.get(task_type, self.default)
 
-    def resolve(self, task_text: str) -> tuple[str, dict]:
-        """Return (model_id, model_config) for the given task text."""
+    def resolve(self, task_text: str) -> tuple[str, dict, str]:
+        """Return (model_id, model_config, task_type) for the given task text."""
         task_type = classify_task(task_text)
         model_id = self._select_model(task_type)
         print(f"[MODEL_ROUTER] type={task_type} → model={model_id}")
-        return model_id, self.configs.get(model_id, {})
+        return model_id, self.configs.get(model_id, {}), task_type
 
-    def resolve_llm(self, task_text: str) -> tuple[str, dict]:
-        """FIX-75: Use default model LLM to classify task, then return (model_id, config).
+    def resolve_llm(self, task_text: str) -> tuple[str, dict, str]:
+        """FIX-75: Use default model LLM to classify task, then return (model_id, config, task_type).
         Falls back to regex-based resolve() if LLM classification fails."""
         task_type = classify_task_llm(task_text, self.default, self.configs.get(self.default, {}))
         model_id = self._select_model(task_type)
         print(f"[MODEL_ROUTER][FIX-75] LLM type={task_type} → model={model_id}")
-        return model_id, self.configs.get(model_id, {})
+        return model_id, self.configs.get(model_id, {}), task_type

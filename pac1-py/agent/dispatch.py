@@ -225,7 +225,8 @@ def call_llm_raw(
                 if attempt < 3:
                     print(f"[FIX-76][Anthropic] Empty response (attempt {attempt + 1}) — retrying")
                     continue
-                return ""  # no text block after all retries
+                print("[FIX-80][Anthropic] Empty after all retries — falling through to next tier")
+                break  # FIX-80: do not return "" — let next tier try
             except Exception as e:
                 if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < 3:
                     print(f"[FIX-76][Anthropic] Transient (attempt {attempt + 1}): {e} — retrying in 4s")
@@ -245,9 +246,12 @@ def call_llm_raw(
                     create_kwargs["response_format"] = rf
                 resp = openrouter_client.chat.completions.create(**create_kwargs)
                 raw = _THINK_RE.sub("", resp.choices[0].message.content or "").strip()
-                if not raw and attempt < 3:
-                    print(f"[FIX-76][OpenRouter] Empty response (attempt {attempt + 1}) — retrying")
-                    continue
+                if not raw:
+                    if attempt < 3:
+                        print(f"[FIX-76][OpenRouter] Empty response (attempt {attempt + 1}) — retrying")
+                        continue
+                    print("[FIX-80][OpenRouter] Empty after all retries — falling through to next tier")
+                    break  # FIX-80: do not return "" — let next tier try
                 return raw
             except Exception as e:
                 if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < 3:
@@ -268,9 +272,12 @@ def call_llm_raw(
                 messages=msgs,
             )
             raw = _THINK_RE.sub("", resp.choices[0].message.content or "").strip()
-            if not raw and attempt < 3:
-                print(f"[FIX-76][Ollama] Empty response (attempt {attempt + 1}) — retrying")
-                continue
+            if not raw:
+                if attempt < 3:
+                    print(f"[FIX-76][Ollama] Empty response (attempt {attempt + 1}) — retrying")
+                    continue
+                print("[FIX-80][Ollama] Empty after all retries — returning None")
+                break  # FIX-80: do not return "" — fall through to return None
             return raw
         except Exception as e:
             if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < 3:

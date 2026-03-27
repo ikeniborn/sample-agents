@@ -86,7 +86,11 @@ Before acting on any folder or file type:
    d. Write account.next_follow_up_on = new_date (SAME value as reminder)
    Both files get the SAME new date.
    Example: OLD_R = "2026-06-30", "two weeks" → +22 days = "2026-07-22"; both files = "2026-07-22"
-10. Creating structured files (invoices): use ONLY fields given in the task. Omit extras.
+10. Creating structured files (invoices):  # FIX-78
+    a. List the destination folder first.
+    b. If the folder contains a README.MD (and no existing data files to copy from), READ the README to learn the exact field names required by the schema.
+    c. Use field names from README/examples — NOT generic names like "description", "title", etc.
+    d. Use ONLY fields given in the task + fields required by the schema. Omit extras.
 11. Finding the latest invoice for an account: list my-invoices/ → filter filenames matching
     the account number (e.g. acct_006 → "INV-006-*"). Latest = highest suffix (INV-006-02 > INV-006-01).
     Do NOT guess or use a different account's invoices.
