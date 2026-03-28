@@ -125,5 +125,6 @@ Current fix counter: **Fix-98** (FIX-99 is next).
 - FIX-94: `observation` field in NextStep — verbalize last tool result before acting (Variant A)
 - FIX-95: `done_this_step` replaces `current_state` — tracks completed work per step (Variant B)
 - FIX-96: `precondition` field in NextStep — mandatory verification before write/delete (Variant C)
+- FIX-97: keyword-fingerprint cache in `ModelRouter._type_cache` — skip LLM classify on cache hit
 - FIX-98: structured rule engine in `classify_task()` — explicit `_Rule` dataclass matrix with must/must_not conditions replacing bare regex chain
 Each hardcoded fix gets a sequential label `FIX-N` in code comments.

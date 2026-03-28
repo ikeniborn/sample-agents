@@ -105,13 +105,17 @@ def _task_fingerprint(task_text: str) -> frozenset[str]:
     return frozenset(words)
 
 
-def classify_task_llm(task_text: str, model: str, model_config: dict) -> str:
+def classify_task_llm(task_text: str, model: str, model_config: dict,
+                      vault_hint: str | None = None) -> str:
     """FIX-75: Use LLM (classifier model) to classify task type before agent start.
     Uses FIX-76 call_llm_raw() for 3-tier routing + retry; falls back to regex.
     FIX-79: treat empty string same as None (empty response after retries).
     FIX-81: truncate to 150 chars — enough for task verb, avoids injection tail.
-    FIX-82: JSON regex-extraction fallback if json.loads fails."""
+    FIX-82: JSON regex-extraction fallback if json.loads fails.
+    FIX-99: optional vault_hint appended to user message for post-prephase re-class."""
     user_msg = f"Task: {task_text[:150]}"  # FIX-81: 600→150 to avoid injection content
+    if vault_hint:  # FIX-99: add vault context when available
+        user_msg += f"\nContext: {vault_hint}"
     # FIX-94: cap classifier tokens — output is always {"type":"X"} (~8 tokens);
     # 512 leaves room for implicit thinking chains without wasting full model budget.
     _cls_cfg = {**model_config, "max_completion_tokens": min(model_config.get("max_completion_tokens", 512), 512)}
@@ -164,8 +168,18 @@ class ModelRouter:
 
     def resolve_llm(self, task_text: str) -> tuple[str, dict, str]:
         """FIX-75: Use classifier model to classify task, then return (model_id, config, task_type).
-        Falls back to regex-based resolve() if LLM classification fails."""
+        FIX-97: Cache classification results by keyword fingerprint — skip LLM on cache hit."""
+        # FIX-97: check keyword fingerprint cache before calling LLM
+        fp = _task_fingerprint(task_text)
+        if fp:
+            if fp in self._type_cache:
+                cached = self._type_cache[fp]
+                print(f"[MODEL_ROUTER][FIX-97] Cache hit {set(fp)} → '{cached}'")
+                model_id = self._select_model(cached)
+                return model_id, self.configs.get(model_id, {}), cached
         task_type = classify_task_llm(task_text, self.classifier, self.configs.get(self.classifier, {}))
+        if fp:
+            self._type_cache[fp] = task_type  # FIX-97: store in cache
         model_id = self._select_model(task_type)
         print(f"[MODEL_ROUTER][FIX-75] LLM type={task_type} → model={model_id}")
         return model_id, self.configs.get(model_id, {}), task_type
@@ -203,24 +217,43 @@ def _count_tree_files(prephase_log: list) -> int:
     return len(file_lines)
 
 
-def reclassify_with_prephase(task_type: str, task_text: str, pre: PrephaseResult) -> str:
-    """FIX-89: Refine task_type using vault context loaded during prephase.
-    Called after run_prephase(). Returns adjusted task_type string.
-
-    Signal — LONG_CONTEXT upgrade:
-      Vault tree has many file entries (>= 8) AND task text uses bulk-scope words
-      (all/every/each/batch). Applies to DEFAULT and THINK; LONG_CONTEXT stays as-is.
-    """
+def reclassify_with_prephase(
+    task_type: str,
+    task_text: str,
+    pre: PrephaseResult,
+    model: str = "",
+    model_config: dict | None = None,
+) -> str:
+    """FIX-89 + FIX-99: Refine task_type using vault context loaded during prephase.
+    FIX-89: rule-based longContext upgrade (large vault + bulk task).
+    FIX-99: optional LLM re-class with vault context (if model provided).
+    Called after run_prephase(). Returns adjusted task_type string."""
     task_lower = task_text.lower()
+    file_count = _count_tree_files(pre.log)
+    is_bulk = bool(_BULK_TASK_RE.search(task_lower))
 
-    # Signal: large vault + bulk-scope task → longContext
-    if task_type in (TASK_DEFAULT, TASK_THINK) and _BULK_TASK_RE.search(task_lower):
-        file_count = _count_tree_files(pre.log)
-        if file_count >= 8:
+    # FIX-89: rule-based longContext upgrade
+    if task_type in (TASK_DEFAULT, TASK_THINK) and is_bulk and file_count >= 8:
+        print(
+            f"[MODEL_ROUTER][FIX-89] {file_count} files in vault tree + bulk task "
+            f"→ override '{task_type}' → 'longContext'"
+        )
+        return TASK_LONG_CONTEXT
+
+    # FIX-99: LLM re-class with vault context (only if classifier model provided)
+    if model:
+        vault_hint = (
+            f"vault has {file_count} files, "
+            f"bulk-scope: {'yes' if is_bulk else 'no'}"
+        )
+        refined = classify_task_llm(
+            task_text, model, model_config or {}, vault_hint=vault_hint
+        )
+        if refined != task_type:
             print(
-                f"[MODEL_ROUTER][FIX-89] {file_count} files in vault tree + bulk task "
-                f"→ override '{task_type}' → 'longContext'"
+                f"[MODEL_ROUTER][FIX-99] LLM re-class with vault context: "
+                f"'{task_type}' → '{refined}'"
             )
-            return TASK_LONG_CONTEXT
+            return refined
 
     return task_type
