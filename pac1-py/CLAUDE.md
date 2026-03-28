@@ -122,9 +122,12 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **Fix-104** (FIX-105 is next).
+Current fix counter: **Fix-107** (FIX-108 is next).
 - FIX-103: seq.json semantics clarified in prompt — id N = next free slot, use as-is (do NOT add 1 before writing)
 - FIX-104: INBOX WORKFLOW step 2 — check "From:" field first; no From: → OUTCOME_NONE_CLARIFICATION immediately
+- FIX-105: `classify_task_llm()` — plain-text keyword extraction fallback after JSON+regex parse fails (extract "think"/"longContext"/"default" from raw text)
+- FIX-106: `classify_task_llm()` — pass `think=False` and `max_tokens=_cls_cfg["max_completion_tokens"]` to `call_llm_raw`; prevents think-blocks consuming all 20 default tokens
+- FIX-107: `call_llm_raw()` Ollama tier — plain-text retry without `response_format` after 4 failed json_object attempts
 - FIX-94: `observation` field in NextStep — verbalize last tool result before acting (Variant A)
 - FIX-95: `done_this_step` replaces `current_state` — tracks completed work per step (Variant B)
 - FIX-96: `precondition` field in NextStep — mandatory verification before write/delete (Variant C)
