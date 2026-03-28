@@ -127,7 +127,8 @@ def classify_task_llm(task_text: str, model: str, model_config: dict,
     _cls_cfg = {**model_config, "max_completion_tokens": min(model_config.get("max_completion_tokens", 512), 512)}
     try:
         raw = call_llm_raw(_CLASSIFY_SYSTEM, user_msg, model, _cls_cfg,
-                           max_tokens=64, think=False)  # FIX-103: disable think + 64 output tokens
+                           max_tokens=_cls_cfg["max_completion_tokens"],
+                           think=False)  # FIX-103: disable think + use configured token budget
         if not raw:  # FIX-79: catch both None and "" (empty string after retry exhaustion)
             print("[MODEL_ROUTER][FIX-75] All LLM tiers failed or empty, falling back to regex")
             _classifier_llm_ok = False
