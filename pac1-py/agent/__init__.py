@@ -17,8 +17,12 @@ def run_agent(router: ModelRouter, harness_url: str, task_text: str) -> dict:
 
     pre = run_prephase(vm, task_text, system_prompt)
 
-    # FIX-89: refine task_type using vault context from prephase (AGENTS.MD + tree)
-    refined = reclassify_with_prephase(task_type, task_text, pre)
+    # FIX-89 + FIX-99: refine task_type using vault context from prephase
+    refined = reclassify_with_prephase(
+        task_type, task_text, pre,
+        model=router.classifier,
+        model_config=router.configs.get(router.classifier, {}),
+    )
     if refined != task_type:
         task_type = refined
         model, cfg = router.model_for_type(task_type)

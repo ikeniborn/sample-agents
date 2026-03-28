@@ -121,10 +121,11 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **Fix-98** (FIX-99 is next).
+Current fix counter: **Fix-99** (FIX-100 is next).
 - FIX-94: `observation` field in NextStep — verbalize last tool result before acting (Variant A)
 - FIX-95: `done_this_step` replaces `current_state` — tracks completed work per step (Variant B)
 - FIX-96: `precondition` field in NextStep — mandatory verification before write/delete (Variant C)
 - FIX-97: keyword-fingerprint cache in `ModelRouter._type_cache` — skip LLM classify on cache hit
 - FIX-98: structured rule engine in `classify_task()` — explicit `_Rule` dataclass matrix with must/must_not conditions replacing bare regex chain
+- FIX-99: two-phase LLM re-class with vault context — `classify_task_llm()` gains optional `vault_hint`; `reclassify_with_prephase()` passes vault file count + bulk flag to LLM after prephase
 Each hardcoded fix gets a sequential label `FIX-N` in code comments.
