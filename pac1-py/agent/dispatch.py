@@ -301,6 +301,19 @@ def call_llm_raw(
             print(f"[FIX-76][Ollama] Error: {e}")
             break
 
+    # FIX-104: plain-text retry — if all json_object attempts failed, try without response_format
+    try:
+        _pt_kw: dict = dict(model=ollama_model, max_tokens=max_tokens, messages=msgs)
+        if _ollama_extra:
+            _pt_kw["extra_body"] = _ollama_extra
+        resp = ollama_client.chat.completions.create(**_pt_kw)
+        raw = _THINK_RE.sub("", resp.choices[0].message.content or "").strip()
+        if raw:
+            print(f"[FIX-104][Ollama] Plain-text retry succeeded: {raw[:60]!r}")
+            return raw
+    except Exception as e:
+        print(f"[FIX-104][Ollama] Plain-text retry failed: {e}")
+
     return None
 
 
