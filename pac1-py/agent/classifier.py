@@ -126,7 +126,8 @@ def classify_task_llm(task_text: str, model: str, model_config: dict,
     # 512 leaves room for implicit thinking chains without wasting full model budget.
     _cls_cfg = {**model_config, "max_completion_tokens": min(model_config.get("max_completion_tokens", 512), 512)}
     try:
-        raw = call_llm_raw(_CLASSIFY_SYSTEM, user_msg, model, _cls_cfg)
+        raw = call_llm_raw(_CLASSIFY_SYSTEM, user_msg, model, _cls_cfg,
+                           max_tokens=64, think=False)  # FIX-103: disable think + 64 output tokens
         if not raw:  # FIX-79: catch both None and "" (empty string after retry exhaustion)
             print("[MODEL_ROUTER][FIX-75] All LLM tiers failed or empty, falling back to regex")
             _classifier_llm_ok = False
@@ -140,6 +141,18 @@ def classify_task_llm(task_text: str, model: str, model_config: dict,
             detected = m.group(1).strip() if m else ""
             if detected:
                 print(f"[MODEL_ROUTER][FIX-82] Extracted type via regex from: {raw!r}")
+        # FIX-105: plain-text keyword extraction (after JSON + regex fallbacks)
+        if not detected:
+            raw_lower = raw.lower()
+            if "longcontext" in raw_lower or "long_context" in raw_lower or "long context" in raw_lower:
+                detected = TASK_LONG_CONTEXT
+                print(f"[MODEL_ROUTER][FIX-105] Extracted type 'longContext' from plain text: {raw[:60]!r}")
+            elif "think" in raw_lower:
+                detected = TASK_THINK
+                print(f"[MODEL_ROUTER][FIX-105] Extracted type 'think' from plain text: {raw[:60]!r}")
+            elif "default" in raw_lower:
+                detected = TASK_DEFAULT
+                print(f"[MODEL_ROUTER][FIX-105] Extracted type 'default' from plain text: {raw[:60]!r}")
         if detected in _VALID_TYPES:
             print(f"[MODEL_ROUTER][FIX-75] LLM classified task as '{detected}'")
             _classifier_llm_ok = True
