@@ -116,13 +116,18 @@ Key env vars:
 - `BENCHMARK_ID` — benchmark ID (default: `bitgn/pac1-dev`)
 - `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY` — API keys (in `.secrets`)
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL` — local Ollama overrides
+- `LOG_LEVEL` — logging verbosity: `INFO` (default) or `DEBUG` (logs full think blocks + full RAW)
 
 Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 - `max_completion_tokens`, `thinking_budget`, `response_format_hint`
 
 ## Fix numbering
 
-Current fix counter: **Fix-107** (FIX-108 is next).
+Current fix counter: **Fix-111** (FIX-112 is next).
+- FIX-111: `done_operations` field in `NextStep` schema + server-side ledger in `preserve_prefix` (survives compaction) + improved `_compact_log` (extracts WRITTEN/DELETED from user messages) + YAML fallback in `_extract_json_from_text` (`models.py`, `loop.py`, `prompt.py`)
+- FIX-110: `LOG_LEVEL` env var (`INFO`/`DEBUG`) + auto-tee stdout → `logs/{ts}_{model}.log` (`main.py`); DEBUG mode logs full `<think>` blocks and full RAW response without 500-char truncation (`loop.py`, `dispatch.py`)
+- FIX-108: `call_llm_raw()` — `max_retries` parameter (default 3); classifier passes `max_retries=0` → 1 attempt only, instant fallback to regex (saves 2-4 min per task on empty response)
+- FIX-109: prompt.py — attachments field reinforced in email step 3 and inbox step 6: REQUIRED for invoice resend, never omit
 - FIX-103: seq.json semantics clarified in prompt — id N = next free slot, use as-is (do NOT add 1 before writing)
 - FIX-104: INBOX WORKFLOW step 2 — check "From:" field first; no From: → OUTCOME_NONE_CLARIFICATION immediately
 - FIX-105: `classify_task_llm()` — plain-text keyword extraction fallback after JSON+regex parse fails (extract "think"/"longContext"/"default" from raw text)

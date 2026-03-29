@@ -189,6 +189,7 @@ _TRANSIENT_KWS_RAW = (
 )
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()  # FIX-110: DEBUG → log think blocks
 
 
 def is_ollama_model(model: str) -> bool:
@@ -205,10 +206,12 @@ def call_llm_raw(
     cfg: dict,
     max_tokens: int = 20,
     think: bool | None = None,  # FIX-84: None=use cfg, False=disable, True=enable
+    max_retries: int = 3,  # FIX-108: classifier passes 0 → 1 attempt, no retries
 ) -> str | None:
     """FIX-76: Lightweight LLM call with 3-tier routing and FIX-27 retry.
     Returns raw text (think blocks stripped), or None if all tiers fail.
-    Used by classify_task_llm(); caller handles JSON parsing and fallback."""
+    Used by classify_task_llm(); caller handles JSON parsing and fallback.
+    FIX-108: max_retries controls retry count per tier (0 = 1 attempt only)."""
 
     msgs = [
         {"role": "system", "content": system},
@@ -218,7 +221,7 @@ def call_llm_raw(
     # --- Tier 1: Anthropic SDK ---
     if is_claude_model(model) and anthropic_client is not None:
         ant_model = get_anthropic_model_id(model)
-        for attempt in range(4):
+        for attempt in range(max_retries + 1):
             try:
                 resp = anthropic_client.messages.create(
                     model=ant_model,
@@ -230,13 +233,13 @@ def call_llm_raw(
                 for block in resp.content:
                     if getattr(block, "type", None) == "text" and block.text.strip():
                         return block.text.strip()
-                if attempt < 3:
+                if attempt < max_retries:
                     print(f"[FIX-76][Anthropic] Empty response (attempt {attempt + 1}) — retrying")
                     continue
                 print("[FIX-80][Anthropic] Empty after all retries — falling through to next tier")
                 break  # FIX-80: do not return "" — let next tier try
             except Exception as e:
-                if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < 3:
+                if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < max_retries:
                     print(f"[FIX-76][Anthropic] Transient (attempt {attempt + 1}): {e} — retrying in 4s")
                     time.sleep(4)
                     continue
@@ -247,22 +250,27 @@ def call_llm_raw(
     if openrouter_client is not None and not is_ollama_model(model):  # FIX-83
         so_mode = probe_structured_output(openrouter_client, model, hint=cfg.get("response_format_hint"))
         rf = {"type": "json_object"} if so_mode == "json_object" else None
-        for attempt in range(4):
+        for attempt in range(max_retries + 1):
             try:
                 create_kwargs: dict = dict(model=model, max_tokens=max_tokens, messages=msgs)
                 if rf is not None:
                     create_kwargs["response_format"] = rf
                 resp = openrouter_client.chat.completions.create(**create_kwargs)
-                raw = _THINK_RE.sub("", resp.choices[0].message.content or "").strip()
+                _content = resp.choices[0].message.content or ""
+                if _LOG_LEVEL == "DEBUG":  # FIX-110
+                    _m = re.search(r"<think>(.*?)</think>", _content, re.DOTALL)
+                    if _m:
+                        print(f"[FIX-110][OpenRouter][THINK]: {_m.group(1).strip()}")
+                raw = _THINK_RE.sub("", _content).strip()
                 if not raw:
-                    if attempt < 3:
+                    if attempt < max_retries:
                         print(f"[FIX-76][OpenRouter] Empty response (attempt {attempt + 1}) — retrying")
                         continue
                     print("[FIX-80][OpenRouter] Empty after all retries — falling through to next tier")
                     break  # FIX-80: do not return "" — let next tier try
                 return raw
             except Exception as e:
-                if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < 3:
+                if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < max_retries:
                     print(f"[FIX-76][OpenRouter] Transient (attempt {attempt + 1}): {e} — retrying in 4s")
                     time.sleep(4)
                     continue
@@ -274,7 +282,7 @@ def call_llm_raw(
     # FIX-84: explicit think= overrides cfg; None means use cfg default
     _think_flag = think if think is not None else cfg.get("ollama_think")
     _ollama_extra: dict | None = {"think": _think_flag} if _think_flag is not None else None
-    for attempt in range(4):
+    for attempt in range(max_retries + 1):
         try:
             _create_kw: dict = dict(
                 model=ollama_model,
@@ -285,16 +293,21 @@ def call_llm_raw(
             if _ollama_extra:
                 _create_kw["extra_body"] = _ollama_extra
             resp = ollama_client.chat.completions.create(**_create_kw)
-            raw = _THINK_RE.sub("", resp.choices[0].message.content or "").strip()
+            _content = resp.choices[0].message.content or ""
+            if _LOG_LEVEL == "DEBUG":  # FIX-110
+                _m = re.search(r"<think>(.*?)</think>", _content, re.DOTALL)
+                if _m:
+                    print(f"[FIX-110][Ollama][THINK]: {_m.group(1).strip()}")
+            raw = _THINK_RE.sub("", _content).strip()
             if not raw:
-                if attempt < 3:
+                if attempt < max_retries:
                     print(f"[FIX-76][Ollama] Empty response (attempt {attempt + 1}) — retrying")
                     continue
                 print("[FIX-80][Ollama] Empty after all retries — returning None")
                 break  # FIX-80: do not return "" — fall through to return None
             return raw
         except Exception as e:
-            if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < 3:
+            if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < max_retries:
                 print(f"[FIX-76][Ollama] Transient (attempt {attempt + 1}): {e} — retrying in 4s")
                 time.sleep(4)
                 continue
@@ -307,7 +320,12 @@ def call_llm_raw(
         if _ollama_extra:
             _pt_kw["extra_body"] = _ollama_extra
         resp = ollama_client.chat.completions.create(**_pt_kw)
-        raw = _THINK_RE.sub("", resp.choices[0].message.content or "").strip()
+        _content = resp.choices[0].message.content or ""
+        if _LOG_LEVEL == "DEBUG":  # FIX-110
+            _m = re.search(r"<think>(.*?)</think>", _content, re.DOTALL)
+            if _m:
+                print(f"[FIX-110][Ollama-pt][THINK]: {_m.group(1).strip()}")
+        raw = _THINK_RE.sub("", _content).strip()
         if raw:
             print(f"[FIX-104][Ollama] Plain-text retry succeeded: {raw[:60]!r}")
             return raw

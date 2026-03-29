@@ -1,8 +1,75 @@
+import datetime
 import json
 import os
+import re
+import sys
 import textwrap
 import time
+import zoneinfo
 from pathlib import Path
+
+
+# ---------------------------------------------------------------------------
+# FIX-110: LOG_LEVEL env + auto-tee stdout → logs/{ts}_{model}.log
+# Must be set up before agent/dispatch imports (they print at import time).
+# ---------------------------------------------------------------------------
+
+def _setup_log_tee() -> None:
+    """Tee stdout to logs/{ts}_{model}.log. ANSI codes are stripped in file."""
+    # Read MODEL_DEFAULT and LOG_LEVEL from env or .env file (no import side-effects yet)
+    _env_path = Path(__file__).parent / ".env"
+    _dotenv: dict[str, str] = {}
+    try:
+        for _line in _env_path.read_text().splitlines():
+            _s = _line.strip()
+            if _s and not _s.startswith("#") and "=" in _s:
+                _k, _, _v = _s.partition("=")
+                _dotenv[_k.strip()] = _v.strip()
+    except Exception:
+        pass
+
+    model = os.getenv("MODEL_DEFAULT") or _dotenv.get("MODEL_DEFAULT") or "unknown"
+    log_level = (os.getenv("LOG_LEVEL") or _dotenv.get("LOG_LEVEL") or "INFO").upper()
+
+    logs_dir = Path(__file__).parent / "logs"
+    logs_dir.mkdir(exist_ok=True)
+
+    _tz_name = os.environ.get("TZ", "")
+    try:
+        _tz = zoneinfo.ZoneInfo(_tz_name) if _tz_name else None
+    except Exception:
+        _tz = None
+    _now = datetime.datetime.now(tz=_tz) if _tz else datetime.datetime.now()
+    _safe = model.replace("/", "-").replace(":", "-")
+    log_path = logs_dir / f"{_now.strftime('%Y%m%d_%H%M%S')}_{_safe}.log"
+
+    _fh = open(log_path, "w", buffering=1, encoding="utf-8")
+    _ansi = re.compile(r"\x1B\[[0-9;]*[A-Za-z]")
+    _orig = sys.stdout
+
+    class _Tee:
+        def write(self, data: str) -> None:
+            _orig.write(data)
+            _fh.write(_ansi.sub("", data))
+
+        def flush(self) -> None:
+            _orig.flush()
+            _fh.flush()
+
+        def isatty(self) -> bool:
+            return _orig.isatty()
+
+        @property
+        def encoding(self) -> str:
+            return _orig.encoding
+
+    sys.stdout = _Tee()
+    print(f"[LOG] {log_path}  (LOG_LEVEL={log_level})")
+
+
+LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()  # re-exported for external use
+_setup_log_tee()
+
 
 from bitgn.harness_connect import HarnessServiceClientSync
 from bitgn.harness_pb2 import EndTrialRequest, EvalPolicy, GetBenchmarkRequest, StartPlaygroundRequest, StatusRequest
@@ -117,16 +184,18 @@ def main() -> None:
             total_out += ts.get("output_tokens", 0)
 
         # Summary table for log (no color codes)
-        W = 152
+        W = 166
         sep = "=" * W
         print(f"\n{sep}")
         _title = "ИТОГОВАЯ СТАТИСТИКА"
         print(f"{_title:^{W}}")
         print(sep)
-        print(f"{'Задание':<10} {'Оценка':>7} {'Время':>8}  {'Вход(tok)':>10} {'Выход(tok)':>10} {'ток/с':>7}  {'Тип':<11} {'Модель':<34}  Проблемы")
+        print(f"{'Задание':<10} {'Оценка':>7} {'Время':>8}  {'Шаги':>5} {'Запр':>5}  {'Вход(tok)':>10} {'Выход(tok)':>10} {'ток/с':>7}  {'Тип':<11} {'Модель':<34}  Проблемы")
         print("-" * W)
         model_totals: dict[str, dict] = {}
         total_llm_ms = 0
+        total_steps = 0
+        total_calls = 0
         for task_id, score, detail, elapsed, ts in scores:
             issues = "; ".join(detail) if score < 1.0 else "—"
             in_t = ts.get("input_tokens", 0)
@@ -134,6 +203,8 @@ def main() -> None:
             llm_ms = ts.get("llm_elapsed_ms", 0)
             ev_c   = ts.get("ollama_eval_count", 0)
             ev_ms  = ts.get("ollama_eval_ms", 0)
+            steps  = ts.get("step_count", 0)
+            calls  = ts.get("llm_call_count", 0)
             # Prefer Ollama-native gen metrics (accurate); fall back to wall-clock
             if ev_c > 0 and ev_ms > 0:
                 tps = ev_c / (ev_ms / 1000.0)
@@ -142,10 +213,12 @@ def main() -> None:
             else:
                 tps = 0.0
             total_llm_ms += llm_ms
+            total_steps += steps
+            total_calls += calls
             m = ts.get("model_used", "—")
             m_short = m.split("/")[-1] if "/" in m else m
             t_type = ts.get("task_type", "—")
-            print(f"{task_id:<10} {score:>7.2f} {elapsed:>7.1f}s  {in_t:>10,} {out_t:>10,} {tps:>6.0f}  {t_type:<11} {m_short:<34}  {issues}")
+            print(f"{task_id:<10} {score:>7.2f} {elapsed:>7.1f}s  {steps:>5} {calls:>5}  {in_t:>10,} {out_t:>10,} {tps:>6.0f}  {t_type:<11} {m_short:<34}  {issues}")
             if m not in model_totals:
                 model_totals[m] = {"in": 0, "out": 0, "llm_ms": 0, "ev_c": 0, "ev_ms": 0, "count": 0}
             model_totals[m]["in"] += in_t
@@ -159,6 +232,8 @@ def main() -> None:
         avg_elapsed = total_elapsed / n if n else 0
         avg_in = total_in // n if n else 0
         avg_out = total_out // n if n else 0
+        avg_steps = total_steps // n if n else 0
+        avg_calls = total_calls // n if n else 0
         total_ev_c  = sum(ts.get("ollama_eval_count", 0) for *_, ts in scores)
         total_ev_ms = sum(ts.get("ollama_eval_ms", 0)    for *_, ts in scores)
         if total_ev_c > 0 and total_ev_ms > 0:
@@ -168,8 +243,8 @@ def main() -> None:
         else:
             total_tps = 0.0
         print(sep)
-        print(f"{'ИТОГО':<10} {total:>6.2f}% {total_elapsed:>7.1f}s  {total_in:>10,} {total_out:>10,} {total_tps:>6.0f}  {'':11} {'':34}")
-        print(f"{'СРЕДНЕЕ':<10} {'':>7} {avg_elapsed:>7.1f}s  {avg_in:>10,} {avg_out:>10,} {'':>6}  {'':11} {'':34}")
+        print(f"{'ИТОГО':<10} {total:>6.2f}% {total_elapsed:>7.1f}s  {total_steps:>5} {total_calls:>5}  {total_in:>10,} {total_out:>10,} {total_tps:>6.0f}  {'':11} {'':34}")
+        print(f"{'СРЕДНЕЕ':<10} {'':>7} {avg_elapsed:>7.1f}s  {avg_steps:>5} {avg_calls:>5}  {avg_in:>10,} {avg_out:>10,} {'':>6}  {'':11} {'':34}")
         print(sep)
         if len(model_totals) > 1:
             print(f"\n{'─' * 84}")

@@ -25,6 +25,7 @@ from .prephase import PrephaseResult
 
 
 TASK_TIMEOUT_S = int(os.environ.get("TASK_TIMEOUT_S", "180"))  # default 3 min, override via env
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()  # FIX-110: DEBUG → log think blocks + full RAW
 
 # FIX-76: copy also defined in dispatch.py for call_llm_raw(); keep both in sync
 _TRANSIENT_KWS = ("503", "502", "429", "NoneType", "overloaded", "unavailable", "server error", "rate limit", "rate-limit")
@@ -73,12 +74,23 @@ def _compact_log(log: list, max_tool_pairs: int = 7, preserve_prefix: list | Non
     kept = tail[-max_msgs:]
 
     summary_parts = []
+    confirmed_ops = []
     for msg in old:
-        if msg.get("role") == "assistant":
-            content = msg.get("content", "")
-            if content:
-                summary_parts.append(f"- {content}")
-    summary = "Previous steps summary:\n" + "\n".join(summary_parts[-5:])
+        role = msg.get("role", "")
+        content = msg.get("content", "")
+        if role == "assistant" and content:
+            summary_parts.append(f"- {content[:120]}")
+        elif role == "user" and content:
+            # FIX-111: extract confirmed operations from compacted tool results
+            for line in content.splitlines():
+                if line.startswith(("WRITTEN:", "DELETED:", "MOVED:", "CREATED DIR:")):
+                    confirmed_ops.append(line)
+    parts: list[str] = []
+    if confirmed_ops:
+        parts.append("Confirmed ops (already done, do NOT redo):\n" + "\n".join(f"  {op}" for op in confirmed_ops))
+    if summary_parts:
+        parts.append("Actions taken:\n" + "\n".join(summary_parts[-5:]))
+    summary = "Previous steps summary:\n" + ("\n".join(parts) if parts else "(none)")
 
     base = preserve_prefix if preserve_prefix is not None else log[:prefix_len]
     return list(base) + [{"role": "user", "content": summary}] + kept
@@ -147,6 +159,17 @@ def _extract_json_from_text(text: str) -> dict | None:
                     except (json.JSONDecodeError, ValueError):
                         break
 
+    # FIX-111: YAML fallback — for models that output YAML or Markdown when JSON schema not supported
+    try:
+        import yaml  # pyyaml
+        stripped = re.sub(r"```(?:yaml)?\s*", "", text.strip()).strip("`").strip()
+        parsed_yaml = yaml.safe_load(stripped)
+        if isinstance(parsed_yaml, dict) and any(k in parsed_yaml for k in ("current_state", "function", "tool")):
+            print(f"\x1B[33m[FIX-111] YAML fallback parsed successfully\x1B[0m")
+            return parsed_yaml
+    except Exception:
+        pass
+
     return None
 
 
@@ -209,8 +232,11 @@ def _call_openai_tier(
                 print(f"{CLI_YELLOW}[{label}] ollama: gen={_gen_tps:.0f} tok/s  prompt={_pr_tps:.0f} tok/s  TTFT={_ttft_ms}ms{CLI_CLR}")
             think_match = re.search(r"<think>(.*?)</think>", raw, re.DOTALL)
             think_tok = len(think_match.group(1)) // 4 if think_match else 0
+            if _LOG_LEVEL == "DEBUG" and think_match:  # FIX-110
+                print(f"{CLI_YELLOW}[{label}][THINK]: {think_match.group(1).strip()}{CLI_CLR}")
             raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-            print(f"{CLI_YELLOW}[{label}] RAW: {raw[:500]}{CLI_CLR}")
+            _raw_limit = None if _LOG_LEVEL == "DEBUG" else 500  # FIX-110
+            print(f"{CLI_YELLOW}[{label}] RAW: {raw[:_raw_limit]}{CLI_CLR}")
             if response_format is not None:
                 try:
                     parsed = json.loads(raw)
@@ -293,12 +319,17 @@ def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextSt
                 for block in response.content:
                     if block.type == "thinking":
                         # Estimate thinking tokens (rough: chars / 4)
-                        think_tok += len(getattr(block, "thinking", "")) // 4
+                        _think_text = getattr(block, "thinking", "")
+                        think_tok += len(_think_text) // 4
+                        if _LOG_LEVEL == "DEBUG" and _think_text:  # FIX-110
+                            print(f"{CLI_YELLOW}[Anthropic][THINK]: {_think_text}{CLI_CLR}")
                     elif block.type == "text":
                         raw = block.text
                 in_tok = getattr(getattr(response, "usage", None), "input_tokens", 0)
                 out_tok = getattr(getattr(response, "usage", None), "output_tokens", 0)
                 print(f"{CLI_YELLOW}[Anthropic] tokens in={in_tok} out={out_tok} think≈{think_tok}{CLI_CLR}")
+                if _LOG_LEVEL == "DEBUG":  # FIX-110
+                    print(f"{CLI_YELLOW}[Anthropic] RAW: {raw}{CLI_CLR}")
             except Exception as e:
                 err_str = str(e)
                 is_transient = any(kw.lower() in err_str.lower() for kw in _TRANSIENT_KWS)
@@ -402,12 +433,19 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
     total_elapsed_ms = 0
     total_eval_count = 0  # Ollama-native generated tokens (0 for other backends)
     total_eval_ms = 0     # Ollama-native generation time ms (0 for other backends)
+    step_count = 0        # number of main-loop iterations started
+    llm_call_count = 0    # total LLM API calls made (incl. retries and stall hints)
 
     # FIX-74: adaptive stall detection state
     _action_fingerprints: deque = deque(maxlen=6)
     _steps_since_write: int = 0
     _error_counts: Counter = Counter()
     _stall_hint_active: bool = False
+
+    # FIX-111: server-authoritative done_operations ledger
+    # Survives log compaction — injected into preserve_prefix and updated in-place
+    _done_ops: list[str] = []
+    _ledger_msg: dict | None = None
 
     for i in range(max_steps):
         # --- Task timeout check ---
@@ -424,6 +462,7 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
                 pass
             break
 
+        step_count += 1
         step = f"step_{i + 1}"
         print(f"\n{CLI_BLUE}--- {step} ---{CLI_CLR} ", end="")
 
@@ -432,6 +471,7 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
 
         # --- LLM call ---
         job, elapsed_ms, in_tok, out_tok, _, ev_c, ev_ms = _call_llm(log, model, max_tokens, cfg)
+        llm_call_count += 1
         total_in_tok += in_tok
         total_out_tok += out_tok
         total_elapsed_ms += elapsed_ms
@@ -450,6 +490,7 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
                 'task_completed=boolean (true/false not string), function=object with "tool" key inside.'
             )})
             job, elapsed_ms, in_tok, out_tok, _, ev_c, ev_ms = _call_llm(log, model, max_tokens, cfg)
+            llm_call_count += 1
             total_in_tok += in_tok
             total_out_tok += out_tok
             total_elapsed_ms += elapsed_ms
@@ -472,6 +513,11 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
         step_summary = job.plan_remaining_steps_brief[0] if job.plan_remaining_steps_brief else "(no steps)"
         print(f"{step_summary} ({elapsed_ms} ms)\n  {job.function}")
 
+        # FIX-111: if model omitted done_operations, inject server-authoritative list
+        if _done_ops and not job.done_operations:
+            print(f"{CLI_YELLOW}[FIX-111] Injecting server-authoritative done_operations ({len(_done_ops)} ops){CLI_CLR}")
+            job = job.model_copy(update={"done_operations": list(_done_ops)})
+
         # Serialize once; reuse for fingerprint and log message
         action_name = job.function.__class__.__name__
         action_args = job.function.model_dump_json()
@@ -486,6 +532,7 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             log.append({"role": "user", "content": f"[STALL HINT] {_stall_hint}"})
             _stall_hint_active = True
             _job2, _e2, _i2, _o2, _, _ev_c2, _ev_ms2 = _call_llm(log, model, max_tokens, cfg)
+            llm_call_count += 1
             log.pop()
             if _job2 is not None:
                 job = _job2
@@ -550,6 +597,27 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
                 _steps_since_write = 0
                 _stall_hint_active = False
                 _error_counts.clear()
+                # FIX-111: update server-authoritative done_operations ledger
+                if not txt.startswith("ERROR"):
+                    if isinstance(job.function, Req_Write):
+                        _done_ops.append(f"WRITTEN: {job.function.path}")
+                    elif isinstance(job.function, Req_Delete):
+                        _done_ops.append(f"DELETED: {job.function.path}")
+                    elif isinstance(job.function, Req_Move):
+                        _done_ops.append(f"MOVED: {job.function.from_name} → {job.function.to_name}")
+                    elif isinstance(job.function, Req_MkDir):
+                        _done_ops.append(f"CREATED DIR: {job.function.path}")
+                    # Inject/update ledger in preserve_prefix so it survives compaction
+                    if _done_ops:
+                        ledger_content = (
+                            "Confirmed completed operations so far (do NOT redo these):\n"
+                            + "\n".join(f"- {op}" for op in _done_ops)
+                        )
+                        if _ledger_msg is None:
+                            _ledger_msg = {"role": "user", "content": ledger_content}
+                            preserve_prefix.append(_ledger_msg)
+                        else:
+                            _ledger_msg["content"] = ledger_content
             else:
                 _steps_since_write += 1
         except ConnectError as exc:
@@ -602,4 +670,6 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
         "llm_elapsed_ms": total_elapsed_ms,
         "ollama_eval_count": total_eval_count,   # 0 for non-Ollama
         "ollama_eval_ms": total_eval_ms,          # 0 for non-Ollama
+        "step_count": step_count,
+        "llm_call_count": llm_call_count,
     }
