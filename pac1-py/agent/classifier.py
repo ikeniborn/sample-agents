@@ -128,15 +128,27 @@ def classify_task_llm(task_text: str, model: str, model_config: dict,
         return _regex_pre
     user_msg = f"Task: {task_text[:150]}"  # FIX-81: 600→150 to avoid injection content
     if vault_hint:  # FIX-99: add vault context when available
-        user_msg += f"\nContext: {vault_hint}"
+        # FIX-121: truncate vault_hint to 400 chars — first lines of AGENTS.MD contain the
+        # role/folder summary which is sufficient for classification. Full AGENTS.MD (~1000+
+        # chars) passed via ollama options (repeat_penalty, repeat_last_n tuned for long
+        # agent steps) causes empty responses under GPU load for this short 8-token output.
+        user_msg += f"\nContext: {vault_hint[:400]}"
     # FIX-94: cap classifier tokens — output is always {"type":"X"} (~8 tokens);
     # 512 leaves room for implicit thinking chains without wasting full model budget.
-    _cls_cfg = {**model_config, "max_completion_tokens": min(model_config.get("max_completion_tokens", 512), 512)}
+    # FIX-121: strip agent-loop ollama_options (repeat_penalty/repeat_last_n tuned for
+    # long generation) — classifier only needs num_ctx and temperature.
+    _base_opts = model_config.get("ollama_options", {})
+    _cls_opts = {k: v for k, v in _base_opts.items() if k in ("num_ctx", "temperature")}
+    _cls_cfg = {
+        **model_config,
+        "max_completion_tokens": min(model_config.get("max_completion_tokens", 512), 512),
+        "ollama_options": _cls_opts or None,
+    }
     try:
         raw = call_llm_raw(_CLASSIFY_SYSTEM, user_msg, model, _cls_cfg,
                            max_tokens=_cls_cfg["max_completion_tokens"],
                            think=False,  # FIX-103: disable think + use configured token budget
-                           max_retries=0)  # FIX-108: 1 attempt only → instant fallback to regex
+                           max_retries=1)  # FIX-121: 1 retry (was 0) — empty response under load
         if not raw:  # FIX-79: catch both None and "" (empty string after retry exhaustion)
             print("[MODEL_ROUTER][FIX-75] All LLM tiers failed or empty, falling back to regex")
             return classify_task(task_text)
