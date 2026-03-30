@@ -364,8 +364,12 @@ def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextSt
 
     # --- Ollama fallback (local, tier 3) ---
     ollama_model = cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL", "qwen2.5:7b")
-    extra = {"think": cfg["ollama_think"]} if "ollama_think" in cfg else None
-    return _call_openai_tier(ollama_client, ollama_model, log, cfg.get("max_completion_tokens", max_tokens), "Ollama", extra_body=extra, response_format=get_response_format("json_schema"))
+    extra: dict = {}
+    if "ollama_think" in cfg:
+        extra["think"] = cfg["ollama_think"]
+    if cfg.get("ollama_options"):  # FIX-119: pass adaptive ollama_options (mirroring dispatch.py FIX-118)
+        extra["options"] = cfg["ollama_options"]
+    return _call_openai_tier(ollama_client, ollama_model, log, cfg.get("max_completion_tokens", max_tokens), "Ollama", extra_body=extra if extra else None, response_format=get_response_format("json_schema"))
 
 
 # ---------------------------------------------------------------------------

@@ -83,7 +83,13 @@ BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/pac1-dev"
 
 _MODELS_JSON = Path(__file__).parent / "models.json"
 _raw = json.loads(_MODELS_JSON.read_text())
+_profiles: dict[str, dict] = _raw.get("_profiles", {})  # FIX-119: named parameter profiles
 MODEL_CONFIGS: dict[str, dict] = {k: v for k, v in _raw.items() if not k.startswith("_")}
+# FIX-119: resolve profile name references in ollama_options fields (string → dict)
+for _cfg in MODEL_CONFIGS.values():
+    for _fname in ("ollama_options", "ollama_options_think", "ollama_options_longContext"):
+        if isinstance(_cfg.get(_fname), str):
+            _cfg[_fname] = _profiles.get(_cfg[_fname], {})
 
 # FIX-91: все типы задаются явно — MODEL_ID как fallback упразднён.
 # Каждая переменная обязательна; если не задана — ValueError при старте.

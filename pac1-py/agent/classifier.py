@@ -183,9 +183,21 @@ class ModelRouter:
         print(f"[MODEL_ROUTER] type={task_type} → model={model_id}")
         return model_id, self.configs.get(model_id, {}), task_type
 
+    def _adapt_config(self, cfg: dict, task_type: str) -> dict:
+        """FIX-119: apply task-type specific ollama_options overlay (shallow merge).
+        Merges ollama_options_{task_type} on top of base ollama_options if present."""
+        key = f"ollama_options_{task_type}"
+        override = cfg.get(key)
+        if not override:
+            return cfg
+        adapted = {**cfg, "ollama_options": {**cfg.get("ollama_options", {}), **override}}
+        print(f"[MODEL_ROUTER][FIX-119] adapted ollama_options for type={task_type}: {adapted['ollama_options']}")
+        return adapted
+
     def resolve_after_prephase(self, task_text: str, pre: "PrephaseResult") -> tuple[str, dict, str]:
         """FIX-117: classify once AFTER prephase using AGENTS.MD content as context.
-        AGENTS.MD describes task workflows and complexity — single LLM call with full context."""
+        AGENTS.MD describes task workflows and complexity — single LLM call with full context.
+        FIX-119: applies task-type adaptive ollama_options via _adapt_config before returning."""
         file_count = _count_tree_files(pre.log)
         vault_hint = None
         if pre.agents_md_content:
@@ -196,6 +208,7 @@ class ModelRouter:
         )
         model_id = self._select_model(task_type)
         print(f"[MODEL_ROUTER][FIX-117] type={task_type} → model={model_id}")
-        return model_id, self.configs.get(model_id, {}), task_type
+        adapted_cfg = self._adapt_config(self.configs.get(model_id, {}), task_type)
+        return model_id, adapted_cfg, task_type
 
 
