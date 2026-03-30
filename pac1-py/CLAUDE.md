@@ -117,7 +117,8 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **Fix-121** (FIX-122 is next).
+Current fix counter: **Fix-122** (FIX-123 is next).
+- FIX-122: `dispatch.py` `call_llm_raw()` Ollama tier — remove `max_tokens` param from both the main `json_object` loop and the FIX-104 plain-text retry call; Ollama stops naturally after generating the JSON token ({"type":"X"}, ~8 tokens); explicit `max_tokens` cap caused empty responses under GPU load when Ollama mishandles short-output caps
 - FIX-121: `classifier.py` `classify_task_llm()` — two fixes for classifier empty-response under GPU load: (1) truncate vault_hint to 400 chars (first lines of AGENTS.MD are sufficient for role/type detection); (2) strip agent-loop ollama_options from classifier call (repeat_penalty/repeat_last_n/top_k tuned for long generation cause empty responses for 8-token output — keep only num_ctx+temperature); (3) raise max_retries 0→1 (one retry now that call is lightweight)
 - FIX-120: `classifier.py` `classify_task_llm()` — regex pre-check fast-path: if regex gives non-default (`think`/`longContext`), return immediately and skip LLM call; LLM is only called when regex is unsure (returns `default`) and vault context might reveal analytical/bulk scope
 - FIX-119: `models.json` `_profiles` section (named parameter sets: default/think/long_ctx) + profile references in all 15 models; `main.py` resolves string→dict at load time; `classifier.py` `ModelRouter._adapt_config()` merges task-type overlay into model config inside `resolve_after_prephase()`; `loop.py` Ollama tier now passes `ollama_options` via `extra_body["options"]` (was only `ollama_think`)

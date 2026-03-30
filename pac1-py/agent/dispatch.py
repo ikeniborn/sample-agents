@@ -288,9 +288,11 @@ def call_llm_raw(
         _ollama_extra["options"] = cfg["ollama_options"]
     for attempt in range(max_retries + 1):
         try:
+            # FIX-122: do not pass max_tokens to Ollama in call_llm_raw — output is short
+            # ({"type":"X"}, ~8 tokens); the model stops naturally; explicit cap causes
+            # empty responses under GPU load when Ollama ignores or mishandles the param.
             _create_kw: dict = dict(
                 model=ollama_model,
-                max_tokens=max_tokens,
                 response_format={"type": "json_object"},
                 messages=msgs,
             )
@@ -320,7 +322,7 @@ def call_llm_raw(
 
     # FIX-104: plain-text retry — if all json_object attempts failed, try without response_format
     try:
-        _pt_kw: dict = dict(model=ollama_model, max_tokens=max_tokens, messages=msgs)
+        _pt_kw: dict = dict(model=ollama_model, messages=msgs)  # FIX-122: no max_tokens
         if _ollama_extra:
             _pt_kw["extra_body"] = _ollama_extra
         resp = ollama_client.chat.completions.create(**_pt_kw)
