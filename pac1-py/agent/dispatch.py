@@ -281,7 +281,11 @@ def call_llm_raw(
     ollama_model = cfg.get("ollama_model") or os.environ.get("OLLAMA_MODEL", model)
     # FIX-84: explicit think= overrides cfg; None means use cfg default
     _think_flag = think if think is not None else cfg.get("ollama_think")
-    _ollama_extra: dict | None = {"think": _think_flag} if _think_flag is not None else None
+    _ollama_extra: dict = {}
+    if _think_flag is not None:
+        _ollama_extra["think"] = _think_flag
+    if cfg.get("ollama_options"):  # FIX-118: pass num_ctx and other Ollama options
+        _ollama_extra["options"] = cfg["ollama_options"]
     for attempt in range(max_retries + 1):
         try:
             _create_kw: dict = dict(

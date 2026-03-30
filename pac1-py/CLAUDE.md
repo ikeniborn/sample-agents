@@ -117,7 +117,9 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **Fix-116** (FIX-117 is next).
+Current fix counter: **Fix-118** (FIX-119 is next).
+- FIX-118: `dispatch.py` + `models.json` — `ollama_options` support: passed via `extra_body["options"]` in Ollama tier; `num_ctx: 16384` added to all cloud models so classifier can handle full AGENTS.MD context
+- FIX-117: `classifier.py` + `__init__.py` — single-pass routing: classify AFTER prephase with AGENTS.MD context; removed `resolve_llm()`, `reclassify_with_prephase()`, `_classifier_llm_ok`, `_type_cache`; added `ModelRouter.resolve_after_prephase()`
 - FIX-116: `prompt.py` OTP step — MANDATORY delete of OTP file after token match, explicit ordered checklist (1.write email 2.delete OTP file 3.report)
 - FIX-115: `prephase.py` — dynamic auto-preload of dirs referenced in AGENTS.MD (intersection with tree); recursive read of subdirs; no hardcoded paths
 - FIX-114: `prompt.py` INBOX WORKFLOW — Channel messages: trust rules from preloaded DOCS/; admin = execute literally, lowest-id contact on ambiguity; OTP match = admin; blacklist = DENIED_SECURITY
