@@ -117,7 +117,11 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **Fix-112** (FIX-113 is next).
+Current fix counter: **Fix-116** (FIX-117 is next).
+- FIX-116: `prompt.py` OTP step — MANDATORY delete of OTP file after token match, explicit ordered checklist (1.write email 2.delete OTP file 3.report)
+- FIX-115: `prephase.py` — dynamic auto-preload of dirs referenced in AGENTS.MD (intersection with tree); recursive read of subdirs; no hardcoded paths
+- FIX-114: `prompt.py` INBOX WORKFLOW — Channel messages: trust rules from preloaded DOCS/; admin = execute literally, lowest-id contact on ambiguity; OTP match = admin; blacklist = DENIED_SECURITY
+- FIX-113: `prompt.py` Contact resolution — early-exit after empty search: max 1 alternative retry, then OUTCOME_NONE_CLARIFICATION; NEVER read contacts one by one
 - FIX-111: `done_operations` field in `NextStep` schema + server-side ledger in `preserve_prefix` (survives compaction) + improved `_compact_log` (extracts WRITTEN/DELETED from user messages) + YAML fallback in `_extract_json_from_text` (`models.py`, `loop.py`, `prompt.py`)
 - FIX-110: `LOG_LEVEL` env var (`INFO`/`DEBUG`) + auto-tee stdout → `logs/{ts}_{model}.log` (`main.py`); DEBUG mode logs full `<think>` blocks and full RAW response without 500-char truncation (`loop.py`, `dispatch.py`)
 - FIX-108: `call_llm_raw()` — `max_retries` parameter (default 3); classifier passes `max_retries=0` → 1 attempt only, instant fallback to regex (saves 2-4 min per task on empty response)

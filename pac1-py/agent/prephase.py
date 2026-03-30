@@ -1,10 +1,13 @@
+import os
 import re
 from dataclasses import dataclass
 
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
-from bitgn.vm.pcm_pb2 import ContextRequest, ReadRequest, TreeRequest
+from bitgn.vm.pcm_pb2 import ContextRequest, ListRequest, ReadRequest, TreeRequest
 
 from .dispatch import CLI_BLUE, CLI_CLR, CLI_GREEN, CLI_YELLOW
+
+_LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 _AGENTS_MD_BUDGET = 2500  # chars; if AGENTS.MD exceeds this, filter to relevant sections only
 
@@ -120,6 +123,7 @@ def run_prephase(
     # Step 1: tree "/" -L 2 — gives the agent the top-level vault layout upfront
     print(f"{CLI_BLUE}[prephase] tree -L 2 /...{CLI_CLR}", end=" ")
     tree_txt = ""
+    tree_result = None
     try:
         tree_result = vm.tree(TreeRequest(root="/", level=2))
         tree_txt = _render_tree_result(tree_result, root_path="/", level=2)
@@ -142,6 +146,56 @@ def run_prephase(
         except Exception:
             pass
 
+    # Step 2.5: auto-preload directories referenced in AGENTS.MD  # FIX-115
+    # Algorithm:
+    #   1. Extract top-level directory names from the tree result
+    #   2. Extract directory names mentioned in AGENTS.MD (backtick or plain `name/` patterns)
+    #   3. Intersection → list + read each file in those dirs (skip templates/README)
+    # No hardcoded folder names — works for any vault layout.
+    docs_content_parts: list[str] = []
+    if agents_md_content and tree_result is not None:
+        # Top-level dirs from tree
+        top_level_dirs = {entry.name for entry in tree_result.root.children if entry.children or True}
+        # Dir names mentioned in AGENTS.MD: match `name/` or plain word/
+        mentioned = set(re.findall(r'`?(\w[\w-]*)/`?', agents_md_content))
+        # Intersect with actual dirs in vault
+        to_preload = sorted(mentioned & top_level_dirs)
+        # Skip dirs that are primary data stores — they are too large and agent reads selectively
+        _skip_data_dirs = {"contacts", "accounts", "opportunities", "reminders", "my-invoices", "outbox", "inbox"}
+        to_preload = [d for d in to_preload if d not in _skip_data_dirs]
+        if to_preload:
+            print(f"{CLI_BLUE}[prephase] referenced dirs to preload: {to_preload}{CLI_CLR}")
+        # _read_dir: recursively reads all files from a directory path  # FIX-115b
+        def _read_dir(dir_path: str, seen: set) -> None:
+            try:
+                entries = vm.list(ListRequest(name=dir_path))
+            except Exception as e:
+                print(f"{CLI_YELLOW}[prephase] {dir_path}/: {e}{CLI_CLR}")
+                return
+            for entry in entries.entries:
+                if entry.name.startswith("_") or entry.name.upper() == "README.MD":
+                    continue
+                child_path = f"{dir_path}/{entry.name}"
+                if child_path in seen:
+                    continue
+                seen.add(child_path)
+                # Try to read as file first; if it fails with no content, treat as subdir
+                try:
+                    file_r = vm.read(ReadRequest(path=child_path))
+                    if file_r.content:
+                        docs_content_parts.append(f"--- {child_path} ---\n{file_r.content}")
+                        print(f"{CLI_BLUE}[prephase] read {child_path}:{CLI_CLR} {CLI_GREEN}ok{CLI_CLR}")
+                        if _LOG_LEVEL == "DEBUG":
+                            print(f"{CLI_BLUE}[prephase] {child_path} content:\n{file_r.content}{CLI_CLR}")
+                        continue
+                except Exception:
+                    pass
+                # No content → treat as subdirectory, recurse
+                _read_dir(child_path, seen)
+
+        for dir_name in to_preload:
+            _read_dir(f"/{dir_name}", set())
+
     # Inject vault layout + AGENTS.MD as context — the agent reads this to discover
     # where "cards", "threads", "inbox", etc. actually live in the vault.
     prephase_parts = [f"VAULT STRUCTURE:\n{tree_txt}"]
@@ -149,8 +203,14 @@ def run_prephase(
         agents_md_injected, was_filtered = _filter_agents_md(agents_md_content, task_text)
         if was_filtered:
             print(f"{CLI_YELLOW}[prephase] AGENTS.MD filtered: {len(agents_md_content)} → {len(agents_md_injected)} chars{CLI_CLR}")
+        if _LOG_LEVEL == "DEBUG":
+            print(f"{CLI_BLUE}[prephase] AGENTS.MD content:\n{agents_md_content}{CLI_CLR}")
         prephase_parts.append(
             f"\n{agents_md_path} CONTENT (source of truth for vault semantics):\n{agents_md_injected}"
+        )
+    if docs_content_parts:
+        prephase_parts.append(
+            "\nDOCS/ CONTENT (workflow rules — follow these exactly):\n" + "\n\n".join(docs_content_parts)
         )
     prephase_parts.append(
         "\nNOTE: Use the vault structure and AGENTS.MD above to identify actual folder "
