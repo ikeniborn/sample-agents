@@ -12,7 +12,7 @@ from pydantic import ValidationError
 from pathlib import Path as _Path
 
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
-from bitgn.vm.pcm_pb2 import AnswerRequest, ListRequest, Outcome
+from bitgn.vm.pcm_pb2 import AnswerRequest, ListRequest, Outcome, ReadRequest
 
 from .dispatch import (
     CLI_RED, CLI_GREEN, CLI_CLR, CLI_YELLOW, CLI_BLUE,
@@ -21,7 +21,7 @@ from .dispatch import (
     dispatch,
     probe_structured_output, get_response_format,
 )
-from .models import NextStep, ReportTaskCompletion, Req_Delete, Req_List, Req_Read, Req_Search, Req_Write, Req_MkDir, Req_Move
+from .models import NextStep, ReportTaskCompletion, Req_Delete, Req_List, Req_Read, Req_Search, Req_Write, Req_MkDir, Req_Move, TaskRoute
 from .prephase import PrephaseResult
 
 
@@ -30,6 +30,16 @@ _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()  # FIX-110: DEBUG → l
 
 # FIX-76: copy also defined in dispatch.py for call_llm_raw(); keep both in sync
 _TRANSIENT_KWS = ("503", "502", "429", "NoneType", "overloaded", "unavailable", "server error", "rate limit", "rate-limit")
+
+# [FIX-128] Module-level regex for fast-path injection detection (compiled once, not per-task)
+_INJECTION_RE = re.compile(
+    r"ignore\s+(previous|above|prior)\s+instructions?"
+    r"|disregard\s+(all|your|previous)"
+    r"|new\s+(task|instruction)\s*:"
+    r"|system\s*prompt\s*:"
+    r'|"tool"\s*:\s*"report_completion"',
+    re.IGNORECASE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -629,15 +639,7 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
     _step_facts: list[_StepFact] = []
 
     # [FIX-128] SGR Routing + Cascade: classify task before any exploration
-    # Fast-path: regex for obvious injection patterns (no LLM cost)
-    _INJECTION_RE = re.compile(
-        r"ignore\s+(previous|above|prior)\s+instructions?"
-        r"|disregard\s+(all|your|previous)"
-        r"|new\s+(task|instruction)\s*:"
-        r"|system\s*prompt\s*:"
-        r'|"tool"\s*:\s*"report_completion"',
-        re.IGNORECASE,
-    )
+    # Fast-path: module-level _INJECTION_RE (compiled once per process, not per task)
     if _INJECTION_RE.search(_task_text):
         print(f"{CLI_RED}[FIX-128] Fast-path injection regex triggered — DENY_SECURITY{CLI_CLR}")
         try:
@@ -697,9 +699,13 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             _route_raw = None
 
         if _route_raw:
-            _route_val = _route_raw.get("route", "EXECUTE")
-            _route_signals = _route_raw.get("injection_signals", [])
-            _route_reason = _route_raw.get("reason", "")
+            try:
+                _tr = TaskRoute.model_validate(_route_raw)
+            except Exception:
+                _tr = None
+            _route_val = _tr.route if _tr else _route_raw.get("route", "EXECUTE")
+            _route_signals = _tr.injection_signals if _tr else _route_raw.get("injection_signals", [])
+            _route_reason = _tr.reason if _tr else _route_raw.get("reason", "")
             print(f"{CLI_YELLOW}[FIX-128] Route={_route_val} signals={_route_signals} reason={_route_reason[:80]}{CLI_CLR}")
             _outcome_map = {
                 "DENY_SECURITY": Outcome.OUTCOME_DENIED_SECURITY,
@@ -885,11 +891,14 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             # [FIX-129] SGR Cycle: post-search expansion for empty contact lookups
             if isinstance(job.function, Req_Search):
                 _sr_data: dict = {}
+                _sr_parsed = False
                 try:
-                    _sr_data = json.loads(txt) if not txt.startswith("VAULT STRUCTURE:") else {}
+                    if not txt.startswith("VAULT STRUCTURE:"):
+                        _sr_data = json.loads(txt)
+                        _sr_parsed = True
                 except (json.JSONDecodeError, ValueError):
                     pass
-                if len(_sr_data.get("matches", [])) == 0:
+                if _sr_parsed and len(_sr_data.get("matches", [])) == 0:
                     _pat = job.function.pattern
                     # Heuristic: looks like a proper name (2–4 words, no special chars or path separators)
                     _pat_words = [w for w in _pat.split() if len(w) > 1]
@@ -916,8 +925,7 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             # After writing a .json file, read it back and check for null/empty required fields.
             if isinstance(job.function, Req_Write) and job.function.path.endswith(".json") and not txt.startswith("ERROR"):
                 try:
-                    from bitgn.vm.pcm_pb2 import ReadRequest as _RR
-                    _wb = vm.read(_RR(name=job.function.path))
+                    _wb = vm.read(ReadRequest(name=job.function.path))
                     _wb_content = MessageToDict(_wb).get("content", "{}")
                     _wb_parsed = json.loads(_wb_content)
                     _num_vals = [v for v in _wb_parsed.values() if isinstance(v, (int, float))]
