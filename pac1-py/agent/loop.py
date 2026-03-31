@@ -689,7 +689,7 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             _rr_resp = _rr_client.chat.completions.create(
                 model=model,
                 messages=_route_log,
-                max_completion_tokens=256,
+                max_completion_tokens=512,
                 response_format={"type": "json_object"},
             )
             _rr_text = (_rr_resp.choices[0].message.content or "{}").strip()
