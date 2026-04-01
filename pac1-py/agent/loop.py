@@ -779,7 +779,16 @@ def _verify_json_write(vm: PcmRuntimeClientSync, job: "NextStep", log: list,
                 print(f"{CLI_YELLOW}{_sv_msg}{CLI_CLR}")
                 log.append({"role": "user", "content": _sv_msg})
     except Exception as _fw_err:
-        print(f"{CLI_YELLOW}[verify] Verification read failed: {_fw_err}{CLI_CLR}")
+        # FIX-142: inject correction hint when read-back or JSON parse fails;
+        # previously only printed — model had no signal and reported OUTCOME_OK with broken file
+        _fix_msg = (
+            f"[verify] {job.function.path} — verification failed: {_fw_err}. "
+            "The written file contains invalid or truncated JSON. "
+            "Read the file back, fix the JSON (ensure all brackets/braces are closed), "
+            "and write it again with valid complete JSON."
+        )
+        print(f"{CLI_YELLOW}{_fix_msg}{CLI_CLR}")
+        log.append({"role": "user", "content": _fix_msg})
 
 
 # Module-level constant: route classifier JSON schema (never changes between tasks)
