@@ -113,7 +113,8 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **FIX-144** (FIX-145 is next).
+Current fix counter: **FIX-145** (FIX-146 is next).
+- FIX-145: `prompt.py` code_eval doc — modules datetime/json/re/math are PRE-LOADED in sandbox globals; `import` statement fails because `__import__` is not in _SAFE_BUILTINS; prompt now says "use directly WITHOUT import" with correct/wrong examples; model consistently used `import datetime; ...` causing ImportError: __import__ not found
 - FIX-144: `loop.py` `_verify_json_write()` null-field hint — clarified: if task provided values fill them in, if not null is acceptable; add note to check computed fields like total; prevents 7-step search loop for account_id/issued_on that task never provided (conflicted with FIX-141 null-is-ok rule)
 - FIX-143: `prompt.py` rule 10f — invoice total field: always compute total = sum of line amounts, simple arithmetic, no code_eval needed; do not omit total even if README doesn't show it
 - FIX-142: `loop.py` `_verify_json_write()` — exception handler now injects correction hint into log when read-back or JSON parse fails (previously only printed, model had no signal and reported OUTCOME_OK despite writing truncated/invalid JSON); hint tells model to read file back, fix brackets/braces, rewrite

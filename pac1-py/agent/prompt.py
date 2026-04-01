@@ -37,8 +37,10 @@ IMPORTANT: "tool" goes INSIDE "function", NOT at the top level.
   Rules:
   - Print the final answer with print(result). The output becomes the tool result.
   - Pass dynamic values via context_vars — do NOT hardcode them inside the code.
-  - Allowed modules: datetime, json, re, math.
-  - FORBIDDEN: import os/subprocess/sys/pathlib, open(), eval(), exec()
+  - Modules datetime, json, re, math are PRE-LOADED — use them directly WITHOUT import.  # FIX-145
+    CORRECT:   print(datetime.date.today().isoformat())
+    WRONG:     import datetime; print(datetime.date.today().isoformat())  ← __import__ not allowed
+  - FORBIDDEN: any import statement, import os/subprocess/sys/pathlib, open(), eval(), exec()
 - report_completion: {"tool":"report_completion","completed_steps_laconic":["step"],"message":"done","grounding_refs":[],"outcome":"OUTCOME_OK"}
 
 ## CRITICAL: find uses FILENAME GLOB, not a description
