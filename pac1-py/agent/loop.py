@@ -744,9 +744,11 @@ def _maybe_expand_search(
         log.append({"role": "user", "content": _cycle_hint})
 
 
-def _verify_json_write(vm: PcmRuntimeClientSync, job: "NextStep", log: list) -> None:
-    """Post-write JSON field verification.
-    After writing a .json file, reads it back and injects a correction hint if null/empty fields exist."""
+def _verify_json_write(vm: PcmRuntimeClientSync, job: "NextStep", log: list,
+                       schema_cls=None) -> None:
+    """Post-write JSON field verification (single vm.read()).
+    Checks null/empty fields, then optionally validates against schema_cls (e.g. EmailOutbox).
+    Injects one combined correction hint if any check fails."""
     if not (isinstance(job.function, Req_Write) and job.function.path.endswith(".json")):
         return
     try:
@@ -761,6 +763,18 @@ def _verify_json_write(vm: PcmRuntimeClientSync, job: "NextStep", log: list) -> 
             )
             print(f"{CLI_YELLOW}{_fix_msg}{CLI_CLR}")
             log.append({"role": "user", "content": _fix_msg})
+            return  # null-field hint is sufficient; skip schema check
+        if schema_cls is not None:
+            try:
+                schema_cls.model_validate_json(_wb_content)
+                print(f"{CLI_YELLOW}[verify] {job.function.path} passed {schema_cls.__name__} schema check{CLI_CLR}")
+            except Exception as _sv_err:
+                _sv_msg = (
+                    f"[verify] {job.function.path} failed {schema_cls.__name__} validation: {_sv_err}. "
+                    "Read the file, correct all required fields, and write it again."
+                )
+                print(f"{CLI_YELLOW}{_sv_msg}{CLI_CLR}")
+                log.append({"role": "user", "content": _sv_msg})
     except Exception as _fw_err:
         print(f"{CLI_YELLOW}[verify] Verification read failed: {_fw_err}{CLI_CLR}")
 
@@ -1077,9 +1091,14 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             if isinstance(job.function, Req_Search):
                 _maybe_expand_search(job, txt, _search_retry_counts, log)
 
-            # Post-write JSON field verification
+            # Post-write JSON field verification (+ EmailOutbox schema for outbox files)
             if not txt.startswith("ERROR"):
-                _verify_json_write(vm, job, log)
+                _is_outbox = (
+                    task_type == TASK_EMAIL
+                    and isinstance(job.function, Req_Write)
+                    and "/outbox/" in job.function.path
+                )
+                _verify_json_write(vm, job, log, schema_cls=EmailOutbox if _is_outbox else None)
 
             # Unit 8 TASK_INBOX: count inbox/ reads; after >1 hint to process one at a time
             if task_type == TASK_INBOX and isinstance(job.function, Req_Read):
@@ -1092,22 +1111,6 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
                         )
                         print(f"{CLI_YELLOW}{_inbox_hint}{CLI_CLR}")
                         log.append({"role": "user", "content": _inbox_hint})
-
-            # Unit 8 TASK_EMAIL: post-write outbox schema verify
-            if task_type == TASK_EMAIL and isinstance(job.function, Req_Write) and not txt.startswith("ERROR"):
-                if "/outbox/" in job.function.path:
-                    try:
-                        _eb = vm.read(ReadRequest(path=job.function.path))
-                        _eb_content = MessageToDict(_eb).get("content", "{}")
-                        EmailOutbox.model_validate_json(_eb_content)
-                        print(f"{CLI_YELLOW}[email] Outbox file {job.function.path} passed EmailOutbox schema check{CLI_CLR}")
-                    except Exception as _ev_err:
-                        _ev_msg = (
-                            f"[email] Outbox file {job.function.path} failed schema validation: {_ev_err}. "
-                            "Read the file, correct all required fields, and write it again."
-                        )
-                        print(f"{CLI_YELLOW}{_ev_msg}{CLI_CLR}")
-                        log.append({"role": "user", "content": _ev_msg})
 
             # Unit 8 TASK_DISTILL: hint to update thread after writing a card file
             if task_type == TASK_DISTILL and isinstance(job.function, Req_Write) and not txt.startswith("ERROR"):
