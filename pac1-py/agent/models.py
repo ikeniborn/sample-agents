@@ -87,8 +87,9 @@ class Req_Delete(BaseModel):
     @field_validator("path")
     @classmethod
     def no_wildcard_or_template(cls, v: str) -> str:
-        if "*" in v:
-            raise ValueError("Wildcards not supported in delete — list and delete one by one")
+        # Wildcard paths (e.g. /folder/*) are rejected by FIX-W4 in the loop body
+        # with an instructive message. Do NOT reject here — ValidationError at this
+        # level returns job=None, which triggers silent retry instead of a useful hint.
         filename = v.rsplit("/", 1)[-1]
         if filename.startswith("_"):
             raise ValueError(f"Cannot delete template files (prefix '_'): {v}")
