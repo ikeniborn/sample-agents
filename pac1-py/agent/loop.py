@@ -494,6 +494,22 @@ def _call_openai_tier(
             raw = _THINK_RE.sub("", raw).strip()
             _raw_limit = None if _LOG_LEVEL == "DEBUG" else 500
             print(f"{CLI_YELLOW}[{label}] RAW: {raw[:_raw_limit]}{CLI_CLR}")
+            # FIX-155: hint-echo guard — some models (minimax) copy the last user hint verbatim
+            # ("[search] ...", "[stall] ...", etc.) instead of generating JSON.
+            # Detect by checking if raw starts with a known hint prefix (all start with "[").
+            _HINT_PREFIXES = ("[search]", "[stall]", "[hint]", "[verify]", "[auto-list]",
+                              "[empty-path]", "[retry]", "[ledger]", "[compact]", "[inbox]",
+                              "[lookup]", "[wildcard]", "[normalize]")
+            if raw.startswith(_HINT_PREFIXES):
+                print(f"{CLI_YELLOW}[{label}] Hint-echo detected — injecting JSON correction{CLI_CLR}")
+                log.append({"role": "user", "content": (
+                    "Your response repeated a system message. "
+                    "Respond with JSON only: "
+                    '{"current_state":"...","plan_remaining_steps_brief":["..."],'
+                    '"done_operations":[],"task_completed":false,"function":{"tool":"list","path":"/"}}'
+                )})
+                continue
+
             if response_format is not None:
                 try:
                     parsed = json.loads(raw)

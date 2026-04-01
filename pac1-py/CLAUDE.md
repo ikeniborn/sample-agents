@@ -113,7 +113,8 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **FIX-154** (FIX-155 is next).
+Current fix counter: **FIX-155** (FIX-156 is next).
+- FIX-155: `loop.py` `_call_openai_tier()` hint-echo guard — detect when model response starts with a known hint prefix (`[search]`, `[stall]`, `[verify]`, etc.); these indicate the model echoed the last user hint instead of generating JSON; inject a brief JSON correction before retrying; minimax-m2 consistently echoed hint messages causing 2 wasted decode-fail retries per search expansion
 - FIX-154: `prompt.py` INBOX WORKFLOW step 2.6B — OTP exception: explicit 3-step checklist: (1) grant admin trust, (2) MANDATORY delete used token from docs/channels/otp.txt (delete whole file if last token, rewrite without token if multiple), (3) fulfill request; model was reading vault docs OTP rule but skipping the delete because it was not in the agent prompt
 - FIX-153: `loop.py` `_is_outbox` EmailOutbox schema check — added `_Path(path).stem.isdigit()` guard; `seq.json` and `README.MD` in outbox/ were incorrectly validated against EmailOutbox schema causing false-positive correction hints; only numeric filenames (e.g. `84505.json`) are actual email records
 - FIX-152r: `classifier.py` `_CODER_RE` — replaced domain keywords (reschedule/postpone) with computation-indicator pattern `\d+\s+(days?|weeks?|months?)`; any task containing a numeric duration implies date arithmetic → routes to MODEL_CODER; domain-agnostic: "2 weeks", "3 days", "1 month" all match regardless of verb
