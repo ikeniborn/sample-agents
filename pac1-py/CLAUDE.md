@@ -113,7 +113,8 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **FIX-152** (FIX-153 is next).
+Current fix counter: **FIX-153** (FIX-154 is next).
+- FIX-153: `loop.py` `_is_outbox` EmailOutbox schema check — added `_Path(path).stem.isdigit()` guard; `seq.json` and `README.MD` in outbox/ were incorrectly validated against EmailOutbox schema causing false-positive correction hints; only numeric filenames (e.g. `84505.json`) are actual email records
 - FIX-152r: `classifier.py` `_CODER_RE` — replaced domain keywords (reschedule/postpone) with computation-indicator pattern `\d+\s+(days?|weeks?|months?)`; any task containing a numeric duration implies date arithmetic → routes to MODEL_CODER; domain-agnostic: "2 weeks", "3 days", "1 month" all match regardless of verb
 - FIX-151: `prompt.py` rule 9b — reschedule formula made explicit: `TOTAL_DAYS = N_days + 8` with examples ("2 weeks → 14+8=22 days", "1 month → 30+8=38 days"); previously `new_date = OLD_R + N_days + 8` was ignored by models that computed only `OLD_R + N_days`; suggest using code_eval for the arithmetic
 - FIX-150: `loop.py` `_extract_json_from_text()` — `_REQ_PREFIX_RE` regex detects `Req_XXX({...})` patterns before bracket extraction; injects inferred `"tool"` when model omits it (minimax-m2 emits `Req_Read({"path":"..."})` without tool field); also added priority tier 3: bare objects with any known `tool` key preferred over full NextStep, so `{"tool":"search",...}` is executed before trying to interpret a bare `{"path":"..."}` as a NextStep

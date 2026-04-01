@@ -1216,12 +1216,13 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             if isinstance(job.function, Req_Search):
                 _maybe_expand_search(job, txt, _search_retry_counts, log)
 
-            # Post-write JSON field verification (+ EmailOutbox schema for outbox files)
+            # Post-write JSON field verification (+ EmailOutbox schema for outbox email files)
             if not txt.startswith("ERROR"):
                 _is_outbox = (
                     task_type == TASK_EMAIL
                     and isinstance(job.function, Req_Write)
                     and "/outbox/" in job.function.path
+                    and _Path(job.function.path).stem.isdigit()  # FIX-153: skip seq.json / README — only numeric filenames are emails
                 )
                 _verify_json_write(vm, job, log, schema_cls=EmailOutbox if _is_outbox else None)
 
