@@ -113,7 +113,9 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **Fix-132** (FIX-133 is next).
+Current fix counter: **FIX-136** (FIX-137 is next).
+- FIX-136: `loop.py` `_call_openai_tier()` — JSON decode failure: `break` → `continue` so Ollama can retry same prompt (model occasionally generates truncated JSON; retry without hint gives it another chance before the outer correction-hint mechanism fires)
+- FIX-135: `loop.py` `run_loop()` routing prompt — narrow CLARIFY definition: "NO action verb AND NO identifiable target at all"; add `_type_ctx` (classifier task type) to routing user message so LLM knows the vault workflow type; prevents false CLARIFY for inbox/email/distill tasks that caused security check to never run (OUTCOME_DENIED_SECURITY → OUTCOME_NONE_CLARIFICATION regression)
 - FIX-132: `loop.py` FIX-128 repair — pass `pre.agents_md_content[:600]` as vault context to routing LLM; without it classifier had no basis for CLARIFY/UNSUPPORTED decisions causing 35+ false CLARIFYs; narrow CLARIFY to "critical absent info only" and UNSUPPORTED to "external services not in vault"
 - FIX-131: `loop.py` FIX-127 repair — `ReadRequest(name=)` → `ReadRequest(path=)`; removed false-positive zero-check from `_bad` list (`0` is a valid field value, agent fills fields from task context)
 - FIX-130: `loop.py` `_check_stall()` — SGR Adaptive Planning quality: function receives step_facts; signal-1 appends recent action list from step_facts[-4:]; signal-2 names parent dir explicitly via _Path(path).parent; signal-3 lists explored dirs and read files from step_facts — adaptive hints reduce stall recovery time (target: gpt-oss 8→≤4 stall events)
