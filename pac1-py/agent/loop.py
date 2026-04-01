@@ -1058,8 +1058,13 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
 
         try:
             result = dispatch(vm, job.function)
-            raw = json.dumps(MessageToDict(result), indent=2) if result else "{}"
-            txt = _format_result(result, raw)
+            # code_eval returns a plain str; all other tools return protobuf messages
+            if isinstance(result, str):
+                txt = result
+                raw = result
+            else:
+                raw = json.dumps(MessageToDict(result), indent=2) if result else "{}"
+                txt = _format_result(result, raw)
             if isinstance(job.function, Req_Delete) and not txt.startswith("ERROR"):
                 txt = f"DELETED: {job.function.path}"
             elif isinstance(job.function, Req_Write) and not txt.startswith("ERROR"):

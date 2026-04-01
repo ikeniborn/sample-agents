@@ -88,7 +88,7 @@ def _execute_code_safe(code: str, context_vars: dict, timeout_s: int = 5) -> str
     safe_globals.update(context_vars)
     buf = io.StringIO()
 
-    def _alarm(sig, frame):
+    def _alarm(_sig, _frame):
         raise TimeoutError("code_eval timeout")
 
     old_handler = signal.signal(signal.SIGALRM, _alarm)

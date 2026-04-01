@@ -5,7 +5,8 @@
     "thinking_budget": "Token budget for extended thinking (Anthropic only); omit to disable",
     "response_format_hint": "Hint for OpenRouter tier: 'json_object' or 'json_schema'",
     "ollama_think": "Enable <think> blocks for Ollama models that support it",
-    "ollama_options": "Ollama-specific options passed via extra_body.options (e.g. {num_ctx: 16384})"
+    "ollama_options": "Ollama-specific options passed via extra_body.options (e.g. {num_ctx: 16384})",
+    "seed": "Random seed for reproducible sampling (Ollama only); fixes the RNG state so identical prompt+seed always produces identical output. Use with temperature=0 for full determinism (classifier), or with low temperature to stabilize code generation (coder)"
   },
   "_ollama_tuning_rationale": {
     "temperature": "0.35 — instructional but not overly deterministic. 0.2 caused regression on conditional-check tasks (inbox no-From → model skipped OUTCOME_NONE_CLARIFICATION). 0.8 default too high (hallucinated paths). 0.35 balances precision with rule-following",
@@ -13,7 +14,8 @@
     "repeat_last_n": "256 — scan further back for repetition patterns (default 64 misses multi-step loops across JSON blocks)",
     "top_k": "30 — narrower candidate pool for structured JSON output. Default 40 is fine but 30 improves consistency",
     "top_p": "0.9 — nucleus sampling, keep default",
-    "num_ctx": "16384 — required for full AGENTS.MD (pre-phase loads vault tree + AGENTS.MD + referenced dirs)"
+    "num_ctx": "16384 — required for full AGENTS.MD (pre-phase loads vault tree + AGENTS.MD + referenced dirs)",
+    "seed": "Fixed RNG seed → deterministic output for same prompt. classifier uses seed=42 + temperature=0.0 for full determinism; coder uses seed=0 + temperature=0.1 to stabilize code generation without full lock-in"
   },
   "_profiles": {
     "_comment": "Named ollama_options profiles. Referenced by string in model configs; resolved at load time by main.py FIX-119.",
