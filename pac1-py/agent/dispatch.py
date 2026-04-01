@@ -182,8 +182,8 @@ def get_response_format(mode: str) -> dict | None:
 # FIX-76: lightweight raw LLM call (used by classify_task_llm in classifier.py)
 # ---------------------------------------------------------------------------
 
-# Transient error keywords — copy also in loop.py; keep both in sync
-_TRANSIENT_KWS_RAW = (
+# Transient error keywords — single source of truth; imported by loop.py
+TRANSIENT_KWS = (
     "503", "502", "429", "NoneType", "overloaded",
     "unavailable", "server error", "rate limit", "rate-limit",
 )
@@ -239,7 +239,7 @@ def call_llm_raw(
                 print("[FIX-80][Anthropic] Empty after all retries — falling through to next tier")
                 break  # FIX-80: do not return "" — let next tier try
             except Exception as e:
-                if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < max_retries:
+                if any(kw.lower() in str(e).lower() for kw in TRANSIENT_KWS) and attempt < max_retries:
                     print(f"[FIX-76][Anthropic] Transient (attempt {attempt + 1}): {e} — retrying in 4s")
                     time.sleep(4)
                     continue
@@ -270,7 +270,7 @@ def call_llm_raw(
                     break  # FIX-80: do not return "" — let next tier try
                 return raw
             except Exception as e:
-                if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < max_retries:
+                if any(kw.lower() in str(e).lower() for kw in TRANSIENT_KWS) and attempt < max_retries:
                     print(f"[FIX-76][OpenRouter] Transient (attempt {attempt + 1}): {e} — retrying in 4s")
                     time.sleep(4)
                     continue
@@ -284,8 +284,9 @@ def call_llm_raw(
     _ollama_extra: dict = {}
     if _think_flag is not None:
         _ollama_extra["think"] = _think_flag
-    if cfg.get("ollama_options"):  # FIX-118: pass num_ctx and other Ollama options
-        _ollama_extra["options"] = cfg["ollama_options"]
+    _opts = cfg.get("ollama_options")
+    if _opts is not None:  # FIX-118+BUG2: None=not configured; {}=valid (though empty) — use `is not None`
+        _ollama_extra["options"] = _opts
     for attempt in range(max_retries + 1):
         try:
             # FIX-122: do not pass max_tokens to Ollama in call_llm_raw — output is short
@@ -313,7 +314,7 @@ def call_llm_raw(
                 break  # FIX-80: do not return "" — fall through to return None
             return raw
         except Exception as e:
-            if any(kw.lower() in str(e).lower() for kw in _TRANSIENT_KWS_RAW) and attempt < max_retries:
+            if any(kw.lower() in str(e).lower() for kw in TRANSIENT_KWS) and attempt < max_retries:
                 print(f"[FIX-76][Ollama] Transient (attempt {attempt + 1}): {e} — retrying in 4s")
                 time.sleep(4)
                 continue
