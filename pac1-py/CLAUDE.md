@@ -113,7 +113,8 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **FIX-147** (FIX-148 is next).
+Current fix counter: **FIX-148** (FIX-149 is next).
+- FIX-148: `loop.py` pre-dispatch empty-path guard — write/delete/move/mkdir with empty `path` field is rejected before dispatch (PCM throws `INVALID_ARGUMENT`); injects correction hint asking model to provide the actual path; happens when model generates a multi-action response where the formal NextStep schema has empty placeholder fields while the real data was in bare Action: blocks
 - FIX-147: `loop.py` `_MAX_READ_HISTORY` 200→400 chars — field `next_follow_up_on` in `acct_001.json` appears at ~240 chars; with 200-char limit it was cut off in log history causing model to re-read the file 15+ times per task; 400 chars covers typical account JSON structure fully
 - FIX-146: `loop.py` `_extract_json_from_text()` — collect ALL bracket-matched JSON objects, prefer richest (current_state+function > function-only > first); fixes multi-action Ollama responses like "Action: {tool:read} ... Action: {tool:write} ... {current_state:...,function:{report_completion}}" where previously only the first bare {tool:read} was extracted and executed, discarding the actual write/report operations
 - FIX-145: `prompt.py` code_eval doc — modules datetime/json/re/math are PRE-LOADED in sandbox globals; `import` statement fails because `__import__` is not in _SAFE_BUILTINS; prompt now says "use directly WITHOUT import" with correct/wrong examples; model consistently used `import datetime; ...` causing ImportError: __import__ not found

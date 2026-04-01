@@ -70,7 +70,7 @@ def _format_result(result, txt: str) -> str:
 # Tool result compaction for log history
 # ---------------------------------------------------------------------------
 
-_MAX_READ_HISTORY = 400  # chars of file content kept in history (model saw full text already)  # FIX-147
+_MAX_READ_HISTORY = 4000  # chars of file content kept in history (model saw full text already)  # FIX-147
 
 
 def _compact_tool_result(action_name: str, txt: str) -> str:
@@ -1121,6 +1121,27 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             print(f"{CLI_YELLOW}[lookup] Blocked mutation {action_name} — lookup tasks are read-only{CLI_CLR}")
             log.append({"role": "user", "content":
                 "[lookup] Lookup tasks are read-only. Use report_completion to answer the question."})
+            _steps_since_write += 1
+            continue
+
+        # FIX-148: empty-path guard — model generated write/delete with path="" placeholder
+        # (happens when model outputs multi-action text with a bare NextStep schema that has empty function fields)
+        # Inject correction hint instead of dispatching, which would throw INVALID_ARGUMENT from PCM.
+        _has_empty_path = (
+            isinstance(job.function, (Req_Write, Req_Delete, Req_Move, Req_MkDir))
+            and not getattr(job.function, "path", None)
+            and not getattr(job.function, "from_name", None)
+        )
+        if _has_empty_path:
+            print(f"{CLI_YELLOW}[empty-path] {action_name} has empty path — injecting correction hint{CLI_CLR}")
+            log.append({
+                "role": "user",
+                "content": (
+                    f"ERROR: {action_name} requires a non-empty path. "
+                    "Your last response had an empty path field. "
+                    "Provide the correct full path (e.g. /reminders/rem_001.json) and content."
+                ),
+            })
             _steps_since_write += 1
             continue
 
