@@ -13,9 +13,14 @@ _AGENTS_MD_BUDGET = 2500  # chars; if AGENTS.MD exceeds this, filter to relevant
 
 
 def _filter_agents_md(content: str, task_text: str) -> tuple[str, bool]:
-    """Return (filtered_content, was_filtered).
-    Splits AGENTS.MD by ## headings, keeps preamble + sections most relevant to task_text.
-    If content is under budget, returns as-is."""
+    """Filter AGENTS.MD to stay within the character budget (2500 chars).
+
+    Splits content by markdown headings (## / #), scores each section by word
+    overlap with task_text, then greedily fills up to the budget starting from
+    the highest-scoring sections. The preamble (content before any heading) is
+    always included first. If the content is already within budget, returns it
+    unchanged. Returns (filtered_content, was_filtered).
+    """
     if len(content) <= _AGENTS_MD_BUDGET:
         return content, False
 
@@ -87,7 +92,7 @@ def _render_tree_result(result, root_path: str = "/", level: int = 2) -> str:
     return f"tree{level_arg} {root_path}\n{body}"
 
 
-# FIX-102: few-shot user→assistant pair — strongest signal for JSON-only output.
+# Few-shot user→assistant pair — strongest signal for JSON-only output.
 # Placed immediately after system prompt so the model sees its own expected format
 # before any task context. More reliable than response_format for Ollama-proxied
 # cloud models that ignore json_object enforcement.
@@ -106,10 +111,20 @@ def run_prephase(
     task_text: str,
     system_prompt_text: str,
 ) -> PrephaseResult:
-    """Pre-phase: expose vault structure and AGENTS.MD to the agent before main loop.
+    """Build the initial conversation log before the main agent loop.
 
-    The agent discovers all relevant paths itself during task execution via
-    list/find/grep tools — no paths are extracted or hardcoded here.
+    Steps performed:
+    1. tree -L 2 / — captures top-level vault layout so the agent knows folder names upfront.
+    2. Read AGENTS.MD — source of truth for vault semantics and folder roles.
+    3. Auto-preload directories referenced in AGENTS.MD: extracts top-level dir names from
+       the tree, intersects with dirs mentioned in AGENTS.MD, then recursively reads all
+       non-template files from those dirs. No folder names are hardcoded — the intersection
+       logic works for any vault layout.
+    4. context() — task-level metadata injected by the harness (e.g. current date, user info).
+
+    The resulting log and preserve_prefix are passed directly to run_loop(). The
+    preserve_prefix is never compacted, so vault structure and AGENTS.MD remain visible
+    throughout the entire task execution.
     """
     print(f"\n{CLI_BLUE}[prephase] Starting pre-phase exploration{CLI_CLR}")
 
@@ -146,7 +161,7 @@ def run_prephase(
         except Exception:
             pass
 
-    # Step 2.5: auto-preload directories referenced in AGENTS.MD  # FIX-115
+    # Step 2.5: auto-preload directories referenced in AGENTS.MD
     # Algorithm:
     #   1. Extract top-level directory names from the tree result
     #   2. Extract directory names mentioned in AGENTS.MD (backtick or plain `name/` patterns)
@@ -165,7 +180,7 @@ def run_prephase(
         to_preload = [d for d in to_preload if d not in _skip_data_dirs]
         if to_preload:
             print(f"{CLI_BLUE}[prephase] referenced dirs to preload: {to_preload}{CLI_CLR}")
-        # _read_dir: recursively reads all files from a directory path  # FIX-115b
+        # _read_dir: recursively reads all files from a directory path
         def _read_dir(dir_path: str, seen: set) -> None:
             try:
                 entries = vm.list(ListRequest(name=dir_path))
