@@ -1,43 +1,7 @@
 from typing import Annotated, List, Literal, Union
 
 from annotated_types import Ge, Le, MaxLen, MinLen
-from pydantic import BaseModel, Field
-
-
-# ---------------------------------------------------------------------------
-# Vault context — extracted from tree + AGENTS.MD in prephase (SGR step)
-# ---------------------------------------------------------------------------
-
-class VaultContext(BaseModel):
-    """Dynamically discovered vault structure. Replaces any hardcoded paths."""
-    inbox_dirs: List[str] = Field(
-        default_factory=list,
-        description="Directories where new/incoming items arrive (read-mostly)",
-    )
-    capture_dirs: List[str] = Field(
-        default_factory=list,
-        description="Directories for raw captured content",
-    )
-    cards_dirs: List[str] = Field(
-        default_factory=list,
-        description="Directories for distilled notes/cards",
-    )
-    threads_dirs: List[str] = Field(
-        default_factory=list,
-        description="Directories for threads/ongoing discussions",
-    )
-    template_prefixes: List[str] = Field(
-        default_factory=lambda: ["_"],
-        description="Filename prefixes that mark template files — never delete",
-    )
-    readonly_during_cleanup: List[str] = Field(
-        default_factory=list,
-        description="Directories that must NOT be touched during card/thread cleanup tasks",
-    )
-    notes: str = Field(
-        default="",
-        description="Key file naming conventions and vault-specific rules",
-    )
+from pydantic import BaseModel, Field, field_validator
 
 
 class TaskRoute(BaseModel):
@@ -82,7 +46,7 @@ class Req_Context(BaseModel):
 
 class Req_Find(BaseModel):
     tool: Literal["find"]
-    name: str
+    name: Annotated[str, MinLen(1)]
     root: str = "/"
     kind: Literal["all", "files", "dirs"] = "all"
     limit: Annotated[int, Ge(1), Le(20)] = 10
@@ -90,7 +54,7 @@ class Req_Find(BaseModel):
 
 class Req_Search(BaseModel):
     tool: Literal["search"]
-    pattern: str
+    pattern: Annotated[str, MinLen(1)]
     limit: Annotated[int, Ge(1), Le(20)] = 10
     root: str = "/"
 
@@ -120,6 +84,16 @@ class Req_Delete(BaseModel):
     tool: Literal["delete"]
     path: str
 
+    @field_validator("path")
+    @classmethod
+    def no_wildcard_or_template(cls, v: str) -> str:
+        if "*" in v:
+            raise ValueError("Wildcards not supported in delete — list and delete one by one")
+        filename = v.rsplit("/", 1)[-1]
+        if filename.startswith("_"):
+            raise ValueError(f"Cannot delete template files (prefix '_'): {v}")
+        return v
+
 
 class Req_MkDir(BaseModel):
     tool: Literal["mkdir"]
@@ -130,6 +104,24 @@ class Req_Move(BaseModel):
     tool: Literal["move"]
     from_name: str
     to_name: str
+
+
+class EmailOutbox(BaseModel):
+    """Schema for outbox/*.json email files. Validated post-write in _verify_json_write()."""
+    to: Annotated[str, MinLen(1)]
+    subject: Annotated[str, MinLen(1)]
+    body: Annotated[str, MinLen(1)]
+    sent: Literal[False] = False  # Must always be False — enforced
+
+    attachments: list[str] = Field(default_factory=list)
+
+    @field_validator("attachments")
+    @classmethod
+    def relative_paths_only(cls, v: list[str]) -> list[str]:
+        for path in v:
+            if path.startswith("/"):
+                raise ValueError(f"Attachment paths must be relative (no leading '/'): {path}")
+        return v
 
 
 class NextStep(BaseModel):
