@@ -79,7 +79,8 @@ class _Rule:
 
 
 # Priority-ordered rule matrix
-# Priority: longContext > inbox > email > [coder — Unit 9] > lookup > distill > think > default
+# Priority: longContext > inbox > email > lookup > distill > think > default
+# FIX-163: TASK_CODER removed from routing — coder model is now a sub-agent called within steps
 _RULE_MATRIX: list[_Rule] = [
     # Rule 1: bulk-scope keywords → longContext
     _Rule(
@@ -101,13 +102,6 @@ _RULE_MATRIX: list[_Rule] = [
         must_not=[_BULK_RE, _INBOX_RE],
         result=TASK_EMAIL,
         label="email-keywords",
-    ),
-    # Rule 3b: calculation/aggregation/date-arithmetic → coder
-    _Rule(
-        must=[_CODER_RE],
-        must_not=[_BULK_RE],
-        result=TASK_CODER,
-        label="coder-keywords",
     ),
     # Rule 4: lookup contact/email/phone with no write intent → lookup
     _Rule(
@@ -153,11 +147,10 @@ def classify_task(task_text: str) -> str:
 _CLASSIFY_SYSTEM = (
     "You are a task router. Classify the task into exactly one type. "
     'Reply ONLY with valid JSON: {"type": "<type>"} where <type> is one of: '
-    "think, longContext, email, coder, lookup, inbox, distill, default.\n"
+    "think, longContext, email, lookup, inbox, distill, default.\n"  # FIX-163: coder removed (sub-agent, not a task route)
     "longContext = batch/all files/multiple files/3+ explicit file paths\n"
     "inbox = process/check/handle the inbox\n"
     "email = send/compose/write email to a recipient\n"
-    "coder = calculate/compute/count/aggregate/date arithmetic/filter lists/sort\n"
     "lookup = find/lookup contact info (email/phone) with no write action\n"
     "distill = analysis/reasoning AND writing a card/note/summary\n"
     "think = analysis/reasoning/summarize/compare/evaluate/explain (no write)\n"
@@ -296,7 +289,7 @@ class ModelRouter:
             TASK_THINK: self.think,
             TASK_LONG_CONTEXT: self.long_context,
             TASK_EMAIL: self.email or self.default,
-            TASK_CODER: self.coder or self.default,
+            TASK_CODER: self.default,  # FIX-163: coder is a sub-agent; task routes to default model
             TASK_LOOKUP: self.lookup or self.default,
             TASK_INBOX: self.inbox or self.think,
             TASK_DISTILL: self.think,

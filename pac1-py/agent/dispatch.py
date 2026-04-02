@@ -7,6 +7,8 @@ import anthropic
 from openai import OpenAI
 from pydantic import BaseModel
 
+from google.protobuf.json_format import MessageToDict
+
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from bitgn.vm.pcm_pb2 import (
     AnswerRequest,
@@ -106,6 +108,62 @@ def _execute_code_safe(code: str, context_vars: dict, timeout_s: int = 5) -> str
         _sys.stdout = old_stdout
         signal.alarm(0)
         signal.signal(signal.SIGALRM, old_handler)
+
+
+# ---------------------------------------------------------------------------
+# FIX-163: Coder sub-model helpers
+# ---------------------------------------------------------------------------
+
+def _extract_code_block(text: str) -> str:
+    """Strip markdown fences; return bare Python code."""
+    m = re.search(r"```(?:python)?\s*(.*?)```", text, re.DOTALL)
+    return m.group(1).strip() if m else text.strip()
+
+
+_CODER_TIMEOUT_S = 45  # FIX-164: hard cap on coder model call to prevent loop starvation
+
+
+def _call_coder_model(task: str, context_vars: dict, coder_model: str, coder_cfg: dict) -> str:
+    """Call MODEL_CODER with minimal context to generate Python 3 code for task.
+    Only passes task description and available variable names — no main-loop history.
+    Hard timeout: _CODER_TIMEOUT_S seconds (FIX-164)."""
+    import signal as _signal
+
+    system = (
+        "You are a Python 3 code generator. Output ONLY runnable Python code — "
+        "no markdown fences, no explanation.\n"
+        "Rules:\n"
+        "- Modules datetime/json/re/math are pre-loaded — use directly, NO import statements\n"
+        "- context_vars are injected as local variables — access by name (e.g. print(len(data)))\n"
+        "- Print the final answer with print()\n"
+        "Example task: 'count entries in list'\n"
+        "Example context_vars keys: ['data']\n"
+        "Example output: print(len(data))"
+    )
+    user_msg = f"Task: {task}\nAvailable variables: {list(context_vars.keys())}"
+
+    def _coder_timeout(_sig, _frame):
+        raise TimeoutError(f"coder model timed out after {_CODER_TIMEOUT_S}s")
+
+    old_handler = _signal.signal(_signal.SIGALRM, _coder_timeout)
+    _signal.alarm(_CODER_TIMEOUT_S)
+    try:
+        raw = call_llm_raw(
+            system=system,
+            user_msg=user_msg,
+            model=coder_model,
+            cfg=coder_cfg,
+            max_tokens=256,  # FIX-164: short code only — was 512
+            think=False,
+            max_retries=1,   # FIX-164: 1 retry max — was 2 (3 attempts × slow model = starvation)
+        )
+        return _extract_code_block(raw or "print('[coder] empty response')")
+    except TimeoutError as _te:
+        print(f"\033[33m[coder] {_te} — returning error stub\033[0m")
+        return "print('[error] coder model timeout')"
+    finally:
+        _signal.alarm(0)
+        _signal.signal(_signal.SIGALRM, old_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +519,8 @@ OUTCOME_BY_NAME = {
 # Dispatch: Pydantic models -> PCM runtime methods
 # ---------------------------------------------------------------------------
 
-def dispatch(vm: PcmRuntimeClientSync, cmd: BaseModel):
+def dispatch(vm: PcmRuntimeClientSync, cmd: BaseModel,  # FIX-163: coder sub-agent params
+             coder_model: str = "", coder_cfg: "dict | None" = None):
     if isinstance(cmd, Req_Context):
         return vm.context(ContextRequest())
     if isinstance(cmd, Req_Tree):
@@ -512,6 +571,18 @@ def dispatch(vm: PcmRuntimeClientSync, cmd: BaseModel):
         )
 
     if isinstance(cmd, Req_CodeEval):
-        return _execute_code_safe(cmd.code, cmd.context_vars)
+        # FIX-163: delegate code generation to MODEL_CODER; only task+vars passed (no loop history)
+        # FIX-166: auto-read vault paths via vm.read(); inject content as context_vars so coder
+        # model never needs to embed file contents in context — paths keep context_vars compact.
+        ctx = dict(cmd.context_vars)
+        for _vpath in cmd.paths:
+            _key = _vpath.lstrip("/").replace("/", "__").replace(".", "_")
+            try:
+                _raw = vm.read(ReadRequest(path=_vpath))
+                ctx[_key] = MessageToDict(_raw).get("content", "")
+            except Exception as _e:
+                ctx[_key] = f"[read error: {_e}]"
+        code = _call_coder_model(cmd.task, ctx, coder_model or "", coder_cfg or {})
+        return _execute_code_safe(code, ctx)
 
     raise ValueError(f"Unknown command: {cmd}")

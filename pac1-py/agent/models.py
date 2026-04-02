@@ -127,7 +127,8 @@ class EmailOutbox(BaseModel):
 
 class Req_CodeEval(BaseModel):
     tool: Literal["code_eval"]
-    code: Annotated[str, MinLen(1), MaxLen(2000)]
+    task: Annotated[str, MinLen(1), MaxLen(500)]  # FIX-163: plain-language description; coder model generates the code
+    paths: List[str] = Field(default_factory=list)  # FIX-166: vault paths to auto-read; content injected as context_vars by dispatch
     context_vars: dict = Field(default_factory=dict)
 
 

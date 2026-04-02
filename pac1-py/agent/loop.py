@@ -878,6 +878,18 @@ def _verify_json_write(vm: PcmRuntimeClientSync, job: "NextStep", log: list,
             print(f"{CLI_YELLOW}{_fix_msg}{CLI_CLR}")
             log.append({"role": "user", "content": _fix_msg})
             return  # null-field hint is sufficient; skip schema check
+        # FIX-160: attachments must contain full relative paths (e.g. "my-invoices/INV-008.json")
+        _att = _wb_parsed.get("attachments", [])
+        _bad_att = [a for a in _att if isinstance(a, str) and "/" not in a and a.strip()]
+        if _bad_att:
+            _att_msg = (
+                f"[verify] attachments contain paths without directory prefix: {_bad_att}. "
+                "Each attachment must be a full relative path (e.g. 'my-invoices/INV-008-07.json'). "
+                "Use list/find to confirm the full path, then rewrite the file."
+            )
+            print(f"{CLI_YELLOW}{_att_msg}{CLI_CLR}")
+            log.append({"role": "user", "content": _att_msg})
+            return
         if schema_cls is not None:
             try:
                 schema_cls.model_validate_json(_wb_content)
@@ -919,7 +931,8 @@ _ROUTE_SCHEMA = json.dumps({
 # ---------------------------------------------------------------------------
 
 def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
-             pre: PrephaseResult, cfg: dict, task_type: str = "default") -> dict:
+             pre: PrephaseResult, cfg: dict, task_type: str = "default",
+             coder_model: str = "", coder_cfg: "dict | None" = None) -> dict:  # FIX-163
     """Run main agent loop. Returns token usage stats dict.
 
     task_type: classifier result; drives per-type loop strategies (Unit 8):
@@ -927,6 +940,7 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
       - inbox: hints after >1 inbox/ files read to process one message at a time
       - email: post-write outbox verify via EmailOutbox schema when available
       - distill: hint to update thread file after writing a card
+    coder_model/coder_cfg: FIX-163 — passed to dispatch() for Req_CodeEval sub-agent calls.
     """
     log = pre.log
     preserve_prefix = pre.preserve_prefix
@@ -1223,7 +1237,8 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             continue
 
         try:
-            result = dispatch(vm, job.function)
+            result = dispatch(vm, job.function,  # FIX-163: pass coder sub-agent params
+                             coder_model=coder_model or model, coder_cfg=coder_cfg or cfg)
             # code_eval returns a plain str; all other tools return protobuf messages
             if isinstance(result, str):
                 txt = result

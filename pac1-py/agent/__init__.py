@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 
-from .classifier import ModelRouter
+from .classifier import ModelRouter, TASK_CODER
 from .loop import run_loop
 from .prephase import run_prephase
 from .prompt import system_prompt
@@ -30,7 +30,12 @@ def run_agent(router: ModelRouter, harness_url: str, task_text: str) -> dict:
     # Classify once with full AGENTS.MD context (single LLM call)
     model, cfg, task_type = router.resolve_after_prephase(task_text, pre)
 
-    stats = run_loop(vm, model, task_text, pre, cfg, task_type=task_type)
+    # FIX-163: compute coder sub-agent config (MODEL_CODER + coder ollama profile)
+    coder_model = router.coder or model
+    coder_cfg = router._adapt_config(router.configs.get(coder_model, {}), TASK_CODER)
+
+    stats = run_loop(vm, model, task_text, pre, cfg, task_type=task_type,
+                     coder_model=coder_model, coder_cfg=coder_cfg)
     stats["model_used"] = model
     stats["task_type"] = task_type
     return stats
