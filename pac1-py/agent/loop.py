@@ -988,8 +988,10 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
         }
 
     # Semantic routing via LLM — handles ambiguous injection + over-permissive cases
+    # FIX-171: lookup tasks always EXECUTE — they only query vault files, never external services;
+    # router LLM incorrectly returns UNSUPPORTED for vault data queries (counting, lookups)
     _rr_client = openrouter_client or ollama_client
-    if _rr_client is not None:
+    if _rr_client is not None and task_type != TASK_LOOKUP:
         # Route schema defined as _ROUTE_SCHEMA module constant
         # Include vault context so classifier knows what's supported
         _vault_ctx = ""

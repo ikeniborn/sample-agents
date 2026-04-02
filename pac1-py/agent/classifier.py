@@ -62,10 +62,12 @@ _WRITE_VERBS_RE = re.compile(
     re.IGNORECASE,
 )
 
-_CODER_RE = re.compile(
-    r"\b(calculate|compute|sum\s+of|count|filter|days?\s+from|date\s+(diff|arith)"
-    r"|how\s+many|average|total\s+of|sort\s+by|aggregate"
-    r"|\d+\s+(days?|weeks?|months?))\b",  # FIX-152r: numeric duration → implies date arithmetic → coder model
+# FIX-175: counting/aggregation queries without write intent → lookup (read-only vault data query).
+# Note: _CODER_RE (FIX-152r) was removed — TASK_CODER is now a sub-agent (FIX-163), not a route.
+# Keywords that imply date arithmetic (e.g. "2 weeks") are NOT here — those tasks include write ops
+# and route to default. Only pure read-aggregation keywords belong in _COUNT_QUERY_RE.
+_COUNT_QUERY_RE = re.compile(
+    r"\b(how\s+many|count|sum\s+of|total\s+of|average|aggregate)\b",
     re.IGNORECASE,
 )
 
@@ -110,6 +112,15 @@ _RULE_MATRIX: list[_Rule] = [
         result=TASK_LOOKUP,
         label="lookup-keywords",
     ),
+    # Rule 4b: counting/aggregation query with no write intent → lookup  # FIX-175
+    # Covers: "how many X", "count X", "sum of X", "total of X", "average", "aggregate"
+    # must_not _WRITE_VERBS_RE ensures tasks like "calculate total and update" route to default
+    _Rule(
+        must=[_COUNT_QUERY_RE],
+        must_not=[_BULK_RE, _INBOX_RE, _EMAIL_RE, _WRITE_VERBS_RE],
+        result=TASK_LOOKUP,
+        label="count-query",
+    ),
     # Rule 5: think-words AND write-verbs simultaneously → distill
     _Rule(
         must=[_THINK_WORDS, _WRITE_VERBS_RE],
@@ -151,7 +162,7 @@ _CLASSIFY_SYSTEM = (
     "longContext = batch/all files/multiple files/3+ explicit file paths\n"
     "inbox = process/check/handle the inbox\n"
     "email = send/compose/write email to a recipient\n"
-    "lookup = find/lookup contact info (email/phone) with no write action\n"
+    "lookup = find, count, or query vault data (contacts, files, channels) with no write action\n"  # FIX-175
     "distill = analysis/reasoning AND writing a card/note/summary\n"
     "think = analysis/reasoning/summarize/compare/evaluate/explain (no write)\n"
     "default = everything else (read, write, create, capture, delete, move, standard tasks)"
