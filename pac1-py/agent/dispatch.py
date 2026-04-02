@@ -129,6 +129,14 @@ def _call_coder_model(task: str, context_vars: dict, coder_model: str, coder_cfg
     Hard timeout: _CODER_TIMEOUT_S seconds (FIX-164)."""
     import signal as _signal
 
+    # FIX-177: reject oversized context_vars before building prompts or calling LLM
+    _ctx_total = sum(len(str(v)) for v in context_vars.values())
+    if _ctx_total > 2000:
+        return (
+            f"[code_eval rejected] context_vars too large ({_ctx_total} chars). "
+            "Use 'paths' field for vault files instead of embedding content in context_vars."
+        )
+
     system = (
         "You are a Python 3 code generator. Output ONLY runnable Python code — "
         "no markdown fences, no explanation.\n"
