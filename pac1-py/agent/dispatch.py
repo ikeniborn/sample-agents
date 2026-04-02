@@ -145,6 +145,11 @@ def _call_coder_model(task: str, context_vars: dict, coder_model: str, coder_cfg
     def _coder_timeout(_sig, _frame):
         raise TimeoutError(f"coder model timed out after {_CODER_TIMEOUT_S}s")
 
+    # FIX-177: reject oversized context_vars before calling coder model
+    _ctx_total = sum(len(str(v)) for v in context_vars.values())
+    if _ctx_total > 2000:
+        return f"[code_eval rejected] context_vars too large ({_ctx_total} chars). Use 'paths' field for vault files instead of embedding content in context_vars."
+
     old_handler = _signal.signal(_signal.SIGALRM, _coder_timeout)
     _signal.alarm(_CODER_TIMEOUT_S)
     try:
