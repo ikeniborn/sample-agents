@@ -770,6 +770,55 @@ def _check_stall(
 
 
 # ---------------------------------------------------------------------------
+# FIX-197: Write-scope code enforcement — programmatic guard for mutation paths
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PATH_PREFIXES = ("/docs/",)
+_SYSTEM_PATHS_EXACT = frozenset({"/AGENTS.MD", "/AGENTS.md"})
+_OTP_PATH = "/docs/channels/otp.txt"
+
+
+def _check_write_scope(action, action_name: str, task_type: str) -> str | None:
+    """Return error message if mutation violates write-scope, else None.
+
+    Layer 1 (all types): deny system paths (docs/, AGENTS.MD).
+      Exception: inbox + Req_Delete + otp.txt (OTP elevation).
+    Layer 2 (email only): allow-list — only /outbox/ paths.
+    """
+    paths_to_check: list[str] = []
+    if hasattr(action, "path") and action.path:
+        paths_to_check.append(action.path)
+    if hasattr(action, "from_name") and action.from_name:  # Req_Move source
+        paths_to_check.append(action.from_name)
+    if hasattr(action, "to_name") and action.to_name:  # Req_Move destination
+        paths_to_check.append(action.to_name)
+
+    for p in paths_to_check:
+        # Layer 1: system path deny-list
+        is_system = p in _SYSTEM_PATHS_EXACT or any(
+            p.startswith(pfx) for pfx in _SYSTEM_PATH_PREFIXES
+        )
+        if is_system:
+            # Exception: inbox OTP deletion
+            if task_type == TASK_INBOX and action_name == "Req_Delete" and p == _OTP_PATH:
+                continue
+            return (
+                f"Blocked: {action_name} targets system path '{p}'. "
+                "System files (docs/, AGENTS.MD) are read-only. "
+                "Choose a different target path."
+            )
+
+        # Layer 2: email allow-list
+        if task_type == TASK_EMAIL and not p.startswith("/outbox/"):
+            return (
+                f"Blocked: {action_name} targets '{p}' but email tasks may only "
+                "write to /outbox/. Use report_completion if no outbox write is needed."
+            )
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Helper functions extracted from run_loop()
 # ---------------------------------------------------------------------------
 
@@ -1258,6 +1307,15 @@ def _run_step(
             "[lookup] Lookup tasks are read-only. Use report_completion to answer the question."})
         st.steps_since_write += 1
         return False
+
+    # FIX-197: Write-scope enforcement — system path protection + email allow-list
+    if isinstance(job.function, (Req_Write, Req_Delete, Req_MkDir, Req_Move)):
+        _scope_err = _check_write_scope(job.function, action_name, task_type)
+        if _scope_err:
+            print(f"{CLI_YELLOW}[write-scope] {_scope_err}{CLI_CLR}")
+            st.log.append({"role": "user", "content": f"[write-scope] {_scope_err}"})
+            st.steps_since_write += 1
+            return False
 
     # FIX-148: empty-path guard — model generated write/delete with path="" placeholder
     # (happens when model outputs multi-action text with a bare NextStep schema that has empty function fields)
