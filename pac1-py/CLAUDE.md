@@ -113,7 +113,8 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **FIX-187** (FIX-188 is next).
+Current fix counter: **FIX-188** (FIX-189 is next).
+- FIX-188: `loop.py` Semantic Router кэширование — (1) модульный `_ROUTE_CACHE: dict[str, tuple]`; (2) ключ SHA-256 по `task_text[:800]`; (3) `_should_cache` флаг — в кэш попадают только успешные LLM ответы, ошибки не кэшируются; (4) fallback при ошибке сети EXECUTE → CLARIFY (консервативный, сетевая ошибка ≠ задача безопасна); устраняет недетерминизм роутера и пропуск security check при сетевых ошибках; audit 2.3
 - FIX-187: `models.json` + `loop.py` + `dispatch.py` — temperature & sampling: (1) add seed=42 to default/think/long_ctx Ollama profiles; (2) fix docs: classifier seed comment 42→0; (3) loop.py Anthropic tier: explicit temperature=1.0 with thinking (API constraint), configured temp without thinking; (4) dispatch.py call_llm_raw(): pass cfg temperature to Anthropic for non-thinking calls; resolves audit 2.2
 - FIX-186: `prompt.py` DELETE WORKFLOW — (1) add Step 4 post-delete verification: after all deletes, list each target folder to confirm files are gone; if file still present → issue delete again; (2) clarify done_operations semantics: tracks ONLY confirmed PCM calls, never pre-filled with planned deletions; root cause: minimax-m2.7 model batch-declares all deletions in done_operations without issuing individual delete tool calls → files remain, score 0.00 (t01)
 - FIX-185: `loop.py` routing prompt — email body rule added: if body text is explicitly stated in the task (even a single word like 'Subj'), route EXECUTE; CLARIFY only if body is completely absent; root cause: routing LLM returned CLARIFY for task "body 'Subj'" treating 'Subj' as placeholder; main prompt rule "short/cryptic body is VALID" existed but was not in routing LLM context; fixes t11 0.00

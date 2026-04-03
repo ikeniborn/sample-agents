@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import re
@@ -39,6 +40,10 @@ _INJECTION_RE = re.compile(
     r'|"tool"\s*:\s*"report_completion"',
     re.IGNORECASE,
 )
+
+# FIX-188: route cache — key: sha256(task_text[:800]), value: (route, reason, injection_signals)
+# Ensures deterministic routing for the same task; populated only on successful LLM responses
+_ROUTE_CACHE: dict[str, tuple[str, str, list[str]]] = {}
 
 
 # ---------------------------------------------------------------------------
@@ -1026,23 +1031,34 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             )},
             {"role": "user", "content": f"Task: {_task_text[:800]}{_vault_ctx}{_type_ctx}"},
         ]
-        _route_raw: dict | None = None
-        try:
-            _rr_resp = _rr_client.chat.completions.create(
-                model=model,
-                messages=_route_log,
-                max_completion_tokens=512,
-                response_format={"type": "json_object"},
-            )
-            _rr_text = (_rr_resp.choices[0].message.content or "{}").strip()
-            _rr_text = _THINK_RE.sub("", _rr_text).strip()
-            total_in_tok += getattr(getattr(_rr_resp, "usage", None), "prompt_tokens", 0)
-            total_out_tok += getattr(getattr(_rr_resp, "usage", None), "completion_tokens", 0)
-            llm_call_count += 1
-            _route_raw = json.loads(_rr_text)
-        except Exception as _re:
-            print(f"{CLI_YELLOW}[router] Router call failed: {_re} — defaulting to EXECUTE{CLI_CLR}")
+        # FIX-188: check module-level cache before calling LLM (audit 2.3)
+        _task_key = hashlib.sha256(_task_text[:800].encode()).hexdigest()
+        _should_cache = False
+        if _task_key in _ROUTE_CACHE:
+            _cv, _cr, _cs = _ROUTE_CACHE[_task_key]
+            print(f"{CLI_YELLOW}[router] Cache hit → Route={_cv}{CLI_CLR}")
+            _route_raw: dict | None = {"route": _cv, "reason": _cr, "injection_signals": _cs}
+        else:
             _route_raw = None
+            try:
+                _rr_resp = _rr_client.chat.completions.create(
+                    model=model,
+                    messages=_route_log,
+                    max_completion_tokens=512,
+                    response_format={"type": "json_object"},
+                )
+                _rr_text = (_rr_resp.choices[0].message.content or "{}").strip()
+                _rr_text = _THINK_RE.sub("", _rr_text).strip()
+                total_in_tok += getattr(getattr(_rr_resp, "usage", None), "prompt_tokens", 0)
+                total_out_tok += getattr(getattr(_rr_resp, "usage", None), "completion_tokens", 0)
+                llm_call_count += 1
+                _route_raw = json.loads(_rr_text)
+                _should_cache = True
+            except Exception as _re:
+                # FIX-188: conservative fallback — network error != task is safe (audit 2.3)
+                # EXECUTE fallback silently bypasses security check; CLARIFY halts safely
+                print(f"{CLI_YELLOW}[router] Router call failed: {_re} — conservative fallback CLARIFY{CLI_CLR}")
+                _route_raw = {"route": "CLARIFY", "reason": f"Router unavailable: {_re}", "injection_signals": []}
 
         if _route_raw:
             try:
@@ -1052,6 +1068,9 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             _route_val = _tr.route if _tr else _route_raw.get("route", "EXECUTE")
             _route_signals = _tr.injection_signals if _tr else _route_raw.get("injection_signals", [])
             _route_reason = _tr.reason if _tr else _route_raw.get("reason", "")
+            # FIX-188: persist successful LLM result to cache (error fallbacks intentionally excluded)
+            if _should_cache:
+                _ROUTE_CACHE[_task_key] = (_route_val, _route_reason, _route_signals)
             print(f"{CLI_YELLOW}[router] Route={_route_val} signals={_route_signals} reason={_route_reason[:80]}{CLI_CLR}")
             _outcome_map = {
                 "DENY_SECURITY": Outcome.OUTCOME_DENIED_SECURITY,
