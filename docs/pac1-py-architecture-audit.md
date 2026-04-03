@@ -12,31 +12,26 @@
 flowchart TD
     MAIN["main.py<br/>Benchmark runner"] --> RA["run_agent()<br/>__init__.py"]
     RA --> PRE["run_prephase()<br/>prephase.py"]
-    PRE --> |"tree / + AGENTS.MD<br/>+ preload docs/"| CLASSIFY
+    PRE --> |"tree + AGENTS.MD<br/>+ preload docs/"| CLASSIFY
     CLASSIFY["resolve_after_prephase()<br/>classifier.py"]
-    CLASSIFY --> |"regex fast-path<br/>или LLM classify"| LOOP
+    CLASSIFY --> |"regex fast-path<br/>или LLM classify"| TIMEOUT
 
-    LOOP["run_loop()<br/>loop.py — 30 шагов макс"]
-
-    subgraph LOOP_INNER["Основной цикл (до 30 итераций)"]
-        direction TB
-        TIMEOUT{"timeout<br/>check"} --> |OK| COMPACT["_compact_log()<br/>sliding window"]
-        COMPACT --> LLM["_call_llm()<br/>3-tier dispatch"]
-        LLM --> PARSE{"JSON<br/>валиден?"}
-        PARSE --> |Нет + не Claude| HINT["hint retry<br/>(+1 LLM call)"]
-        HINT --> PARSE2{"JSON<br/>валиден?"}
-        PARSE2 --> |Нет| STOP["OUTCOME_ERR_INTERNAL"]
-        PARSE --> |Да| STALL{"stall<br/>detected?"}
-        PARSE2 --> |Да| STALL
-        STALL --> |Да| STALL_RETRY["one-shot retry<br/>с hint injection"]
-        STALL --> |Нет| GUARDS["pre-dispatch guards"]
-        STALL_RETRY --> GUARDS
-        GUARDS --> DISPATCH["dispatch()<br/>dispatch.py"]
-        DISPATCH --> POST["post-dispatch<br/>handlers"]
-        POST --> FACT["_extract_fact()"]
-    end
-
-    TIMEOUT --> |Превышен| STOP2["OUTCOME_ERR_INTERNAL"]
+    TIMEOUT{"timeout<br/>check"} --> |Превышен| STOP2["OUTCOME_ERR_INTERNAL"]
+    TIMEOUT --> |OK| COMPACT["_compact_log()<br/>sliding window"]
+    COMPACT --> LLM["_call_llm()<br/>3-tier dispatch"]
+    LLM --> PARSE{"JSON<br/>валиден?"}
+    PARSE --> |"Нет + не Claude"| HINT["hint retry<br/>+1 LLM call"]
+    HINT --> PARSE2{"JSON<br/>валиден?"}
+    PARSE2 --> |Нет| STOP["OUTCOME_ERR_INTERNAL"]
+    PARSE --> |Да| STALL{"stall<br/>detected?"}
+    PARSE2 --> |Да| STALL
+    STALL --> |Да| STALL_RETRY["one-shot retry<br/>с hint injection"]
+    STALL --> |Нет| GUARDS["pre-dispatch guards"]
+    STALL_RETRY --> GUARDS
+    GUARDS --> DISPATCH["dispatch()<br/>dispatch.py"]
+    DISPATCH --> POST["post-dispatch<br/>handlers"]
+    POST --> FACT["_extract_fact()"]
+    FACT --> |"next step"| TIMEOUT
 ```
 
 ### 1.2 Трёхуровневый LLM dispatch
@@ -85,14 +80,14 @@ flowchart LR
 flowchart TD
     ND["NON-DETERMINISM<br/>от запуска к запуску"]
 
-    ND --> T["🔴 Temperature > 0<br/>без seed"]
-    ND --> R["🔴 Semantic Router<br/>без кэша"]
-    ND --> P["🟡 Промпт ~3200 tok<br/>противоречия + неоднозначности"]
-    ND --> J["🟡 JSON extraction<br/>order-dependent"]
-    ND --> S["🟡 Stall hints<br/>feedback loop"]
-    ND --> TO["🟡 Wall-clock timeout<br/>system-dependent"]
-    ND --> C["🟢 Capability cache<br/>in-memory only"]
-    ND --> LC["🟢 Log compaction<br/>потеря контекста"]
+    ND --> T["CRIT: Temperature > 0<br/>без seed"]
+    ND --> R["CRIT: Semantic Router<br/>без кэша"]
+    ND --> P["HIGH: Промпт ~3200 tok<br/>противоречия + неоднозначности"]
+    ND --> J["HIGH: JSON extraction<br/>order-dependent"]
+    ND --> S["HIGH: Stall hints<br/>feedback loop"]
+    ND --> TO["HIGH: Wall-clock timeout<br/>system-dependent"]
+    ND --> C["MED: Capability cache<br/>in-memory only"]
+    ND --> LC["MED: Log compaction<br/>потеря контекста"]
 
     T --> T1["default: T=0.35, no seed"]
     T --> T2["think: T=0.55, no seed"]
@@ -163,7 +158,7 @@ sequenceDiagram
     alt Да, нужна проверка
         L->>LLM: TaskRoute classify<br/>task_text[:800] + vault_ctx
         LLM-->>L: {route: "EXECUTE" | "DENY" | "CLARIFY" | "UNSUPPORTED"}
-        Note over L,LLM: ⚠️ Результат НЕ кэшируется<br/>Одна задача → разный route при повторе
+        Note over L,LLM: WARN: Результат НЕ кэшируется<br/>Одна задача - разный route при повторе
     else Нет (lookup)
         L->>L: Пропуск роутера (FIX-171)
     end
@@ -173,7 +168,7 @@ sequenceDiagram
         Note over L: return (0 шагов)
     else route = EXECUTE или ошибка роутера
         L->>L: Продолжить в основной цикл
-        Note over L: ⚠️ Ошибка сети → fallback EXECUTE<br/>= пропуск проверки безопасности
+        Note over L: WARN: Ошибка сети - fallback EXECUTE<br/>= пропуск проверки безопасности
     end
 ```
 
@@ -194,9 +189,9 @@ sequenceDiagram
 ```mermaid
 flowchart TD
     subgraph CONTRA["Противоречия в промпте"]
-        C1["🔴 OTP Elevation vs MANDATORY Verify"]
-        C2["🟡 Admin Execute vs Write Scope"]
-        C3["🟡 Contact Matching — разные правила"]
+        C1["CRIT: OTP Elevation vs MANDATORY Verify"]
+        C2["HIGH: Admin Execute vs Write Scope"]
+        C3["HIGH: Contact Matching - разные правила"]
     end
 
     C1 --> C1A["prompt.py:204-207<br/>admin → skip Steps 4-5"]
@@ -274,28 +269,28 @@ flowchart LR
 
 ```mermaid
 flowchart TD
-    TEXT["Свободный текст<br/>от LLM"] --> F1{"```json...```<br/>fenced?"}
+    TEXT["Свободный текст<br/>от LLM"] --> F1{"json fence<br/>block?"}
 
-    F1 --> |Да| RET1["✅ return JSON"]
+    F1 --> |Да| RET1["return JSON"]
     F1 --> |Нет| COLLECT["Собрать ВСЕ bracket-matched<br/>JSON объекты"]
 
     COLLECT --> HAS{"Есть<br/>кандидаты?"}
 
     HAS --> |Да| P2{"mutation tool?<br/>write/delete/move/mkdir"}
-    P2 --> |Да| RET2["✅ return первый mutation"]
-    P2 --> |Нет| P3{"bare tool?<br/>(без current_state)"}
-    P3 --> |Да| RET3["✅ return bare tool"]
-    P3 --> |Нет| P4{"NextStep +<br/>!report_completion?"}
-    P4 --> |Да| RET4["✅ return NextStep"]
+    P2 --> |Да| RET2["P2: return первый mutation"]
+    P2 --> |Нет| P3{"bare tool?<br/>без current_state"}
+    P3 --> |Да| RET3["P3: return bare tool"]
+    P3 --> |Нет| P4{"NextStep +<br/>не report_completion?"}
+    P4 --> |Да| RET4["P4: return NextStep"]
     P4 --> |Нет| P5{"Любой<br/>NextStep?"}
-    P5 --> |Да| RET5["✅ return (вкл. report_completion)"]
-    P5 --> |Нет| P6{"'function'<br/>key?"}
-    P6 --> |Да| RET6["✅ return function obj"]
-    P6 --> |Нет| RET7["✅ return первый кандидат"]
+    P5 --> |Да| RET5["P5: вкл. report_completion"]
+    P5 --> |Нет| P6{"function<br/>key?"}
+    P6 --> |Да| RET6["P6: return function obj"]
+    P6 --> |Нет| RET7["P7: return первый кандидат"]
 
     HAS --> |Нет| YAML{"YAML<br/>fallback?"}
-    YAML --> |Да| RET8["✅ return parsed YAML"]
-    YAML --> |Нет| NONE["❌ return None"]
+    YAML --> |Да| RET8["P8: return parsed YAML"]
+    YAML --> |Нет| NONE["FAIL: return None"]
 
     style RET1 fill:#6bcb77,color:#333
     style NONE fill:#ff6b6b,color:#fff
@@ -332,7 +327,7 @@ sequenceDiagram
     LLM-->>L: новый ответ
 
     Note over L: hint удаляется из лога<br/>НО ответ на hint остаётся
-    Note over L: ⚠️ При compaction hint-ответ<br/>попадает в digest без контекста
+    Note over L: WARN: При compaction hint-ответ<br/>попадает в digest без контекста
 
     alt Модель эхо-повторяет hint (minimax)
         L->>L: FIX-155: echo guard
@@ -378,20 +373,20 @@ pie title Распределение FIX'ов по модулям
 
 ```mermaid
 flowchart LR
-    subgraph PROMPT_ONLY["⚠️ Только в промпте<br/>(нет code enforcement)"]
-        A["Write ONLY task-requested files<br/>prompt.py:62"]
-        B["Email domain MUST match<br/>prompt.py:224"]
-        C["Company verification MANDATORY<br/>prompt.py:225"]
-        D["Delete OTP after use<br/>prompt.py:196"]
-        E["Body ONLY task-provided text<br/>prompt.py:76"]
+    subgraph PROMPT_ONLY["Только в промпте - нет code enforcement"]
+        A["Write ONLY task-requested files"]
+        B["Email domain MUST match"]
+        C["Company verification MANDATORY"]
+        D["Delete OTP after use"]
+        E["Body ONLY task-provided text"]
     end
 
-    subgraph CODE_ENFORCED["✅ В коде<br/>(гарантировано)"]
-        F["No wildcard delete<br/>loop.py:1199"]
-        G["Lookup = read-only<br/>loop.py:1212-1213"]
-        H["Empty-path guard<br/>loop.py:1223-1228"]
-        I["No _ prefix delete<br/>models.py validator"]
-        J["Outbox schema verify<br/>loop.py:1263-1271"]
+    subgraph CODE_ENFORCED["В коде - гарантировано"]
+        F["No wildcard delete"]
+        G["Lookup = read-only"]
+        H["Empty-path guard"]
+        I["No _ prefix delete"]
+        J["Outbox schema verify"]
     end
 
     style PROMPT_ONLY fill:#fff3cd,stroke:#ffc107
@@ -447,7 +442,12 @@ flowchart TD
     REGEX_EXTRACT --> |"fail"| PLAIN["plain-text<br/>keyword match"]
     PLAIN --> |"fail"| FALLBACK["fallback →<br/>classify_task() regex"]
 
-    LC & INB & EM & LU & DI & TH --> SKIP["⚡ LLM call пропущен<br/>(regex-confident)"]
+    LC --> SKIP["LLM call пропущен<br/>regex-confident"]
+    INB --> SKIP
+    EM --> SKIP
+    LU --> SKIP
+    DI --> SKIP
+    TH --> SKIP
 
     style SKIP fill:#6bcb77,color:#333
     style DEF fill:#ffd93d,color:#333
@@ -478,44 +478,34 @@ flowchart TD
 ### 5.1 Состояние и его эволюция
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Init: run_loop() start
+flowchart TD
+    INIT["Init"] --> PREROUTE["PreRoute:<br/>injection regex +<br/>semantic router"]
+    PREROUTE --> |"route = EXECUTE"| TC["TimeoutCheck"]
+    PREROUTE --> |"DENY / CLARIFY /<br/>UNSUPPORTED"| DONE["Done"]
 
-    Init --> PreRoute: injection regex + semantic router
-    PreRoute --> MainLoop: route = EXECUTE
-    PreRoute --> Done: route = DENY/CLARIFY/UNSUPPORTED
+    subgraph MAINLOOP["MainLoop - до 30 итераций"]
+        TC --> |OK| LC2["LogCompaction"]
+        TC --> |timeout| BREAK["Break: ERR_INTERNAL"]
+        LC2 --> LLMC["LLMCall"]
+        LLMC --> |"job = None,<br/>не Claude"| JR["JSONRetry"]
+        LLMC --> |job OK| SC["StallCheck"]
+        JR --> |job OK| SC
+        JR --> |"всё ещё None"| BREAK
+        SC --> |stall detected| SR["StallRetry"]
+        SC --> |"нет stall"| PDG["PreDispatchGuards"]
+        SR --> PDG
+        PDG --> |guards passed| DSP["Dispatch"]
+        PDG --> |"guard blocked"| NI["NextIteration"]
+        DSP --> |OK| PD["PostDispatch"]
+        DSP --> |ConnectError| ER["ErrorRecovery"]
+        PD --> FE["FactExtract"]
+        ER --> FE
+        FE --> NI
+        NI --> TC
+    end
 
-    state MainLoop {
-        [*] --> TimeoutCheck
-        TimeoutCheck --> LogCompaction: OK
-        TimeoutCheck --> Done: timeout exceeded
-
-        LogCompaction --> LLMCall
-        LLMCall --> JSONRetry: job = None + не Claude
-        LLMCall --> StallCheck: job OK
-        JSONRetry --> StallCheck: job OK (после retry)
-        JSONRetry --> Done: всё ещё None
-
-        StallCheck --> PreDispatchGuards: нет stall
-        StallCheck --> StallRetry: stall detected
-        StallRetry --> PreDispatchGuards
-
-        PreDispatchGuards --> Dispatch: guards passed
-        PreDispatchGuards --> NextIteration: guard blocked (wildcard, empty-path, lookup-mutation)
-
-        Dispatch --> PostDispatch: OK
-        Dispatch --> ErrorRecovery: ConnectError
-
-        PostDispatch --> FactExtract
-        ErrorRecovery --> FactExtract
-
-        FactExtract --> NextIteration
-        NextIteration --> [*]
-    }
-
-    MainLoop --> Done: report_completion / max_steps
-
-    Done --> [*]
+    BREAK --> DONE
+    DSP --> |report_completion| DONE
 ```
 
 ### 5.2 Log compaction: что сохраняется, что теряется
@@ -542,7 +532,7 @@ flowchart TD
         DONEF["DONE: mutations"]
     end
 
-    subgraph LOST["⚠️ Потеряно при compaction"]
+    subgraph LOST["WARN: Потеряно при compaction"]
         DETAIL["Детали старых tool results"]
         ORDER["Порядок операций"]
         HINTS["Контекст stall hints"]
@@ -697,23 +687,11 @@ flowchart TD
 
 ### 9.1 Матрица приоритетов
 
-```mermaid
-quadrantChart
-    title Усилие vs Влияние на стабильность
-    x-axis "Низкое усилие" --> "Высокое усилие"
-    y-axis "Низкое влияние" --> "Высокое влияние"
-
-    "T=0 + seed": [0.15, 0.9]
-    "Кэш TaskRoute": [0.2, 0.85]
-    "Resolve prompt contradictions": [0.3, 0.7]
-    "Code enforce write scope": [0.4, 0.75]
-    "Split run_loop()": [0.6, 0.5]
-    "Prompt < 100 lines": [0.75, 0.8]
-    "Persist capability cache": [0.2, 0.3]
-    "Step-based timeout": [0.15, 0.35]
-    "Anthropic JSON fallback": [0.25, 0.4]
-    "Regression test suite": [0.8, 0.65]
-```
+| Влияние / Усилие | Низкое усилие | Среднее усилие | Высокое усилие |
+|:---:|:---:|:---:|:---:|
+| **Высокое влияние** | T=0+seed, Кэш TaskRoute | Resolve contradictions, Code enforce write scope | Prompt < 100 lines, Regression tests |
+| **Среднее влияние** | Step-based timeout | Anthropic JSON fallback | Split run_loop() |
+| **Низкое влияние** | Persist capability cache | | |
 
 ### 9.2 Tier 1: Быстрые wins (оценка: устранят ~60% нестабильности)
 
