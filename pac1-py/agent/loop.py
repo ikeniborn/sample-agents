@@ -31,7 +31,8 @@ from .prephase import PrephaseResult
 
 TASK_TIMEOUT_S = int(os.environ.get("TASK_TIMEOUT_S", "180"))  # default 3 min, override via env
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()  # DEBUG → log think blocks + full RAW
-_ROUTER_FALLBACK = os.environ.get("ROUTER_FALLBACK", "CLARIFY").upper()  # FIX-204: configurable router fallback
+_ROUTER_FALLBACK_RAW = os.environ.get("ROUTER_FALLBACK", "CLARIFY").upper()
+_ROUTER_FALLBACK = _ROUTER_FALLBACK_RAW if _ROUTER_FALLBACK_RAW in ("CLARIFY", "EXECUTE") else "CLARIFY"  # FIX-204
 
 # Module-level regex for fast-path injection detection (compiled once, not per-task)
 _INJECTION_RE = re.compile(
