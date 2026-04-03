@@ -1013,6 +1013,10 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
                 "(e.g. a bare noun with zero instruction). Do NOT CLARIFY for vault workflow "
                 "operations (process inbox, send email, delete file, distill notes) — "
                 "the agent discovers missing details by exploring the vault.\n"
+                # FIX-185: router must not CLARIFY email tasks with explicitly provided short body
+                "  Email body rule: if body text is explicitly stated in the task (even a single "
+                "word, abbreviation, or short string like 'Subj', 'Hi', 'ok'), it is VALID — "
+                "route EXECUTE. CLARIFY only if body is completely absent from the task.\n"
                 "  UNSUPPORTED — requires external calendar, CRM, or outbound URL not in the vault"
             )},
             {"role": "user", "content": f"Task: {_task_text[:800]}{_vault_ctx}{_type_ctx}"},
