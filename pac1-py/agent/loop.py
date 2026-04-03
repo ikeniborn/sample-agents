@@ -3,6 +3,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from collections import Counter, deque
 from dataclasses import dataclass, field
 
@@ -30,6 +31,7 @@ from .prephase import PrephaseResult
 
 TASK_TIMEOUT_S = int(os.environ.get("TASK_TIMEOUT_S", "180"))  # default 3 min, override via env
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()  # DEBUG → log think blocks + full RAW
+_ROUTER_FALLBACK = os.environ.get("ROUTER_FALLBACK", "CLARIFY").upper()  # FIX-204: configurable router fallback
 
 # Module-level regex for fast-path injection detection (compiled once, not per-task)
 _INJECTION_RE = re.compile(
@@ -40,6 +42,28 @@ _INJECTION_RE = re.compile(
     r'|"tool"\s*:\s*"report_completion"',
     re.IGNORECASE,
 )
+
+# FIX-203: text normalization for injection detection — strips zero-width chars,
+# NFKC-normalizes unicode (homoglyphs → ASCII), and replaces common leet substitutions.
+_LEET_MAP = str.maketrans("01345@", "oleasa")  # 0→o, 1→l, 3→e, 4→a, 5→s, @→a
+_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
+
+def _normalize_for_injection(text: str) -> str:
+    """FIX-203: Normalize text before injection regex check."""
+    t = _ZERO_WIDTH_RE.sub("", text)
+    t = unicodedata.normalize("NFKC", t)
+    t = t.translate(_LEET_MAP)
+    return t
+
+# FIX-206: body anti-contamination patterns for outbox email verification.
+# Detects vault paths, tree output, tool results, and system file references leaked into email body.
+_CONTAM_PATTERNS: list[tuple[re.Pattern, str]] = [
+    (re.compile(r"^/[a-zA-Z_\-]+/", re.MULTILINE), "vault path"),
+    (re.compile(r"VAULT STRUCTURE:"), "vault tree"),
+    (re.compile(r"[├└│]──"), "tree output"),
+    (re.compile(r"\bResult of Req_"), "tool result"),
+    (re.compile(r"\bAGENTS\.MD\b"), "system file ref"),
+]
 
 # FIX-188: route cache — key: sha256(task_text[:800]), value: (route, reason, injection_signals)
 # Ensures deterministic routing for the same task; populated only on successful LLM responses
@@ -143,9 +167,10 @@ def _history_action_repr(action_name: str, action) -> str:
 @dataclass
 class _StepFact:
     """One key fact extracted from a completed step for rolling digest."""
-    kind: str    # "list", "read", "search", "write", "delete", "move", "mkdir"
+    kind: str    # "list", "read", "search", "write", "delete", "move", "mkdir", "stall"
     path: str
     summary: str  # compact 1-line description
+    error: str = ""  # FIX-199: preserve error details through compaction
 
 
 @dataclass
@@ -213,19 +238,20 @@ def _extract_fact(action_name: str, action, result_txt: str) -> "_StepFact | Non
 
     # For mutating operations, check result_txt for errors before reporting success
     _is_err = result_txt.startswith("ERROR")
+    _err_detail = result_txt[:120] if _is_err else ""  # FIX-199: capture error for digest
     if action_name == "Req_Write":
         summary = result_txt[:80] if _is_err else f"WRITTEN: {path}"
-        return _StepFact("write", path, summary)
+        return _StepFact("write", path, summary, error=_err_detail)
     if action_name == "Req_Delete":
         summary = result_txt[:80] if _is_err else f"DELETED: {path}"
-        return _StepFact("delete", path, summary)
+        return _StepFact("delete", path, summary, error=_err_detail)
     if action_name == "Req_Move":
         to = getattr(action, "to_name", "?")
         summary = result_txt[:80] if _is_err else f"MOVED: {path} → {to}"
-        return _StepFact("move", path, summary)
+        return _StepFact("move", path, summary, error=_err_detail)
     if action_name == "Req_MkDir":
         summary = result_txt[:80] if _is_err else f"CREATED DIR: {path}"
-        return _StepFact("mkdir", path, summary)
+        return _StepFact("mkdir", path, summary, error=_err_detail)
 
     return None
 
@@ -234,6 +260,8 @@ def _build_digest(facts: "list[_StepFact]") -> str:
     """Build compact state digest from accumulated step facts."""
     sections: dict[str, list[str]] = {
         "LISTED": [], "READ": [], "FOUND": [], "DONE": [],
+        "ERRORS": [],   # FIX-199: preserve error details through compaction
+        "STALLS": [],   # FIX-200: preserve stall events through compaction
     }
     for f in facts:
         if f.kind == "list":
@@ -244,6 +272,10 @@ def _build_digest(facts: "list[_StepFact]") -> str:
             sections["FOUND"].append(f"  {f.summary}")
         elif f.kind in ("write", "delete", "move", "mkdir"):
             sections["DONE"].append(f"  {f.summary}")
+        elif f.kind == "stall":  # FIX-200
+            sections["STALLS"].append(f"  {f.summary}")
+        if f.error:  # FIX-199: errors on any kind propagate to ERRORS section
+            sections["ERRORS"].append(f"  {f.kind}({f.path}): {f.error}")
     parts = [
         f"{label}:\n" + "\n".join(lines)
         for label, lines in sections.items()
@@ -467,6 +499,32 @@ def _extract_json_from_text(text: str) -> dict | None:  # FIX-146 (revised FIX-1
     return None
 
 
+def _normalize_parsed(parsed: dict) -> dict:
+    """Normalize a raw parsed dict into a valid NextStep structure.  # FIX-207
+    Handles bare function objects, plan truncation, and missing task_completed.
+    Shared by Anthropic and OpenRouter/Ollama tiers."""
+    if "tool" in parsed and "current_state" not in parsed:
+        parsed = {
+            "current_state": "continuing",
+            "plan_remaining_steps_brief": ["execute action"],
+            "task_completed": False,
+            "function": parsed,
+        }
+    elif "reasoning" in parsed and "current_state" not in parsed:
+        parsed = {
+            "current_state": "reasoning stripped",
+            "plan_remaining_steps_brief": ["explore vault"],
+            "task_completed": False,
+            "function": {"tool": "list", "path": "/"},
+        }
+    if isinstance(parsed.get("plan_remaining_steps_brief"), list):
+        steps = [s for s in parsed["plan_remaining_steps_brief"] if s]
+        parsed["plan_remaining_steps_brief"] = steps[:5] if steps else ["continue"]
+    if "task_completed" not in parsed:
+        parsed["task_completed"] = False
+    return parsed
+
+
 # ---------------------------------------------------------------------------
 # LLM call: Anthropic primary, OpenRouter/Ollama fallback
 # ---------------------------------------------------------------------------
@@ -565,35 +623,9 @@ def _call_openai_tier(
                     print(f"{CLI_RED}[{label}] JSON extraction from text failed{CLI_CLR}")
                     break
                 print(f"{CLI_YELLOW}[{label}] JSON extracted from free-form text{CLI_CLR}")
-            # Response normalization
-            # Auto-wrap bare function objects (model returns {"tool":...} without outer NextStep)
-            if isinstance(parsed, dict) and "tool" in parsed and "current_state" not in parsed:
-                print(f"{CLI_YELLOW}[normalize] Auto-wrapping bare function object{CLI_CLR}")
-                parsed = {
-                    "current_state": "continuing",
-                    "plan_remaining_steps_brief": ["execute action"],
-                    "task_completed": False,
-                    "function": parsed,
-                }
-            # Strip thinking-only wrapper (model returns {"reasoning":...} without NextStep fields)
-            elif isinstance(parsed, dict) and "reasoning" in parsed and "current_state" not in parsed:
-                print(f"{CLI_YELLOW}[normalize] Stripping bare reasoning wrapper, using list action{CLI_CLR}")
-                parsed = {
-                    "current_state": "reasoning stripped",
-                    "plan_remaining_steps_brief": ["explore vault"],
-                    "task_completed": False,
-                    "function": {"tool": "list", "path": "/"},
-                }
-            # Truncate plan_remaining_steps_brief to MaxLen(5)
-            if isinstance(parsed, dict) and isinstance(parsed.get("plan_remaining_steps_brief"), list):
-                steps = [s for s in parsed["plan_remaining_steps_brief"] if s]  # drop empty strings
-                if not steps:
-                    steps = ["continue"]
-                parsed["plan_remaining_steps_brief"] = steps[:5]
-            # Inject missing task_completed=False (required field sometimes dropped by model)
-            if isinstance(parsed, dict) and "task_completed" not in parsed:
-                print(f"{CLI_YELLOW}[normalize] Missing task_completed — defaulting to false{CLI_CLR}")
-                parsed["task_completed"] = False
+            # Response normalization — shared helper (FIX-207)
+            if isinstance(parsed, dict):
+                parsed = _normalize_parsed(parsed)
             try:
                 return NextStep.model_validate(parsed), elapsed_ms, in_tok, out_tok, think_tok, _eval_count, _eval_ms
             except ValidationError as e:
@@ -671,7 +703,15 @@ def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextSt
                 try:
                     return NextStep.model_validate_json(raw), elapsed_ms, in_tok, out_tok, think_tok, 0, 0
                 except (ValidationError, ValueError) as e:
-                    print(f"{CLI_RED}[Anthropic] JSON parse failed: {e}{CLI_CLR}")
+                    # FIX-207: extraction fallback — same chain as OpenRouter/Ollama
+                    print(f"{CLI_YELLOW}[Anthropic] JSON parse failed, trying extraction: {e}{CLI_CLR}")
+                    parsed = _extract_json_from_text(raw)
+                    if parsed is not None and isinstance(parsed, dict):
+                        parsed = _normalize_parsed(parsed)
+                        try:
+                            return NextStep.model_validate(parsed), elapsed_ms, in_tok, out_tok, think_tok, 0, 0
+                        except (ValidationError, ValueError) as e2:
+                            print(f"{CLI_RED}[Anthropic] Extraction also failed: {e2}{CLI_CLR}")
                     return None, elapsed_ms, in_tok, out_tok, think_tok, 0, 0
 
         _next = "OpenRouter" if openrouter_client is not None else "Ollama"
@@ -792,6 +832,8 @@ def _handle_stall_retry(
     _stall_hint = _check_stall(fingerprints, steps_since_write, error_counts, step_facts)
     if _stall_hint and not stall_active:
         print(f"{CLI_YELLOW}[stall] Detected: {_stall_hint[:120]}{CLI_CLR}")
+        # FIX-200: record stall event as step fact for compaction survival
+        step_facts.append(_StepFact(kind="stall", path="", summary=_stall_hint[:100]))
         log.append({"role": "user", "content": f"[STALL HINT] {_stall_hint}"})
         stall_active = True
         _job2, _e2, _i2, _o2, _, _ev_c2, _ev_ms2 = _call_llm(log, model, max_tokens, cfg)
@@ -944,6 +986,19 @@ def _verify_json_write(vm: PcmRuntimeClientSync, job: "NextStep", log: list,
                 )
                 print(f"{CLI_YELLOW}{_sv_msg}{CLI_CLR}")
                 log.append({"role": "user", "content": _sv_msg})
+            # FIX-206: body anti-contamination check for outbox emails
+            if hasattr(schema_cls, "__name__") and "EmailOutbox" in schema_cls.__name__:
+                _body = _wb_parsed.get("body", "")
+                _found = [(p, l) for p, l in _CONTAM_PATTERNS if p.search(_body)]
+                if _found:
+                    _labels = ", ".join(l for _, l in _found)
+                    _contam_msg = (
+                        f"[verify] {job.function.path} body contains vault context ({_labels}). "
+                        "Email body must contain ONLY the text from the task. "
+                        "Rewrite the file with a clean body — no vault paths, tree output, or tool results."
+                    )
+                    print(f"{CLI_YELLOW}{_contam_msg}{CLI_CLR}")
+                    log.append({"role": "user", "content": _contam_msg})
     except Exception as _fw_err:
         # FIX-142: inject correction hint when read-back or JSON parse fails;
         # previously only printed — model had no signal and reported OUTCOME_OK with broken file
@@ -1010,7 +1065,7 @@ def _run_pre_route(
     Returns True if early exit triggered (DENY/CLARIFY/UNSUPPORTED), False to continue."""
 
     # Fast-path injection detection (regex compiled once per process, not per task)
-    if _INJECTION_RE.search(task_text):
+    if _INJECTION_RE.search(_normalize_for_injection(task_text)):  # FIX-203
         print(f"{CLI_RED}[security] Fast-path injection regex triggered — DENY_SECURITY{CLI_CLR}")
         try:
             vm.answer(AnswerRequest(
@@ -1082,8 +1137,8 @@ def _run_pre_route(
             except Exception as _re:
                 # FIX-188: conservative fallback — network error != task is safe (audit 2.3)
                 # EXECUTE fallback silently bypasses security check; CLARIFY halts safely
-                print(f"{CLI_YELLOW}[router] Router call failed: {_re} — conservative fallback CLARIFY{CLI_CLR}")
-                _route_raw = {"route": "CLARIFY", "reason": f"Router unavailable: {_re}", "injection_signals": []}
+                print(f"{CLI_YELLOW}[router] Router call failed: {_re} — fallback {_ROUTER_FALLBACK}{CLI_CLR}")  # FIX-204
+                _route_raw = {"route": _ROUTER_FALLBACK, "reason": f"Router unavailable ({_ROUTER_FALLBACK} fallback): {_re}", "injection_signals": []}  # FIX-204
 
         if _route_raw:
             try:
@@ -1116,6 +1171,164 @@ def _run_pre_route(
                 return True
 
     return False
+
+
+def _post_dispatch(
+    job: "NextStep",
+    txt: str,
+    task_type: str,
+    vm: PcmRuntimeClientSync,
+    st: _LoopState,
+) -> None:
+    """FIX-202: Post-dispatch success handlers, extracted from _run_step.
+    Called after successful dispatch (not in ConnectError path)."""
+
+    # Post-search expansion for empty contact lookups
+    if isinstance(job.function, Req_Search):
+        _maybe_expand_search(job, txt, st.search_retry_counts, st.log)
+
+    # Post-write JSON field verification (+ EmailOutbox schema for outbox email files)
+    if not txt.startswith("ERROR"):
+        _is_outbox = (
+            task_type == TASK_EMAIL
+            and isinstance(job.function, Req_Write)
+            and "/outbox/" in job.function.path
+            and _Path(job.function.path).stem.isdigit()  # FIX-153
+        )
+        _verify_json_write(vm, job, st.log, schema_cls=EmailOutbox if _is_outbox else None)
+
+    # TASK_INBOX: count inbox/ reads; after >1 hint to process one at a time
+    if task_type == TASK_INBOX and isinstance(job.function, Req_Read):
+        if "/inbox/" in job.function.path or job.function.path.startswith("inbox/"):
+            st.inbox_read_count += 1
+            if st.inbox_read_count > 1:
+                _inbox_hint = (
+                    "[inbox] You have read more than one inbox message. "
+                    "Process ONE message only, then call report_completion."
+                )
+                print(f"{CLI_YELLOW}{_inbox_hint}{CLI_CLR}")
+                st.log.append({"role": "user", "content": _inbox_hint})
+
+    # TASK_DISTILL: hint to update thread after writing a card file
+    if task_type == TASK_DISTILL and isinstance(job.function, Req_Write) and not txt.startswith("ERROR"):
+        if "/cards/" in job.function.path or "card" in _Path(job.function.path).name.lower():
+            _distill_hint = (
+                f"[distill] Card written: {job.function.path}. "
+                "Remember to update the thread file with a link to this card."
+            )
+            print(f"{CLI_YELLOW}{_distill_hint}{CLI_CLR}")
+            st.log.append({"role": "user", "content": _distill_hint})
+
+
+# ---------------------------------------------------------------------------
+# FIX-208: Write-scope code enforcement — programmatic guard for mutation paths
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PATH_PREFIXES = ("/docs/",)
+_SYSTEM_PATHS_EXACT = frozenset({"/AGENTS.MD", "/AGENTS.md"})
+_OTP_PATH = "/docs/channels/otp.txt"
+
+
+def _check_write_scope(action, action_name: str, task_type: str) -> str | None:
+    """Return error message if mutation violates write-scope, else None.
+
+    Layer 1 (all types): deny system paths (docs/, AGENTS.MD).
+      Exception: inbox + Req_Delete + otp.txt (OTP elevation).
+    Layer 2 (email only): allow-list — only /outbox/ paths.
+    """
+    paths_to_check: list[str] = []
+    if hasattr(action, "path") and action.path:
+        paths_to_check.append(action.path)
+    if hasattr(action, "from_name") and action.from_name:
+        paths_to_check.append(action.from_name)
+    if hasattr(action, "to_name") and action.to_name:
+        paths_to_check.append(action.to_name)
+
+    for p in paths_to_check:
+        is_system = p in _SYSTEM_PATHS_EXACT or any(
+            p.startswith(pfx) for pfx in _SYSTEM_PATH_PREFIXES
+        )
+        if is_system:
+            if task_type == TASK_INBOX and action_name == "Req_Delete" and p == _OTP_PATH:
+                continue
+            return (
+                f"Blocked: {action_name} targets system path '{p}'. "
+                "System files (docs/, AGENTS.MD) are read-only. "
+                "Choose a different target path."
+            )
+        if task_type == TASK_EMAIL and not p.startswith("/outbox/"):
+            return (
+                f"Blocked: {action_name} targets '{p}' but email tasks may only "
+                "write to /outbox/. Use report_completion if no outbox write is needed."
+            )
+
+    return None
+
+
+def _pre_dispatch(
+    job: "NextStep",
+    task_type: str,
+    vm: PcmRuntimeClientSync,
+    st: _LoopState,
+) -> str | None:
+    """FIX-201: Pre-dispatch preparation and guards, extracted from _run_step.
+    Runs preparation (auto-list before delete, track listed dirs) always.
+    Returns None to proceed with dispatch, or error message to skip it."""
+    action_name = job.function.__class__.__name__
+
+    # Preparation: auto-list parent dir before first delete from it
+    if isinstance(job.function, Req_Delete):
+        parent = str(_Path(job.function.path).parent)
+        if parent not in st.listed_dirs:
+            print(f"{CLI_YELLOW}[auto-list] Auto-listing {parent} before delete{CLI_CLR}")
+            try:
+                _lr = vm.list(ListRequest(name=parent))
+                _lr_raw = json.dumps(MessageToDict(_lr), indent=2) if _lr else "{}"
+                st.listed_dirs.add(parent)
+                st.log.append({"role": "user", "content": f"[auto-list] Directory listing of {parent} (auto):\nResult of Req_List: {_lr_raw}"})
+            except Exception as _le:
+                print(f"{CLI_RED}[auto-list] Auto-list failed: {_le}{CLI_CLR}")
+
+    # Preparation: track listed dirs
+    if isinstance(job.function, Req_List):
+        st.listed_dirs.add(job.function.path)
+
+    # Guard: wildcard delete rejection
+    if isinstance(job.function, Req_Delete) and ("*" in job.function.path):
+        wc_parent = job.function.path.rstrip("/*").rstrip("/") or "/"
+        print(f"{CLI_YELLOW}[wildcard] Wildcard delete rejected: {job.function.path}{CLI_CLR}")
+        return (
+            f"ERROR: Wildcards not supported. You must delete files one by one.\n"
+            f"List '{wc_parent}' first, then delete each file individually by its exact path."
+        )
+
+    # Guard: TASK_LOOKUP read-only — mutations not allowed for lookup tasks
+    if task_type == TASK_LOOKUP and isinstance(job.function, (Req_Write, Req_Delete, Req_MkDir, Req_Move)):
+        print(f"{CLI_YELLOW}[lookup] Blocked mutation {action_name} — lookup tasks are read-only{CLI_CLR}")
+        return "[lookup] Lookup tasks are read-only. Use report_completion to answer the question."
+
+    # Guard: FIX-208 write-scope — system path protection + email allow-list
+    if isinstance(job.function, (Req_Write, Req_Delete, Req_MkDir, Req_Move)):
+        _scope_err = _check_write_scope(job.function, action_name, task_type)
+        if _scope_err:
+            print(f"{CLI_YELLOW}[write-scope] {_scope_err}{CLI_CLR}")
+            return f"[write-scope] {_scope_err}"
+
+    # Guard: FIX-148 empty-path — model generated write/delete with path="" placeholder
+    _has_empty_path = (
+        isinstance(job.function, (Req_Write, Req_Delete, Req_Move, Req_MkDir))
+        and not getattr(job.function, "path", None)
+        and not getattr(job.function, "from_name", None)
+    )
+    if _has_empty_path:
+        print(f"{CLI_YELLOW}[empty-path] {action_name} has empty path — injecting correction hint{CLI_CLR}")
+        return (
+            f"ERROR: {action_name} requires a non-empty path. "
+            "Your last response had an empty path field. "
+            "Provide the correct full path (e.g. /reminders/rem_001.json) and content."
+        )
+
+    return None
 
 
 def _run_step(
@@ -1160,7 +1373,7 @@ def _run_step(
     _st_accum(st, elapsed_ms, in_tok, out_tok, ev_c, ev_ms)
 
     # JSON parse retry hint (for Ollama json_object mode)
-    if job is None and not is_claude_model(model):
+    if job is None:  # FIX-207: retry hint for all models (was non-Claude only)
         print(f"{CLI_YELLOW}[retry] Adding JSON correction hint{CLI_CLR}")
         st.log.append({"role": "user", "content": (
             'Your previous response was invalid. Respond with EXACTLY this JSON structure '
@@ -1220,63 +1433,10 @@ def _run_step(
         "content": _history_action_repr(action_name, job.function),
     })
 
-    # Auto-list parent dir before first delete from it
-    if isinstance(job.function, Req_Delete):
-        parent = str(_Path(job.function.path).parent)
-        if parent not in st.listed_dirs:
-            print(f"{CLI_YELLOW}[auto-list] Auto-listing {parent} before delete{CLI_CLR}")
-            try:
-                _lr = vm.list(ListRequest(name=parent))
-                _lr_raw = json.dumps(MessageToDict(_lr), indent=2) if _lr else "{}"
-                st.listed_dirs.add(parent)
-                st.log.append({"role": "user", "content": f"[auto-list] Directory listing of {parent} (auto):\nResult of Req_List: {_lr_raw}"})
-            except Exception as _le:
-                print(f"{CLI_RED}[auto-list] Auto-list failed: {_le}{CLI_CLR}")
-
-    # Track listed dirs
-    if isinstance(job.function, Req_List):
-        st.listed_dirs.add(job.function.path)
-
-    # Wildcard delete rejection
-    if isinstance(job.function, Req_Delete) and ("*" in job.function.path):
-        wc_parent = job.function.path.rstrip("/*").rstrip("/") or "/"
-        print(f"{CLI_YELLOW}[wildcard] Wildcard delete rejected: {job.function.path}{CLI_CLR}")
-        st.log.append({
-            "role": "user",
-            "content": (
-                f"ERROR: Wildcards not supported. You must delete files one by one.\n"
-                f"List '{wc_parent}' first, then delete each file individually by its exact path."
-            ),
-        })
-        st.steps_since_write += 1
-        return False
-
-    # Unit 8 TASK_LOOKUP: read-only guard — mutations are not allowed for lookup tasks
-    if task_type == TASK_LOOKUP and isinstance(job.function, (Req_Write, Req_Delete, Req_MkDir, Req_Move)):
-        print(f"{CLI_YELLOW}[lookup] Blocked mutation {action_name} — lookup tasks are read-only{CLI_CLR}")
-        st.log.append({"role": "user", "content":
-            "[lookup] Lookup tasks are read-only. Use report_completion to answer the question."})
-        st.steps_since_write += 1
-        return False
-
-    # FIX-148: empty-path guard — model generated write/delete with path="" placeholder
-    # (happens when model outputs multi-action text with a bare NextStep schema that has empty function fields)
-    # Inject correction hint instead of dispatching, which would throw INVALID_ARGUMENT from PCM.
-    _has_empty_path = (
-        isinstance(job.function, (Req_Write, Req_Delete, Req_Move, Req_MkDir))
-        and not getattr(job.function, "path", None)
-        and not getattr(job.function, "from_name", None)
-    )
-    if _has_empty_path:
-        print(f"{CLI_YELLOW}[empty-path] {action_name} has empty path — injecting correction hint{CLI_CLR}")
-        st.log.append({
-            "role": "user",
-            "content": (
-                f"ERROR: {action_name} requires a non-empty path. "
-                "Your last response had an empty path field. "
-                "Provide the correct full path (e.g. /reminders/rem_001.json) and content."
-            ),
-        })
+    # FIX-201: pre-dispatch preparation and guards
+    _guard_msg = _pre_dispatch(job, task_type, vm, st)
+    if _guard_msg is not None:
+        st.log.append({"role": "user", "content": _guard_msg})
         st.steps_since_write += 1
         return False
 
@@ -1298,41 +1458,8 @@ def _run_step(
             txt = f"CREATED DIR: {job.function.path}"
         print(f"{CLI_GREEN}OUT{CLI_CLR}: {txt[:300]}{'...' if len(txt) > 300 else ''}")
 
-        # Post-search expansion for empty contact lookups
-        if isinstance(job.function, Req_Search):
-            _maybe_expand_search(job, txt, st.search_retry_counts, st.log)
-
-        # Post-write JSON field verification (+ EmailOutbox schema for outbox email files)
-        if not txt.startswith("ERROR"):
-            _is_outbox = (
-                task_type == TASK_EMAIL
-                and isinstance(job.function, Req_Write)
-                and "/outbox/" in job.function.path
-                and _Path(job.function.path).stem.isdigit()  # FIX-153: skip seq.json / README — only numeric filenames are emails
-            )
-            _verify_json_write(vm, job, st.log, schema_cls=EmailOutbox if _is_outbox else None)
-
-        # Unit 8 TASK_INBOX: count inbox/ reads; after >1 hint to process one at a time
-        if task_type == TASK_INBOX and isinstance(job.function, Req_Read):
-            if "/inbox/" in job.function.path or job.function.path.startswith("inbox/"):
-                st.inbox_read_count += 1
-                if st.inbox_read_count > 1:
-                    _inbox_hint = (
-                        "[inbox] You have read more than one inbox message. "
-                        "Process ONE message only, then call report_completion."
-                    )
-                    print(f"{CLI_YELLOW}{_inbox_hint}{CLI_CLR}")
-                    st.log.append({"role": "user", "content": _inbox_hint})
-
-        # Unit 8 TASK_DISTILL: hint to update thread after writing a card file
-        if task_type == TASK_DISTILL and isinstance(job.function, Req_Write) and not txt.startswith("ERROR"):
-            if "/cards/" in job.function.path or "card" in _Path(job.function.path).name.lower():
-                _distill_hint = (
-                    f"[distill] Card written: {job.function.path}. "
-                    "Remember to update the thread file with a link to this card."
-                )
-                print(f"{CLI_YELLOW}{_distill_hint}{CLI_CLR}")
-                st.log.append({"role": "user", "content": _distill_hint})
+        # FIX-202: post-dispatch success handlers
+        _post_dispatch(job, txt, task_type, vm, st)
 
         # Reset stall state on meaningful progress
         if isinstance(job.function, (Req_Write, Req_Delete, Req_Move, Req_MkDir)):
@@ -1351,6 +1478,13 @@ def _run_step(
         st.error_counts[(action_name, _err_path, exc.code.name)] += 1
         st.stall_hint_active = False  # allow stall hint on next iteration if error repeats
         st.steps_since_write += 1
+        # FIX-199: record error as step fact for digest preservation
+        st.step_facts.append(_StepFact(
+            kind=action_name.lower().replace("req_", ""),
+            path=_err_path,
+            summary=f"ERROR {exc.code.name}",
+            error=txt[:120],
+        ))
         # After NOT_FOUND on read, auto-relist parent — path may have been garbled
         if isinstance(job.function, Req_Read) and exc.code.name == "NOT_FOUND":
             txt += _auto_relist_parent(vm, job.function.path, "read", check_path=True)

@@ -2,6 +2,7 @@
 
 1. Целевой каталог агента pac1-py
 2. Нельзя корректировать pac1-py/.secrets
+3. Никогда не создавай реквисты в https://github.com/bitgn/sample-agents
 
 # Разработка
 

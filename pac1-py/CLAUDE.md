@@ -113,7 +113,23 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **FIX-194** (FIX-195 is next).
+Current fix counter: **FIX-210** (FIX-211 is next).
+- FIX-210: `prompt.py` — remove all FIX-NNN annotations from system prompt string; ~31 end-of-line comments and mid-line refs stripped; saves ~90 tokens/task; eliminates LLM confusion from internal labels (audit 3.1 #10)
+- FIX-209: `prephase.py` — deterministic AGENTS.MD inclusion: budget 2500→8000 chars; word-overlap heuristic replaced with simple truncation; eliminates non-deterministic section selection based on task phrasing (audit 3.3)
+- FIX-208: `loop.py` — write-scope code enforcement: `_check_write_scope()` validates mutation targets; Layer 1 deny-list blocks writes to docs/, AGENTS.MD (OTP delete excepted); Layer 2 allow-list restricts email tasks to /outbox/ only (audit 3.2 #5)
+- FIX-207: `loop.py` — Anthropic JSON extraction fallback: `_normalize_parsed()` shared helper for bare-function wrapping and plan truncation; Anthropic tier now uses `_extract_json_from_text()` + `_normalize_parsed()` on parse failure (same 8-level chain as OpenRouter/Ollama); JSON correction hint enabled for all models (audit 3.4 #6)
+- FIX-206: `loop.py` `_verify_json_write()` — body anti-contamination check for outbox emails: detects vault paths, tree output, tool results, system file refs leaked into email body; `_CONTAM_PATTERNS` module-level constant; injects correction hint on detection
+- FIX-205: `dispatch.py` `dispatch()` — code-level write scope enforcement: `_PROTECTED_WRITE`/`_PROTECTED_PREFIX` block writes/deletes to AGENTS.MD, docs/channels/ (OTP delete excepted)
+- FIX-204: `loop.py` — configurable router fallback via `ROUTER_FALLBACK` env var (default CLARIFY, opt-in EXECUTE); replaces hardcoded CLARIFY
+- FIX-203: `loop.py` — unicode/leet normalization before injection regex: `_normalize_for_injection()` strips zero-width chars, NFKC-normalizes, translates common leet substitutions; applied in `_run_pre_route()`
+- FIX-202: `loop.py` — extract `_post_dispatch()` from `_run_step()`: search expansion, JSON verify, inbox hint, distill hint
+- FIX-201: `loop.py` — extract `_pre_dispatch()` from `_run_step()`: auto-list parent, track dirs, wildcard/lookup/empty-path guards
+- FIX-200: `loop.py` — stall events recorded in step_facts: `_StepFact(kind="stall")` appended in `_handle_stall_retry()`; STALLS section in `_build_digest()`
+- FIX-199: `loop.py` — `_StepFact.error` field + ERRORS section in `_build_digest()`; ConnectError creates error StepFact
+- FIX-198: `classifier.py` — `TASK_CODER` removed from `_VALID_TYPES` and `_PLAINTEXT_FALLBACK` (sub-agent since FIX-163, not a task route)
+- FIX-197: `dispatch.py` `call_llm_raw()` — seed forwarding to OpenRouter tier from ollama_options; Anthropic SDK has no seed param (comment)
+- FIX-196: `models.json` — seed documentation fix: "seed=0" → "seed=1" to match actual profile value
+- FIX-195: `loop.py` — decompose `run_loop()` God Function into `_run_step()`, `_handle_stall_retry()`, `_call_llm()`, `_process_llm_response()`
 - FIX-194: `prompt.py` — month/week conversion table in rule 9b: `N months = N×30 days` (explicit); "3 months" example added; precision instructions: include units only if task explicitly requests them, otherwise bare value; resolves audit 2.4 ambiguity #4 and #8
 - FIX-193: `prompt.py` — current_state length cap `≤15 words`; contact ID sort clarified: extract integer from suffix (cont_009→9), numeric sort, not lexicographic; resolves audit 2.4 ambiguity #2 and #3
 - FIX-192: `prompt.py` — OTP token format: `<token>` = exact string from otp.txt (copy verbatim); trust level source: defined in docs/channels/ files; non-listed handle = "non-marked" → treat as non-trusted; resolves audit 2.4 ambiguity #5, #6, #7

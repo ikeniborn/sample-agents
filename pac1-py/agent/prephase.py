@@ -9,54 +9,18 @@ from .dispatch import CLI_BLUE, CLI_CLR, CLI_GREEN, CLI_YELLOW
 
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
-_AGENTS_MD_BUDGET = 2500  # chars; if AGENTS.MD exceeds this, filter to relevant sections only
+_AGENTS_MD_BUDGET = 8000  # FIX-209: increased from 2500; full AGENTS.MD eliminates non-determinism (audit 3.3)
 
 
 def _filter_agents_md(content: str, task_text: str) -> tuple[str, bool]:
-    """Filter AGENTS.MD to stay within the character budget (2500 chars).
+    """Include full AGENTS.MD up to budget; deterministic truncation if over.
 
-    Splits content by markdown headings (## / #), scores each section by word
-    overlap with task_text, then greedily fills up to the budget starting from
-    the highest-scoring sections. The preamble (content before any heading) is
-    always included first. If the content is already within budget, returns it
-    unchanged. Returns (filtered_content, was_filtered).
+    Previous word-overlap heuristic removed — it caused non-deterministic section
+    selection based on task phrasing (audit 3.3).
     """
     if len(content) <= _AGENTS_MD_BUDGET:
         return content, False
-
-    # Split by markdown headings (## or #), preserving heading lines
-    parts = re.split(r'^(#{1,3} .+)$', content, flags=re.MULTILINE)
-    # parts = [preamble, heading1, body1, heading2, body2, ...]
-
-    sections: list[tuple[str, str]] = []
-    if parts[0].strip():
-        sections.append(("", parts[0]))  # preamble (no heading)
-    for i in range(1, len(parts) - 1, 2):
-        sections.append((parts[i], parts[i + 1]))
-
-    if len(sections) <= 1:
-        return content[:_AGENTS_MD_BUDGET] + "\n[...truncated]", True
-
-    task_words = set(re.findall(r'\b\w{3,}\b', task_text.lower()))
-
-    def _score(heading: str, body: str) -> int:
-        if not heading:
-            return 1000  # preamble always first
-        h_words = set(re.findall(r'\b\w{3,}\b', heading.lower()))
-        b_words = set(re.findall(r'\b\w{3,}\b', body[:400].lower()))
-        return len(task_words & h_words) * 5 + len(task_words & b_words)
-
-    scored = sorted(sections, key=lambda s: -_score(s[0], s[1]))
-
-    result_parts: list[str] = []
-    used = 0
-    for heading, body in scored:
-        chunk = (heading + body) if heading else body
-        if used + len(chunk) <= _AGENTS_MD_BUDGET:
-            result_parts.append(chunk)
-            used += len(chunk)
-
-    return "".join(result_parts), True
+    return content[:_AGENTS_MD_BUDGET] + f"\n[...truncated — full AGENTS.MD is {len(content)} chars]", True
 
 
 @dataclass

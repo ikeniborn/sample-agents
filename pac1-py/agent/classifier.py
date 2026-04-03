@@ -169,7 +169,7 @@ _CLASSIFY_SYSTEM = (
 )
 
 _VALID_TYPES = frozenset({TASK_THINK, TASK_LONG_CONTEXT, TASK_DEFAULT,
-                          TASK_EMAIL, TASK_LOOKUP, TASK_INBOX, TASK_DISTILL, TASK_CODER})
+                          TASK_EMAIL, TASK_LOOKUP, TASK_INBOX, TASK_DISTILL})  # FIX-198: TASK_CODER removed (sub-agent since FIX-163, not a task route)
 
 # Ordered keyword → task_type table for plain-text LLM response fallback.
 # Most-specific types first; longContext listed with all common spellings.
@@ -177,7 +177,7 @@ _PLAINTEXT_FALLBACK: list[tuple[tuple[str, ...], str]] = [
     (("longcontext", "long_context", "long context"), TASK_LONG_CONTEXT),
     (("inbox",),   TASK_INBOX),
     (("email",),   TASK_EMAIL),
-    (("coder",),   TASK_CODER),
+    # FIX-198: ("coder",) removed — sub-agent since FIX-163, not a task route
     (("lookup",),  TASK_LOOKUP),
     (("distill",), TASK_DISTILL),
     (("think",),   TASK_THINK),

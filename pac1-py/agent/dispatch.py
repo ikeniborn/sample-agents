@@ -349,7 +349,14 @@ def call_llm_raw(
         {"role": "user", "content": user_msg},
     ]
 
+    # FIX-197: extract seed for cross-tier forwarding (Anthropic has no seed param)
+    _seed = None
+    _opts = cfg.get("ollama_options")
+    if isinstance(_opts, dict):
+        _seed = _opts.get("seed")
+
     # --- Tier 1: Anthropic SDK ---
+    # FIX-197: Anthropic SDK has no seed param; temperature from cfg (FIX-187) is the best determinism lever
     if is_claude_model(model) and anthropic_client is not None:
         ant_model = get_anthropic_model_id(model)
         for attempt in range(max_retries + 1):
@@ -390,6 +397,8 @@ def call_llm_raw(
                 create_kwargs: dict = dict(model=model, max_tokens=max_tokens, messages=msgs)
                 if rf is not None:
                     create_kwargs["response_format"] = rf
+                if _seed is not None:
+                    create_kwargs["seed"] = _seed  # FIX-197
                 resp = openrouter_client.chat.completions.create(**create_kwargs)
                 _content = resp.choices[0].message.content or ""
                 if _LOG_LEVEL == "DEBUG":
@@ -527,8 +536,30 @@ OUTCOME_BY_NAME = {
 # Dispatch: Pydantic models -> PCM runtime methods
 # ---------------------------------------------------------------------------
 
+# FIX-205: code-level write scope enforcement — paths that must never be written/deleted by agent.
+# AGENTS.MD is the vault rulebook; docs/channels/ contains trust level definitions.
+# Exception: otp.txt deletion is allowed (part of OTP consumption workflow, FIX-154).
+_PROTECTED_WRITE = frozenset({"/AGENTS.MD", "/AGENTS.md"})
+_PROTECTED_PREFIX = ("/docs/channels/",)
+_OTP_PATH = "/docs/channels/otp.txt"
+
+
 def dispatch(vm: PcmRuntimeClientSync, cmd: BaseModel,  # FIX-163: coder sub-agent params
              coder_model: str = "", coder_cfg: "dict | None" = None):
+    # FIX-205: code-level write scope enforcement
+    if isinstance(cmd, (Req_Write, Req_Delete, Req_Move)):
+        _target = getattr(cmd, "path", None) or getattr(cmd, "to_name", "")
+        _from = getattr(cmd, "from_name", "")
+        for _p in (_target, _from):
+            if not _p:
+                continue
+            if _p in _PROTECTED_WRITE or any(_p.startswith(pfx) for pfx in _PROTECTED_PREFIX):
+                # Exception: otp.txt can be deleted or rewritten (OTP consumption flow, FIX-154)
+                # Delete = last token; Write = rewrite without consumed token (multi-token file)
+                if _p == _OTP_PATH and isinstance(cmd, (Req_Delete, Req_Write)):
+                    continue
+                return f"ERROR: Write/delete/move to protected path '{_p}' is not allowed (FIX-205)"
+
     if isinstance(cmd, Req_Context):
         return vm.context(ContextRequest())
     if isinstance(cmd, Req_Tree):
