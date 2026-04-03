@@ -598,6 +598,11 @@ def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextSt
                 )
                 if thinking_budget:
                     create_kwargs["thinking"] = {"type": "enabled", "budget_tokens": thinking_budget}
+                    create_kwargs["temperature"] = 1.0  # FIX-187: required by Anthropic API with extended thinking
+                else:
+                    _ant_temp = cfg.get("temperature")  # FIX-187: pass configured temperature when no thinking
+                    if _ant_temp is not None:
+                        create_kwargs["temperature"] = _ant_temp
                 response = anthropic_client.messages.create(**create_kwargs)
                 elapsed_ms = int((time.time() - started) * 1000)
                 think_tok = 0

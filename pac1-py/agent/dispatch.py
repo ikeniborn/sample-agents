@@ -354,12 +354,16 @@ def call_llm_raw(
         ant_model = get_anthropic_model_id(model)
         for attempt in range(max_retries + 1):
             try:
-                resp = anthropic_client.messages.create(
+                _create_kw: dict = dict(
                     model=ant_model,
                     max_tokens=max_tokens,
                     system=system,
                     messages=[{"role": "user", "content": user_msg}],
                 )
+                _ant_temp = cfg.get("temperature")  # FIX-187: pass temperature for non-thinking calls
+                if _ant_temp is not None:
+                    _create_kw["temperature"] = _ant_temp
+                resp = anthropic_client.messages.create(**_create_kw)
                 # Iterate blocks — take first type="text" (skip thinking blocks)
                 for block in resp.content:
                     if getattr(block, "type", None) == "text" and block.text.strip():
