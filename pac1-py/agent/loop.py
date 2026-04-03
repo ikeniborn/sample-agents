@@ -142,6 +142,7 @@ class _StepFact:
     kind: str    # "list", "read", "search", "write", "delete", "move", "mkdir"
     path: str
     summary: str  # compact 1-line description
+    hint: str = ""  # FIX-197: stall hint that prompted this action
 
 
 def _extract_fact(action_name: str, action, result_txt: str) -> "_StepFact | None":
@@ -199,14 +200,15 @@ def _build_digest(facts: "list[_StepFact]") -> str:
         "LISTED": [], "READ": [], "FOUND": [], "DONE": [],
     }
     for f in facts:
+        _hint_suffix = f" (after stall: {f.hint[:60]})" if f.hint else ""  # FIX-197
         if f.kind == "list":
-            sections["LISTED"].append(f"  {f.path}: {f.summary}")
+            sections["LISTED"].append(f"  {f.path}: {f.summary}{_hint_suffix}")
         elif f.kind == "read":
-            sections["READ"].append(f"  {f.path}: {f.summary}")
+            sections["READ"].append(f"  {f.path}: {f.summary}{_hint_suffix}")
         elif f.kind == "search":
-            sections["FOUND"].append(f"  {f.summary}")
+            sections["FOUND"].append(f"  {f.summary}{_hint_suffix}")
         elif f.kind in ("write", "delete", "move", "mkdir"):
-            sections["DONE"].append(f"  {f.summary}")
+            sections["DONE"].append(f"  {f.summary}{_hint_suffix}")
     parts = [
         f"{label}:\n" + "\n".join(lines)
         for label, lines in sections.items()
@@ -308,20 +310,75 @@ def _to_anthropic_messages(log: list) -> tuple[str, list]:
 # JSON extraction from free-form text (fallback when SO not supported)
 # ---------------------------------------------------------------------------
 
+_MUTATION_TOOLS = frozenset({"write", "delete", "move", "mkdir"})  # FIX-196
+_REQ_PREFIX_RE = re.compile(r'Req_(\w+)\s*\(')  # FIX-150/196: detect Req_XXX({...}) patterns
+
+
+def _obj_mutation_tool(obj: dict) -> bool:  # FIX-196
+    """True if obj describes a mutation tool call (write/delete/move/mkdir)."""
+    fn = obj.get("function", obj)
+    if isinstance(fn, dict):
+        return fn.get("tool", "") in _MUTATION_TOOLS
+    return False
+
+
+def _score_candidate(obj: dict) -> int:  # FIX-196
+    """Score JSON candidate by known NextStep field count.
+    Higher = more complete. Breaks text-order ties within priority tiers."""
+    score = 0
+    if "current_state" in obj: score += 2
+    if "function" in obj: score += 3
+    if "plan_remaining_steps_brief" in obj: score += 1
+    if "done_operations" in obj: score += 1
+    if "task_completed" in obj: score += 1
+    fn = obj.get("function", obj)
+    if isinstance(fn, dict):
+        if "path" in fn: score += 1
+        if "content" in fn: score += 1
+    return score
+
+
 def _extract_json_from_text(text: str) -> dict | None:
-    """Extract first valid JSON object from free-form model output (already de-thought).
-    Tries: ```json fenced block → bracket-matched first {…}."""
-    # Try ```json ... ``` fenced block
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if m:
+    """Extract best JSON object from free-form model output (already de-thought).
+    FIX-196: collects ALL valid JSON candidates, then selects highest-scoring
+    per priority tier (mutations > full NextStep > function-only > first).
+    Tries: ```json fenced block → all bracket-matched {…} → YAML fallback."""
+
+    candidates: list[dict] = []
+
+    # FIX-150: detect Req_XXX({...}) patterns — infer "tool" when model omits it
+    for _rp_m in _REQ_PREFIX_RE.finditer(text):
+        _rp_name = _rp_m.group(1).lower()
+        _rp_start = text.find("{", _rp_m.end() - 1)
+        if _rp_start != -1:
+            _depth = 0
+            for _rp_idx in range(_rp_start, len(text)):
+                if text[_rp_idx] == "{": _depth += 1
+                elif text[_rp_idx] == "}":
+                    _depth -= 1
+                    if _depth == 0:
+                        try:
+                            _rp_obj = json.loads(text[_rp_start:_rp_idx + 1])
+                            if isinstance(_rp_obj, dict) and "tool" not in _rp_obj:
+                                _rp_obj["tool"] = _rp_name
+                            candidates.append(_rp_obj)
+                        except (json.JSONDecodeError, ValueError):
+                            pass
+                        break
+
+    # Try ```json ... ``` fenced blocks
+    for m in re.finditer(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL):
         try:
-            return json.loads(m.group(1))
+            candidates.append(json.loads(m.group(1)))
         except (json.JSONDecodeError, ValueError):
             pass
 
-    # Bracket-match from the first { to its balanced closing }
-    start = text.find("{")
-    if start != -1:
+    # Bracket-match ALL top-level {…} objects
+    pos = 0
+    while pos < len(text):
+        start = text.find("{", pos)
+        if start == -1:
+            break
         depth = 0
         for idx in range(start, len(text)):
             if text[idx] == "{":
@@ -330,9 +387,40 @@ def _extract_json_from_text(text: str) -> dict | None:
                 depth -= 1
                 if depth == 0:
                     try:
-                        return json.loads(text[start:idx + 1])
+                        candidates.append(json.loads(text[start:idx + 1]))
                     except (json.JSONDecodeError, ValueError):
-                        break
+                        pass
+                    pos = idx + 1
+                    break
+        else:
+            break  # unbalanced — stop scanning
+
+    if candidates:
+        # FIX-196: select highest-scoring candidate per tier (audit 2.6)
+        # Tier 1: mutations (write/delete/move/mkdir) — FIX-149 priority
+        _t2 = [obj for obj in candidates if _obj_mutation_tool(obj)]
+        if _t2:
+            return max(_t2, key=_score_candidate)
+        # Tier 2: bare function objects (tool key, no current_state)
+        _t3 = [obj for obj in candidates if "tool" in obj and "current_state" not in obj]
+        if _t3:
+            return max(_t3, key=_score_candidate)
+        # Tier 3: full NextStep without report_completion
+        _t4 = [obj for obj in candidates
+               if "current_state" in obj and "function" in obj
+               and (obj.get("function") or {}).get("tool", "") != "report_completion"]
+        if _t4:
+            return max(_t4, key=_score_candidate)
+        # Tier 4: full NextStep (any, including report_completion)
+        _t5 = [obj for obj in candidates if "current_state" in obj and "function" in obj]
+        if _t5:
+            return max(_t5, key=_score_candidate)
+        # Tier 5: has function key
+        _t6 = [obj for obj in candidates if "function" in obj]
+        if _t6:
+            return max(_t6, key=_score_candidate)
+        # Tier 6: best of whatever we have
+        return max(candidates, key=_score_candidate)
 
     # FIX-111: YAML fallback — for models that output YAML or Markdown when JSON schema not supported
     try:
@@ -346,6 +434,40 @@ def _extract_json_from_text(text: str) -> dict | None:
         pass
 
     return None
+
+
+# ---------------------------------------------------------------------------
+# Parsed JSON normalization (shared by all tiers)
+# ---------------------------------------------------------------------------
+
+def _normalize_parsed(parsed: dict) -> dict:
+    """Normalize a parsed JSON dict into NextStep shape.
+    Applies FIX-W1 (bare function wrap), FIX-W2 (reasoning strip),
+    FIX-W3 (plan truncation), FIX-77 (missing task_completed)."""
+    # FIX-W1: auto-wrap bare function objects
+    if "tool" in parsed and "current_state" not in parsed:
+        parsed = {
+            "current_state": "continuing",
+            "plan_remaining_steps_brief": ["execute action"],
+            "task_completed": False,
+            "function": parsed,
+        }
+    # FIX-W2: strip thinking-only wrapper
+    elif "reasoning" in parsed and "current_state" not in parsed:
+        parsed = {
+            "current_state": "reasoning stripped",
+            "plan_remaining_steps_brief": ["explore vault"],
+            "task_completed": False,
+            "function": {"tool": "list", "path": "/"},
+        }
+    # FIX-W3: truncate plan_remaining_steps_brief to MaxLen(5)
+    if isinstance(parsed.get("plan_remaining_steps_brief"), list):
+        steps = [s for s in parsed["plan_remaining_steps_brief"] if s]
+        parsed["plan_remaining_steps_brief"] = (steps or ["continue"])[:5]
+    # FIX-77: inject missing task_completed
+    if "task_completed" not in parsed:
+        parsed["task_completed"] = False
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -429,34 +551,9 @@ def _call_openai_tier(
                     print(f"{CLI_RED}[{label}] JSON extraction from text failed{CLI_CLR}")
                     break
                 print(f"{CLI_YELLOW}[{label}] JSON extracted from free-form text{CLI_CLR}")
-            # FIX-W1: auto-wrap bare function objects (model returns {"tool":...} without outer NextStep)
-            if isinstance(parsed, dict) and "tool" in parsed and "current_state" not in parsed:
-                print(f"{CLI_YELLOW}[FIX-W1] Auto-wrapping bare function object{CLI_CLR}")
-                parsed = {
-                    "current_state": "continuing",
-                    "plan_remaining_steps_brief": ["execute action"],
-                    "task_completed": False,
-                    "function": parsed,
-                }
-            # FIX-W2: strip thinking-only wrapper (model returns {"reasoning":...} without NextStep fields)
-            elif isinstance(parsed, dict) and "reasoning" in parsed and "current_state" not in parsed:
-                print(f"{CLI_YELLOW}[FIX-W2] Stripping bare reasoning wrapper, using list action{CLI_CLR}")
-                parsed = {
-                    "current_state": "reasoning stripped",
-                    "plan_remaining_steps_brief": ["explore vault"],
-                    "task_completed": False,
-                    "function": {"tool": "list", "path": "/"},
-                }
-            # FIX-W3: truncate plan_remaining_steps_brief to MaxLen(5)
-            if isinstance(parsed, dict) and isinstance(parsed.get("plan_remaining_steps_brief"), list):
-                steps = [s for s in parsed["plan_remaining_steps_brief"] if s]  # drop empty strings
-                if not steps:
-                    steps = ["continue"]
-                parsed["plan_remaining_steps_brief"] = steps[:5]
-            # FIX-77: inject missing task_completed=False (required field sometimes dropped by model)
-            if isinstance(parsed, dict) and "task_completed" not in parsed:
-                print(f"{CLI_YELLOW}[FIX-77] Missing task_completed — defaulting to false{CLI_CLR}")
-                parsed["task_completed"] = False
+            # Normalize into NextStep shape (FIX-W1/W2/W3/FIX-77)
+            if isinstance(parsed, dict):
+                parsed = _normalize_parsed(parsed)
             try:
                 return NextStep.model_validate(parsed), elapsed_ms, in_tok, out_tok, think_tok, _eval_count, _eval_ms
             except ValidationError as e:
@@ -518,7 +615,15 @@ def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextSt
                 try:
                     return NextStep.model_validate_json(raw), elapsed_ms, in_tok, out_tok, think_tok, 0, 0
                 except (ValidationError, ValueError) as e:
-                    print(f"{CLI_RED}[Anthropic] JSON parse failed: {e}{CLI_CLR}")
+                    # FIX-195: fallback extraction before giving up (audit 2.6 + 3.4)
+                    print(f"{CLI_YELLOW}[Anthropic] Direct parse failed, trying extraction: {e}{CLI_CLR}")
+                    parsed = _extract_json_from_text(raw)
+                    if isinstance(parsed, dict):
+                        parsed = _normalize_parsed(parsed)
+                        try:
+                            return NextStep.model_validate(parsed), elapsed_ms, in_tok, out_tok, think_tok, 0, 0
+                        except ValidationError:
+                            pass
                     return None, elapsed_ms, in_tok, out_tok, think_tok, 0, 0
 
         _next = "OpenRouter" if openrouter_client is not None else "Ollama"
@@ -638,6 +743,10 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
     # FIX-125: accumulated step facts for rolling state digest in _compact_log
     _step_facts: list[_StepFact] = []
 
+    # FIX-198: step-budget-aware timeout
+    _step_durations: list[float] = []
+    _budget_hint_sent: bool = False
+
     # [FIX-128] SGR Routing + Cascade: classify task before any exploration
     # Fast-path: module-level _INJECTION_RE (compiled once per process, not per task)
     if _INJECTION_RE.search(_task_text):
@@ -754,6 +863,21 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
     for i in range(max_steps):
         # --- Task timeout check ---
         elapsed_task = time.time() - task_start
+
+        # FIX-198: soft budget warning — give model a chance to finalize
+        if not _budget_hint_sent and len(_step_durations) >= 2:
+            _recent = _step_durations[-5:]
+            _avg_step = sum(_recent) / len(_recent)
+            _remaining = TASK_TIMEOUT_S - elapsed_task
+            if _remaining > 0 and elapsed_task + 2 * _avg_step > TASK_TIMEOUT_S:
+                _budget_msg = (
+                    f"[budget] ~{_remaining:.0f}s left (avg step {_avg_step:.0f}s). "
+                    "Finalize now: write pending changes, then report_completion."
+                )
+                print(f"{CLI_YELLOW}{_budget_msg}{CLI_CLR}")
+                log.append({"role": "user", "content": _budget_msg})
+                _budget_hint_sent = True
+
         if elapsed_task > TASK_TIMEOUT_S:
             print(f"{CLI_RED}[TIMEOUT] Task exceeded {TASK_TIMEOUT_S}s ({elapsed_task:.0f}s elapsed), stopping{CLI_CLR}")
             try:
@@ -767,6 +891,7 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
             break
 
         step_count += 1
+        _step_start = time.time()  # FIX-198
         step = f"step_{i + 1}"
         print(f"\n{CLI_BLUE}--- {step} ---{CLI_CLR} ", end="")
 
@@ -784,8 +909,8 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
         total_eval_count += ev_c
         total_eval_ms += ev_ms
 
-        # JSON parse retry hint (for Ollama json_object mode)
-        if job is None and not is_claude_model(model):
+        # JSON parse retry hint — FIX-195: all models get JSON correction hint retry (audit 2.6)
+        if job is None:
             print(f"{CLI_YELLOW}[retry] Adding JSON correction hint{CLI_CLR}")
             log.append({"role": "user", "content": (
                 'Your previous response was invalid. Respond with EXACTLY this JSON structure '
@@ -834,10 +959,12 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
         _action_fingerprints.append(f"{action_name}:{action_args}")
 
         _stall_hint = _check_stall(_action_fingerprints, _steps_since_write, _error_counts, _step_facts)
+        _stall_hint_text = ""  # FIX-197: preserve hint text for fact tagging
         if _stall_hint and not _stall_hint_active:
             print(f"{CLI_YELLOW}[FIX-74][STALL] Detected: {_stall_hint[:120]}{CLI_CLR}")
             log.append({"role": "user", "content": f"[STALL HINT] {_stall_hint}"})
             _stall_hint_active = True
+            _stall_hint_text = _stall_hint  # FIX-197
             _job2, _e2, _i2, _o2, _, _ev_c2, _ev_ms2 = _call_llm(log, model, max_tokens, cfg)
             llm_call_count += 1
             log.pop()
@@ -1046,11 +1173,15 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
         # FIX-125: extract step fact before compacting (uses raw txt, not history-compact version)
         _fact = _extract_fact(action_name, job.function, txt)
         if _fact is not None:
+            if _stall_hint_text:  # FIX-197: tag stall-recovery facts
+                _fact.hint = _stall_hint_text
             _step_facts.append(_fact)
 
         # FIX-123: compact tool result for log history (model saw full output already)
         _history_txt = _compact_tool_result(action_name, txt)
         log.append({"role": "user", "content": f"Result of {action_name}: {_history_txt}"})
+
+        _step_durations.append(time.time() - _step_start)  # FIX-198
 
     return {
         "input_tokens": total_in_tok,

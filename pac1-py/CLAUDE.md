@@ -113,7 +113,11 @@ Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 
 ## Fix numbering
 
-Current fix counter: **FIX-139** (FIX-140 is next).
+Current fix counter: **FIX-198** (FIX-199 is next).
+- FIX-198: `loop.py` `run_loop()` — step-budget-aware timeout: track per-step wall-clock in rolling window; when `elapsed + 2 × avg_step > TASK_TIMEOUT_S`, inject budget hint asking model to finalize; hard wall-clock cap unchanged; new state fields: `_step_durations`, `_budget_hint_sent`; resolves audit 2.8
+- FIX-197: `loop.py` `_StepFact` + stall handling + `_build_digest()` — stall hint context preservation: add `hint` field to `_StepFact`; tag stall-recovery facts with hint text; surface hint suffix in digest so compaction preserves recovery causality; resolves audit 2.7
+- FIX-196: `loop.py` `_extract_json_from_text()` — JSON extraction candidate scoring: add `_score_candidate()` helper counting known NextStep fields; collect ALL bracket-matched JSON objects; within each priority tier (mutations > bare function > full NextStep > any), select `max(candidates, key=_score_candidate)` instead of first match; deterministic regardless of text order (score ties → first-in-text); resolves audit 2.6
+- FIX-195: `loop.py` `_call_llm()` Anthropic tier + hint retry — Anthropic JSON extraction fallback: on ValidationError, try `_extract_json_from_text(raw)` + normalization before returning None; remove `not is_claude_model(model)` guard from hint retry so Claude also gets JSON correction retries; resolves audit 2.6 + 3.4
 - FIX-139: `prompt.py` rule 10 — discovery-first for required reference fields (account_id, contact_id): list referenced folder; if exactly 1 entity exists use it without asking; 0 or multiple → CLARIFY. Do NOT ask before discovery. (fixes t10 invoice missing account_id)
 - FIX-138: `prompt.py` Contact resolution — multi-level account-hop: if search /contacts yields 0, search /accounts by name → get account_id → search /contacts by account_id → use found contact email; 4th level → CLARIFY. (fixes t14 Aperture AI Labs contact)
 - FIX-137: `loop.py` line 74 — increase `_MAX_READ_HISTORY` 200→500 chars; real inbox messages (~277 chars) and JSON files (~350 chars) were truncated to [+N chars] marker causing agent to treat them as incomplete; 500-char limit covers real vault content. (fixes t29 inbox message truncation)
