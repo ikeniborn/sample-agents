@@ -293,6 +293,8 @@ class ModelRouter:
     inbox: str = ""
     # Unit 9: coder task type model override
     coder: str = ""
+    # FIX-218: evaluator/critic model
+    evaluator: str = ""
     configs: dict[str, dict] = field(default_factory=dict)
 
     def _select_model(self, task_type: str) -> str:

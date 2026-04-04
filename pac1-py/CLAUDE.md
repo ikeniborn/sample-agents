@@ -107,13 +107,28 @@ Key env vars:
 - `ANTHROPIC_API_KEY`, `OPENROUTER_API_KEY` — API keys (in `.secrets`)
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL` — local Ollama overrides
 - `LOG_LEVEL` — logging verbosity: `INFO` (default) or `DEBUG` (logs full think blocks + full RAW)
+- `MODEL_EVALUATOR` — model for evaluator/critic (default: `MODEL_DEFAULT`)
+- `EVALUATOR_ENABLED` — enable evaluator: `1` = on, `0` = off (default: `0`)
+- `EVAL_SKEPTICISM` — evaluator strictness: `low`, `mid` (default), `high`
+- `EVAL_EFFICIENCY` — evaluator context depth: `low`, `mid` (default), `high`
+- `EVAL_MAX_REJECTIONS` — max evaluator rejections before forced approval (default: `2`)
+- `ROUTER_MAX_RETRIES` — max retry attempts for router empty response (default: `2`)
 
 Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 - `max_completion_tokens`, `thinking_budget`, `response_format_hint`
 
 ## Fix numbering
 
-Current fix counter: **FIX-210** (FIX-211 is next).
+Current fix counter: **FIX-219** (FIX-220 is next).
+- FIX-219: `loop.py` `_run_pre_route()` — router retry on empty response: `_ROUTER_MAX_RETRIES` env var (default 2); retry loop with empty-response detection + JSONDecodeError handling; fallback EXECUTE (not CLARIFY) when all attempts return empty — no injection evidence means agent should try; code-level guards (FIX-215/214) still protect inside the loop; fixes 6-12 tasks/run failing due to GPU-load empty responses
+- FIX-218: `evaluator.py` (new) + `loop.py` + `classifier.py` + `__init__.py` + `main.py` + `models.json` — evaluator/critic step before report_completion: separate MODEL_EVALUATOR LLM reviews agent outcome vs evidence (task text, done_ops, step digest); intercepts in `_run_step()` between `_pre_dispatch()` and `dispatch()`; configurable via EVALUATOR_ENABLED, EVAL_SKEPTICISM (low/mid/high), EVAL_EFFICIENCY (low/mid/high), EVAL_MAX_REJECTIONS; fail-open on LLM errors; skips if <30s remaining; reviews OUTCOME_OK, OUTCOME_NONE_CLARIFICATION, OUTCOME_DENIED_SECURITY
+- FIX-217: `prompt.py` — aggressive prompt reduction 267→135 lines (~50%); extracted format gate and security check to code interceptors; compressed all sections, removed verbose examples
+- FIX-216: skipped — domain/company verify remains prompt-only (too complex for code interceptor without full channel file parsing)
+- FIX-215: `loop.py` `_post_dispatch()` — code-level inbox injection detection: `_INBOX_INJECTION_PATTERNS` + `_INBOX_ACTION_RE` regex checks on first inbox read; auto-injects DENIED_SECURITY hint on match
+- FIX-214: `loop.py` `_post_dispatch()` — code-level format gate: `_FORMAT_GATE_RE` checks From:/Channel: header after first inbox read; auto-injects CLARIFICATION hint when missing
+- FIX-213: `dispatch.py` — capability cache persistence: `_load_capability_cache()` / `_save_capability_cache()` to `.cache/capability_cache.json` with 7-day TTL; survives process restarts
+- FIX-212: `loop.py` `_extract_json_from_text()` — deterministic tie-breaking: `_richness_key()` helper (more keys = richer, full NextStep preferred, actionable tools over report); `min(filtered, key=_richness_key)` replaces `for obj: return obj` in tiers 2-7
+- FIX-211: `loop.py` + `dispatch.py` + `models.json` — OpenRouter temperature pass-through: `_call_openai_tier()` gains `temperature` param; `_call_llm()` extracts temperature from cfg or ollama_options; `call_llm_raw()` passes temperature to OpenRouter `create_kwargs`; OpenRouter models in models.json gain `"temperature": 0.35`
 - FIX-210: `prompt.py` — remove all FIX-NNN annotations from system prompt string; ~31 end-of-line comments and mid-line refs stripped; saves ~90 tokens/task; eliminates LLM confusion from internal labels (audit 3.1 #10)
 - FIX-209: `prephase.py` — deterministic AGENTS.MD inclusion: budget 2500→8000 chars; word-overlap heuristic replaced with simple truncation; eliminates non-deterministic section selection based on task phrasing (audit 3.3)
 - FIX-208: `loop.py` — write-scope code enforcement: `_check_write_scope()` validates mutation targets; Layer 1 deny-list blocks writes to docs/, AGENTS.MD (OTP delete excepted); Layer 2 allow-list restricts email tasks to /outbox/ only (audit 3.2 #5)

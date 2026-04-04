@@ -1,3 +1,4 @@
+import json
 import os
 import re
 import time
@@ -251,8 +252,35 @@ def _nextstep_json_schema() -> dict:
 
 _NEXTSTEP_SCHEMA: dict | None = None
 
+# FIX-213: Persist capability cache to disk — avoid re-probing on restart
+_CACHE_DIR = Path(__file__).resolve().parent.parent / ".cache"
+_CACHE_FILE = _CACHE_DIR / "capability_cache.json"
+_CACHE_TTL_S = 7 * 86400  # 7 days
+
+
+def _load_capability_cache() -> dict[str, str]:
+    """Load persisted cache, filtering stale entries (>7 days)."""
+    try:
+        data = json.loads(_CACHE_FILE.read_text())
+        now = time.time()
+        return {k: v["mode"] for k, v in data.items()
+                if isinstance(v, dict) and now - v.get("ts", 0) < _CACHE_TTL_S}
+    except Exception:
+        return {}
+
+
+def _save_capability_cache() -> None:
+    """Persist current cache to disk. Non-critical — failure is silently ignored."""
+    try:
+        _CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        data = {k: {"mode": v, "ts": time.time()} for k, v in _CAPABILITY_CACHE.items()}
+        _CACHE_FILE.write_text(json.dumps(data, indent=2))
+    except Exception:
+        pass
+
+
 # Runtime cache: model name → detected format mode
-_CAPABILITY_CACHE: dict[str, str] = {}
+_CAPABILITY_CACHE: dict[str, str] = _load_capability_cache()  # FIX-213
 
 
 def _get_static_hint(model: str) -> str | None:
@@ -272,6 +300,7 @@ def probe_structured_output(client: OpenAI, model: str, hint: str | None = None)
     mode = hint or _get_static_hint(model)
     if mode is not None:
         _CAPABILITY_CACHE[model] = mode
+        _save_capability_cache()  # FIX-213
         print(f"[capability] {model}: {mode} (static hint)")
         return mode
 
@@ -291,6 +320,7 @@ def probe_structured_output(client: OpenAI, model: str, hint: str | None = None)
         else:
             mode = "json_object"  # transient error — assume supported
     _CAPABILITY_CACHE[model] = mode
+    _save_capability_cache()  # FIX-213
     print(f"[capability] {model}: {mode} (probed)")
     return mode
 
@@ -395,6 +425,12 @@ def call_llm_raw(
         for attempt in range(max_retries + 1):
             try:
                 create_kwargs: dict = dict(model=model, max_tokens=max_tokens, messages=msgs)
+                # FIX-211: pass temperature to OpenRouter tier
+                _temp = cfg.get("temperature")
+                if _temp is None:
+                    _temp = (cfg.get("ollama_options") or {}).get("temperature")
+                if _temp is not None:
+                    create_kwargs["temperature"] = _temp
                 if rf is not None:
                     create_kwargs["response_format"] = rf
                 if _seed is not None:

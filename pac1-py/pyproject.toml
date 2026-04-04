@@ -14,6 +14,9 @@ dependencies = [
     "anthropic>=0.86.0",
 ]
 
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
 [tool.uv]
 # AICODE-NOTE: Uses locally generated protobuf files (pac1-py/bitgn/) and
 # connect-python instead of external buf.build SDK packages, mirroring

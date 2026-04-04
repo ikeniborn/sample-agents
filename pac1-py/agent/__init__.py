@@ -34,8 +34,13 @@ def run_agent(router: ModelRouter, harness_url: str, task_text: str) -> dict:
     coder_model = router.coder or model
     coder_cfg = router._adapt_config(router.configs.get(coder_model, {}), TASK_CODER)
 
+    # FIX-218: evaluator sub-agent config
+    evaluator_model = router.evaluator or model
+    evaluator_cfg = router._adapt_config(router.configs.get(evaluator_model, {}), "evaluator")
+
     stats = run_loop(vm, model, task_text, pre, cfg, task_type=task_type,
-                     coder_model=coder_model, coder_cfg=coder_cfg)
+                     coder_model=coder_model, coder_cfg=coder_cfg,
+                     evaluator_model=evaluator_model, evaluator_cfg=evaluator_cfg)
     stats["model_used"] = model
     stats["task_type"] = task_type
     return stats

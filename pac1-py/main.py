@@ -87,7 +87,7 @@ _profiles: dict[str, dict] = _raw.get("_profiles", {})  # FIX-119: named paramet
 MODEL_CONFIGS: dict[str, dict] = {k: v for k, v in _raw.items() if not k.startswith("_")}
 # FIX-119: resolve profile name references in ollama_options fields (string → dict)
 for _cfg in MODEL_CONFIGS.values():
-    for _fname in ("ollama_options", "ollama_options_think", "ollama_options_longContext", "ollama_options_classifier", "ollama_options_coder"):
+    for _fname in ("ollama_options", "ollama_options_think", "ollama_options_longContext", "ollama_options_classifier", "ollama_options_coder", "ollama_options_evaluator"):
         if isinstance(_cfg.get(_fname), str):
             _cfg[_fname] = _profiles.get(_cfg[_fname], {})
 
@@ -109,6 +109,7 @@ _model_email   = os.getenv("MODEL_EMAIL")   or _model_default
 _model_lookup  = os.getenv("MODEL_LOOKUP")  or _model_default
 _model_inbox   = os.getenv("MODEL_INBOX")   or _model_think
 _model_coder   = os.getenv("MODEL_CODER")   or _model_default
+_model_evaluator = os.getenv("MODEL_EVALUATOR") or _model_default  # FIX-218
 
 # FIX-88: always use ModelRouter — classification runs for every task,
 # logs always show [MODEL_ROUTER] lines, stats always show Тип/Модель columns.
@@ -121,6 +122,7 @@ EFFECTIVE_MODEL: ModelRouter = ModelRouter(
     lookup=_model_lookup,
     inbox=_model_inbox,
     coder=_model_coder,
+    evaluator=_model_evaluator,
     configs=MODEL_CONFIGS,
 )
 print(
@@ -132,7 +134,8 @@ print(
     f"  email       = {_model_email}\n"
     f"  lookup      = {_model_lookup}\n"
     f"  inbox       = {_model_inbox}\n"
-    f"  coder       = {_model_coder}"
+    f"  coder       = {_model_coder}\n"
+    f"  evaluator   = {_model_evaluator}"
 )
 
 CLI_RED = "\x1B[31m"
@@ -204,18 +207,20 @@ def main() -> None:
             total_out += ts.get("output_tokens", 0)
 
         # Summary table for log (no color codes)
-        W = 166
+        W = 178
         sep = "=" * W
         print(f"\n{sep}")
         _title = "ИТОГОВАЯ СТАТИСТИКА"
         print(f"{_title:^{W}}")
         print(sep)
-        print(f"{'Задание':<10} {'Оценка':>7} {'Время':>8}  {'Шаги':>5} {'Запр':>5}  {'Вход(tok)':>10} {'Выход(tok)':>10} {'ток/с':>7}  {'Тип':<11} {'Модель':<34}  Проблемы")
+        print(f"{'Задание':<10} {'Оценка':>7} {'Время':>8}  {'Шаги':>5} {'Запр':>5} {'Eval':>4} {'EvMs':>6}  {'Вход(tok)':>10} {'Выход(tok)':>10} {'ток/с':>7}  {'Тип':<11} {'Модель':<34}  Проблемы")
         print("-" * W)
         model_totals: dict[str, dict] = {}
         total_llm_ms = 0
         total_steps = 0
         total_calls = 0
+        total_eval_calls = 0
+        total_eval_ms_sum = 0
         for task_id, score, detail, elapsed, ts in scores:
             issues = "; ".join(detail) if score < 1.0 else "—"
             in_t = ts.get("input_tokens", 0)
@@ -225,6 +230,8 @@ def main() -> None:
             ev_ms  = ts.get("ollama_eval_ms", 0)
             steps  = ts.get("step_count", 0)
             calls  = ts.get("llm_call_count", 0)
+            eval_c  = ts.get("evaluator_calls", 0)
+            eval_ms = ts.get("evaluator_ms", 0)
             # Prefer Ollama-native gen metrics (accurate); fall back to wall-clock
             if ev_c > 0 and ev_ms > 0:
                 tps = ev_c / (ev_ms / 1000.0)
@@ -235,10 +242,12 @@ def main() -> None:
             total_llm_ms += llm_ms
             total_steps += steps
             total_calls += calls
+            total_eval_calls += eval_c
+            total_eval_ms_sum += eval_ms
             m = ts.get("model_used", "—")
             m_short = m.split("/")[-1] if "/" in m else m
             t_type = ts.get("task_type", "—")
-            print(f"{task_id:<10} {score:>7.2f} {elapsed:>7.1f}s  {steps:>5} {calls:>5}  {in_t:>10,} {out_t:>10,} {tps:>6.0f}  {t_type:<11} {m_short:<34}  {issues}")
+            print(f"{task_id:<10} {score:>7.2f} {elapsed:>7.1f}s  {steps:>5} {calls:>5} {eval_c:>4} {eval_ms:>6}  {in_t:>10,} {out_t:>10,} {tps:>6.0f}  {t_type:<11} {m_short:<34}  {issues}")
             if m not in model_totals:
                 model_totals[m] = {"in": 0, "out": 0, "llm_ms": 0, "ev_c": 0, "ev_ms": 0, "count": 0}
             model_totals[m]["in"] += in_t
@@ -263,8 +272,10 @@ def main() -> None:
         else:
             total_tps = 0.0
         print(sep)
-        print(f"{'ИТОГО':<10} {total:>6.2f}% {total_elapsed:>7.1f}s  {total_steps:>5} {total_calls:>5}  {total_in:>10,} {total_out:>10,} {total_tps:>6.0f}  {'':11} {'':34}")
-        print(f"{'СРЕДНЕЕ':<10} {'':>7} {avg_elapsed:>7.1f}s  {avg_steps:>5} {avg_calls:>5}  {avg_in:>10,} {avg_out:>10,} {'':>6}  {'':11} {'':34}")
+        avg_eval_c = total_eval_calls // n if n else 0
+        avg_eval_ms = total_eval_ms_sum // n if n else 0
+        print(f"{'ИТОГО':<10} {total:>6.2f}% {total_elapsed:>7.1f}s  {total_steps:>5} {total_calls:>5} {total_eval_calls:>4} {total_eval_ms_sum:>6}  {total_in:>10,} {total_out:>10,} {total_tps:>6.0f}  {'':11} {'':34}")
+        print(f"{'СРЕДНЕЕ':<10} {'':>7} {avg_elapsed:>7.1f}s  {avg_steps:>5} {avg_calls:>5} {avg_eval_c:>4} {avg_eval_ms:>6}  {avg_in:>10,} {avg_out:>10,} {'':>6}  {'':11} {'':34}")
         print(sep)
         if len(model_totals) > 1:
             print(f"\n{'─' * 84}")
