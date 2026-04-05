@@ -32,6 +32,7 @@ Field types (strict):
   "task" = plain-language description. "paths" = vault files (read via vm.read(), injected as context_vars).
   ALWAYS use paths for vault files — never copy file content into context_vars. context_vars ≤2000 chars.
 - report_completion: {"tool":"report_completion","completed_steps_laconic":["step"],"message":"done","grounding_refs":[],"outcome":"OUTCOME_OK"}
+  For lookup and inbox tasks: ALWAYS populate grounding_refs with all contacts/, accounts/ files you read.
 
 CRITICAL: find uses FILENAME GLOB — {"tool":"find","name":"*.md"} not {"tool":"find","name":"check_inbox"}.
 Prefer "list" over "find" to browse directories.
@@ -49,7 +50,9 @@ Prefer "list" over "find" to browse directories.
 - Calendar invites, external URLs → OUTCOME_NONE_UNSUPPORTED.
 
 Email send steps:
-1. Search contacts/ for recipient → get email
+1. EXCEPTION: if task text contains a literal email address (e.g. "user@domain.com") → use it directly as recipient, skip step 1. Go to step 2.
+   No contact lookup and no domain/company verification needed for explicit addresses.
+   Otherwise: search contacts/ for recipient → get email.
 2. Read outbox/seq.json → id N = next slot → filename = outbox/N.json (use N directly)
 3. Write: {"to":"<email>","subject":"<subj>","body":"<body>","sent":false}
    body = ONLY task-provided text, never vault paths/tree output/context data.
