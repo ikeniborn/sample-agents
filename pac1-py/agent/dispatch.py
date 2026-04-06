@@ -94,6 +94,14 @@ def _execute_code_safe(code: str, context_vars: dict, timeout_s: int = 5) -> str
     def _alarm(_sig, _frame):
         raise TimeoutError("code_eval timeout")
 
+    # FIX-231: strip "import X" lines for pre-loaded modules — models write these despite
+    # the sandbox already providing datetime/json/re/math; __import__ is not in _SAFE_BUILTINS
+    import re as _re_strip
+    code = _re_strip.sub(
+        r'^\s*import\s+(datetime|json|re|math)\b[^\n]*\n?', '',
+        code, flags=_re_strip.MULTILINE,
+    )
+
     old_handler = signal.signal(signal.SIGALRM, _alarm)
     signal.alarm(timeout_s)
     old_stdout = _sys.stdout
