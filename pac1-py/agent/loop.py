@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 import time
 import unicodedata
 from collections import Counter, deque
@@ -130,6 +131,7 @@ _SCOPE_RESTRICT_RE = re.compile(
 # FIX-188: route cache — key: sha256(task_text[:800]), value: (route, reason, injection_signals)
 # Ensures deterministic routing for the same task; populated only on successful LLM responses
 _ROUTE_CACHE: dict[str, tuple[str, str, list[str]]] = {}
+_ROUTE_CACHE_LOCK = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -1289,8 +1291,10 @@ def _run_pre_route(
         # FIX-188: check module-level cache before calling LLM (audit 2.3)
         _task_key = hashlib.sha256(task_text[:800].encode()).hexdigest()
         _should_cache = False
-        if _task_key in _ROUTE_CACHE:
-            _cv, _cr, _cs = _ROUTE_CACHE[_task_key]
+        with _ROUTE_CACHE_LOCK:
+            _cached_route = _ROUTE_CACHE.get(_task_key)
+        if _cached_route is not None:
+            _cv, _cr, _cs = _cached_route
             print(f"{CLI_YELLOW}[router] Cache hit → Route={_cv}{CLI_CLR}")
             _route_raw: dict | None = {"route": _cv, "reason": _cr, "injection_signals": _cs}
         else:
@@ -1351,7 +1355,8 @@ def _run_pre_route(
             _route_reason = _tr.reason if _tr else _route_raw.get("reason", "")
             # FIX-188: persist successful LLM result to cache (error fallbacks intentionally excluded)
             if _should_cache:
-                _ROUTE_CACHE[_task_key] = (_route_val, _route_reason, _route_signals)
+                with _ROUTE_CACHE_LOCK:
+                    _ROUTE_CACHE[_task_key] = (_route_val, _route_reason, _route_signals)
             print(f"{CLI_YELLOW}[router] Route={_route_val} signals={_route_signals} reason={_route_reason[:80]}{CLI_CLR}")
             _outcome_map = {
                 "DENY_SECURITY": Outcome.OUTCOME_DENIED_SECURITY,

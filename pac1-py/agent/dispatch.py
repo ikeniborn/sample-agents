@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -289,6 +290,7 @@ def _save_capability_cache() -> None:
 
 # Runtime cache: model name → detected format mode
 _CAPABILITY_CACHE: dict[str, str] = _load_capability_cache()  # FIX-213
+_CAPABILITY_CACHE_LOCK = threading.Lock()
 
 
 def _get_static_hint(model: str) -> str | None:
@@ -301,35 +303,39 @@ def _get_static_hint(model: str) -> str | None:
 
 def probe_structured_output(client: OpenAI, model: str, hint: str | None = None) -> str:
     """Detect if model supports response_format. Returns 'json_object' or 'none'.
-    Checks hint → static table → runtime probe (cached per model name)."""
-    if model in _CAPABILITY_CACHE:
-        return _CAPABILITY_CACHE[model]
+    Checks hint → static table → runtime probe (cached per model name).
+    Thread-safe: double-checked locking — lock held only for cache read/write,
+    not during the HTTP probe call."""
+    with _CAPABILITY_CACHE_LOCK:
+        if model in _CAPABILITY_CACHE:
+            return _CAPABILITY_CACHE[model]
 
+    # --- probe outside lock (slow HTTP call) ---
     mode = hint or _get_static_hint(model)
-    if mode is not None:
+    if mode is None:
+        print(f"[capability] Probing {model} for structured output support...")
+        try:
+            client.chat.completions.create(
+                model=model,
+                response_format={"type": "json_object"},
+                messages=[{"role": "user", "content": 'Reply with valid JSON: {"ok": true}'}],
+                max_completion_tokens=20,
+            )
+            mode = "json_object"
+        except Exception as e:
+            err = str(e).lower()
+            if any(kw in err for kw in ("response_format", "unsupported", "not supported", "invalid_request")):
+                mode = "none"
+            else:
+                mode = "json_object"  # transient error — assume supported
+        label = "probed"
+    else:
+        label = "static hint"
+
+    with _CAPABILITY_CACHE_LOCK:
         _CAPABILITY_CACHE[model] = mode
         _save_capability_cache()  # FIX-213
-        print(f"[capability] {model}: {mode} (static hint)")
-        return mode
-
-    print(f"[capability] Probing {model} for structured output support...")
-    try:
-        client.chat.completions.create(
-            model=model,
-            response_format={"type": "json_object"},
-            messages=[{"role": "user", "content": 'Reply with valid JSON: {"ok": true}'}],
-            max_completion_tokens=20,
-        )
-        mode = "json_object"
-    except Exception as e:
-        err = str(e).lower()
-        if any(kw in err for kw in ("response_format", "unsupported", "not supported", "invalid_request")):
-            mode = "none"
-        else:
-            mode = "json_object"  # transient error — assume supported
-    _CAPABILITY_CACHE[model] = mode
-    _save_capability_cache()  # FIX-213
-    print(f"[capability] {model}: {mode} (probed)")
+    print(f"[capability] {model}: {mode} ({label})")
     return mode
 
 
