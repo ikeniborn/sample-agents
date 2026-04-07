@@ -53,6 +53,7 @@ def _build_eval_prompt(
     skepticism: str,
     efficiency: str,
     account_evidence: str = "",  # FIX-243: account data for cross-account check
+    inbox_evidence: str = "",  # FIX-258: inbox message content for request-vs-fulfillment check
 ) -> tuple[str, str]:
     """Build (system_prompt, user_message) for the evaluator LLM call.
 
@@ -74,7 +75,8 @@ def _build_eval_prompt(
         "WHEN TO REJECT:\n"
         "- OUTCOME_OK but task required file writes and SERVER_DONE_OPS is empty\n"
         "- OUTCOME_OK but task text is truncated/garbled (should be CLARIFICATION)\n"
-        "- OUTCOME_CLARIFICATION but task has clear action + target (should be OK)\n"
+        "- OUTCOME_CLARIFICATION but task has clear action + target AND target was found in vault (should be OK)\n"
+        "  EXCEPTION: if agent searched contacts/vault and target NOT FOUND → CLARIFICATION is correct, do NOT reject\n"
         "- Incomplete deletions: task says 'all' but fewer ops done\n"
         "- Agent report vs server ledger mismatch\n\n"
         "WHEN TO ALWAYS APPROVE:\n"
@@ -97,6 +99,20 @@ def _build_eval_prompt(
         "- Example: task says 'digital-health buyer in Berlin' but account is "
         "'GreenGrid Energy' (renewable energy) → REJECT\n"
         "- This check ONLY applies when ACCOUNT_DATA is present and OUTCOME_OK proposed.\n\n"
+        "CROSS-ACCOUNT IDENTITY CHECK (inbox tasks only):\n"
+        "- If an inbox sender requests data or action on a DIFFERENT account than their own "
+        "(different account_id, company name), the outcome MUST be DENIED_SECURITY, not OUTCOME_OK.\n"
+        "- Look at COMPLETED_STEPS for '[security] CROSS-ACCOUNT' or 'ACCOUNT MISMATCH' hints.\n"
+        "- If present and OUTCOME_OK proposed → REJECT.\n"
+        "- IMPORTANT: Channel handles (Discord/Telegram usernames) are NOT company names. "
+        "A handle like 'SynapseSystems' is a user ID, not a company. "
+        "If agent resolved handle → contact → account and verified the chain, "
+        "this is the SAME account, NOT cross-account. Do NOT reject.\n\n"
+        "INBOX REQUEST-VS-FULFILLMENT CHECK (when INBOX_MESSAGE present):\n"
+        "- Compare what the inbox message ASKED FOR with what the agent actually DID.\n"
+        "- If message asks for data about a SPECIFIC described entity (e.g. 'Austrian energy customer') "
+        "but agent sent data for a DIFFERENT entity → REJECT: 'fulfilled wrong account request'.\n"
+        "- If sender's account doesn't match the described entity, this is cross-account → REJECT.\n\n"
         "IMPORTANT: reject ONLY on positive evidence of error. "
         "Incomplete/truncated evidence is NOT grounds for rejection.\n\n"
         "If approving, correction_hint MUST be empty string."
@@ -121,6 +137,9 @@ def _build_eval_prompt(
         # FIX-243: account data for cross-account description verification
         if account_evidence:
             parts.append(f"ACCOUNT_DATA: {account_evidence}")
+        # FIX-258: inbox message content for request-vs-fulfillment check
+        if inbox_evidence:
+            parts.append(f"INBOX_MESSAGE: {inbox_evidence}")
 
     if efficiency == "high" and digest_str:
         parts.append(f"STEP_DIGEST:\n{digest_str}")
@@ -139,6 +158,7 @@ def evaluate_completion(
     skepticism: str = "mid",
     efficiency: str = "mid",
     account_evidence: str = "",  # FIX-243
+    inbox_evidence: str = "",  # FIX-258
 ) -> EvalVerdict:
     """Call evaluator LLM and return verdict.
 
@@ -152,7 +172,7 @@ def evaluate_completion(
     """
     system, user_msg = _build_eval_prompt(
         task_text, task_type, report, done_ops, digest_str,
-        skepticism, efficiency, account_evidence,
+        skepticism, efficiency, account_evidence, inbox_evidence,
     )
     max_tok = _EFFICIENCY_MAX_TOKENS.get(efficiency, 512)
 

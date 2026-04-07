@@ -41,8 +41,9 @@ _THINK_WORDS = re.compile(
 )
 
 # Unit 8: new task type patterns
+# FIX-265b: broadened inbox detection — also matches "review inbound note", "next inbox message"
 _INBOX_RE = re.compile(
-    r"\b(process|check|handle)\s+(the\s+)?inbox\b",
+    r"\b(process|check|handle|review)\s+(the\s+)?(next\s+)?(inbox|inbound)\b",
     re.IGNORECASE,
 )
 
@@ -57,8 +58,9 @@ _LOOKUP_RE = re.compile(
 )
 
 # Write-verbs used to distinguish lookup from distill/email
+# FIX-264: add(?![-]) prevents matching "add" in compound words like "add-on"
 _WRITE_VERBS_RE = re.compile(
-    r"\b(write|create|add|update|send|compose|delete|move|rename)\b",
+    r"\b(write|create|add(?![-])|update|send|compose|delete|move|rename)\b",
     re.IGNORECASE,
 )
 
@@ -160,7 +162,7 @@ _CLASSIFY_SYSTEM = (
     'Reply ONLY with valid JSON: {"type": "<type>"} where <type> is one of: '
     "think, longContext, email, lookup, inbox, distill, default.\n"  # FIX-163: coder removed (sub-agent, not a task route)
     "longContext = batch/all files/multiple files/3+ explicit file paths\n"
-    "inbox = process/check/handle the inbox\n"
+    "inbox = process/check/handle/review the inbox or inbound notes\n"
     "email = send/compose/write email to a recipient\n"
     "lookup = find, count, or query vault data (contacts, files, channels) with no write action\n"  # FIX-175
     "distill = analysis/reasoning AND writing a card/note/summary\n"
