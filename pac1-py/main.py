@@ -191,7 +191,25 @@ def _run_single_task(task, router: ModelRouter, benchmark_id: str) -> tuple:
             print(exc)
         task_elapsed = time.time() - task_start
         result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
-        return (task.task_id, result.score, list(result.score_detail), task_elapsed, token_stats)
+        score = result.score
+        detail = list(result.score_detail)
+        style = CLI_GREEN if score == 1 else CLI_RED
+        in_t   = token_stats.get("input_tokens", 0)
+        out_t  = token_stats.get("output_tokens", 0)
+        steps  = token_stats.get("step_count", 0)
+        calls  = token_stats.get("llm_call_count", 0)
+        t_type = token_stats.get("task_type", "—")
+        m_short = (token_stats.get("model_used") or "—").split("/")[-1]
+        detail_str = "\n" + textwrap.indent("\n".join(detail), "  ") if detail else ""
+        print(
+            f"{style}[{task.task_id}] Score: {score:0.2f}"
+            f" | {task_elapsed:.1f}s"
+            f" | {steps}st {calls}rq"
+            f" | in {in_t:,} / out {out_t:,} tok"
+            f" | {t_type} | {m_short}"
+            f"{detail_str}{CLI_CLR}"
+        )
+        return (task.task_id, score, detail, task_elapsed, token_stats)
     finally:
         fh = _task_local.log_fh
         _task_local.log_fh = None
@@ -200,90 +218,90 @@ def _run_single_task(task, router: ModelRouter, benchmark_id: str) -> tuple:
             fh.close()
 
 
-def _write_summary(scores: list, run_start: float) -> None:
-    """Print run summary to stdout (captured by _Tee → terminal + results.txt)."""
-    for task_id, score, *_ in scores:
-        style = CLI_GREEN if score == 1 else CLI_RED
-        print(f"{task_id}: {style}{score:0.2f}{CLI_CLR}")
+_TABLE_W = 178
+_TABLE_SEP = "=" * _TABLE_W
 
-    total = sum(score for _, score, *_ in scores) / len(scores) * 100.0
-    total_elapsed = time.time() - run_start
-    print(f"FINAL: {total:0.2f}%")
 
-    total_in = total_out = 0
-    for *_, ts in scores:
-        total_in += ts.get("input_tokens", 0)
-        total_out += ts.get("output_tokens", 0)
-
-    W = 178
-    sep = "=" * W
-    print(f"\n{sep}")
-    print(f"{'ИТОГОВАЯ СТАТИСТИКА':^{W}}")
-    print(sep)
+def _print_table_header() -> None:
+    """Print the summary table header to main.log (call once before tasks start)."""
+    print(f"\n{_TABLE_SEP}")
+    print(f"{'ИТОГОВАЯ СТАТИСТИКА':^{_TABLE_W}}")
+    print(_TABLE_SEP)
     print(f"{'Задание':<10} {'Оценка':>7} {'Время':>8}  {'Шаги':>5} {'Запр':>5} {'Eval':>4} {'EvMs':>6}  {'Вход(tok)':>10} {'Выход(tok)':>10} {'ток/с':>7}  {'Тип':<11} {'Модель':<34}  Проблемы")
-    print("-" * W)
+    print("-" * _TABLE_W)
+
+
+def _print_table_row(task_id: str, score: float, detail: list, elapsed: float, ts: dict) -> None:
+    """Print one completed-task row into the summary table."""
+    issues = "; ".join(detail) if score < 1.0 else "—"
+    in_t   = ts.get("input_tokens", 0)
+    out_t  = ts.get("output_tokens", 0)
+    llm_ms = ts.get("llm_elapsed_ms", 0)
+    ev_c   = ts.get("ollama_eval_count", 0)
+    ev_ms  = ts.get("ollama_eval_ms", 0)
+    steps  = ts.get("step_count", 0)
+    calls  = ts.get("llm_call_count", 0)
+    eval_c = ts.get("evaluator_calls", 0)
+    eval_ms = ts.get("evaluator_ms", 0)
+    if ev_c > 0 and ev_ms > 0:
+        tps = ev_c / (ev_ms / 1000.0)
+    elif llm_ms > 0:
+        tps = out_t / (llm_ms / 1000.0)
+    else:
+        tps = 0.0
+    m = ts.get("model_used", "—")
+    m_short = m.split("/")[-1] if "/" in m else m
+    t_type = ts.get("task_type", "—")
+    print(f"{task_id:<10} {score:>7.2f} {elapsed:>7.1f}s  {steps:>5} {calls:>5} {eval_c:>4} {eval_ms:>6}  {in_t:>10,} {out_t:>10,} {tps:>6.0f}  {t_type:<11} {m_short:<34}  {issues}")
+
+
+def _write_summary(scores: list, run_start: float) -> None:
+    """Print totals + per-model breakdown after all rows have been printed."""
+    n = len(scores)
+    total = sum(s for _, s, *_ in scores) / n * 100.0
+    total_elapsed = time.time() - run_start
+    total_in = total_out = total_llm_ms = total_steps = total_calls = 0
+    total_eval_calls = total_eval_ms_sum = 0
     model_totals: dict[str, dict] = {}
-    total_llm_ms = 0
-    total_steps = 0
-    total_calls = 0
-    total_eval_calls = 0
-    total_eval_ms_sum = 0
     for task_id, score, detail, elapsed, ts in scores:
-        issues = "; ".join(detail) if score < 1.0 else "—"
-        in_t = ts.get("input_tokens", 0)
-        out_t = ts.get("output_tokens", 0)
+        in_t   = ts.get("input_tokens", 0)
+        out_t  = ts.get("output_tokens", 0)
         llm_ms = ts.get("llm_elapsed_ms", 0)
         ev_c   = ts.get("ollama_eval_count", 0)
         ev_ms  = ts.get("ollama_eval_ms", 0)
-        steps  = ts.get("step_count", 0)
-        calls  = ts.get("llm_call_count", 0)
-        eval_c  = ts.get("evaluator_calls", 0)
-        eval_ms = ts.get("evaluator_ms", 0)
-        if ev_c > 0 and ev_ms > 0:
-            tps = ev_c / (ev_ms / 1000.0)
-        elif llm_ms > 0:
-            tps = out_t / (llm_ms / 1000.0)
-        else:
-            tps = 0.0
+        total_in  += in_t;  total_out += out_t
         total_llm_ms += llm_ms
-        total_steps += steps
-        total_calls += calls
-        total_eval_calls += eval_c
-        total_eval_ms_sum += eval_ms
+        total_steps += ts.get("step_count", 0)
+        total_calls += ts.get("llm_call_count", 0)
+        total_eval_calls  += ts.get("evaluator_calls", 0)
+        total_eval_ms_sum += ts.get("evaluator_ms", 0)
         m = ts.get("model_used", "—")
-        m_short = m.split("/")[-1] if "/" in m else m
-        t_type = ts.get("task_type", "—")
-        print(f"{task_id:<10} {score:>7.2f} {elapsed:>7.1f}s  {steps:>5} {calls:>5} {eval_c:>4} {eval_ms:>6}  {in_t:>10,} {out_t:>10,} {tps:>6.0f}  {t_type:<11} {m_short:<34}  {issues}")
         if m not in model_totals:
-            model_totals[m] = {"in": 0, "out": 0, "llm_ms": 0, "ev_c": 0, "ev_ms": 0, "count": 0}
-        model_totals[m]["in"] += in_t
-        model_totals[m]["out"] += out_t
-        model_totals[m]["llm_ms"] = model_totals[m].get("llm_ms", 0) + llm_ms
-        model_totals[m]["ev_c"]  = model_totals[m].get("ev_c", 0) + ev_c
-        model_totals[m]["ev_ms"] = model_totals[m].get("ev_ms", 0) + ev_ms
-        model_totals[m]["elapsed"] = model_totals[m].get("elapsed", 0) + elapsed
-        model_totals[m]["count"] += 1
-    n = len(scores)
-    total_tasks_elapsed = sum(elapsed for _, _, _, elapsed, _ in scores)
-    avg_elapsed = total_tasks_elapsed / n if n else 0
-    avg_in = total_in // n if n else 0
-    avg_out = total_out // n if n else 0
-    avg_steps = total_steps // n if n else 0
-    avg_calls = total_calls // n if n else 0
+            model_totals[m] = {"in": 0, "out": 0, "llm_ms": 0, "ev_c": 0, "ev_ms": 0, "elapsed": 0, "count": 0}
+        mt = model_totals[m]
+        mt["in"] += in_t;  mt["out"] += out_t
+        mt["llm_ms"] += llm_ms;  mt["ev_c"] += ev_c;  mt["ev_ms"] += ev_ms
+        mt["elapsed"] += elapsed;  mt["count"] += 1
+    total_tasks_elapsed = sum(e for _, _, _, e, _ in scores)
+    avg_elapsed = total_tasks_elapsed / n
+    avg_in  = total_in  // n
+    avg_out = total_out // n
+    avg_steps = total_steps // n
+    avg_calls = total_calls // n
+    avg_eval_c  = total_eval_calls  // n
+    avg_eval_ms = total_eval_ms_sum // n
     total_ev_c  = sum(ts.get("ollama_eval_count", 0) for *_, ts in scores)
-    total_ev_ms = sum(ts.get("ollama_eval_ms", 0)    for *_, ts in scores)
+    total_ev_ms = sum(ts.get("ollama_eval_ms",    0) for *_, ts in scores)
     if total_ev_c > 0 and total_ev_ms > 0:
         total_tps = total_ev_c / (total_ev_ms / 1000.0)
     elif total_llm_ms > 0:
         total_tps = total_out / (total_llm_ms / 1000.0)
     else:
         total_tps = 0.0
-    print(sep)
-    avg_eval_c = total_eval_calls // n if n else 0
-    avg_eval_ms = total_eval_ms_sum // n if n else 0
+    print(_TABLE_SEP)
     print(f"{'ИТОГО':<10} {total:>6.2f}% {total_elapsed:>7.1f}s  {total_steps:>5} {total_calls:>5} {total_eval_calls:>4} {total_eval_ms_sum:>6}  {total_in:>10,} {total_out:>10,} {total_tps:>6.0f}  {'':11} {'':34}")
     print(f"{'СРЕДНЕЕ':<10} {'':>7} {avg_elapsed:>7.1f}s  {avg_steps:>5} {avg_calls:>5} {avg_eval_c:>4} {avg_eval_ms:>6}  {avg_in:>10,} {avg_out:>10,} {'':>6}  {'':11} {'':34}")
-    print(sep)
+    print(_TABLE_SEP)
     if len(model_totals) > 1:
         print(f"\n{'─' * 84}")
         print("По моделям:")
@@ -293,12 +311,11 @@ def _write_summary(scores: list, run_start: float) -> None:
         for m, mt in sorted(model_totals.items()):
             m_short = m.split("/")[-1] if "/" in m else m
             cnt = mt["count"]
-            avg_i = mt["in"] // cnt if cnt else 0
+            avg_i = mt["in"]  // cnt if cnt else 0
             avg_o = mt["out"] // cnt if cnt else 0
-            avg_e = mt.get("elapsed", 0) / cnt if cnt else 0
-            m_ev_c  = mt.get("ev_c", 0)
-            m_ev_ms = mt.get("ev_ms", 0)
-            m_llm_ms = mt.get("llm_ms", 0)
+            avg_e = mt["elapsed"] / cnt if cnt else 0.0
+            m_ev_c   = mt["ev_c"];   m_ev_ms  = mt["ev_ms"]
+            m_llm_ms = mt["llm_ms"]
             if m_ev_c > 0 and m_ev_ms > 0:
                 m_tps = m_ev_c / (m_ev_ms / 1000.0)
             elif m_llm_ms > 0:
@@ -324,6 +341,7 @@ def main() -> None:
         )
 
         tasks_to_run = [t for t in res.tasks if not task_filter or t.task_id in task_filter]
+        _print_table_header()
         with ThreadPoolExecutor(max_workers=PARALLEL_TASKS) as pool:
             futures = {
                 pool.submit(_run_single_task, t, EFFECTIVE_MODEL, BENCHMARK_ID): t
@@ -339,22 +357,7 @@ def main() -> None:
                 if score >= 0:
                     with scores_lock:
                         scores.append((task_id, score, detail, task_elapsed, token_stats))
-                    style = CLI_GREEN if score == 1 else CLI_RED
-                    in_t  = token_stats.get("input_tokens", 0)
-                    out_t = token_stats.get("output_tokens", 0)
-                    steps = token_stats.get("step_count", 0)
-                    calls = token_stats.get("llm_call_count", 0)
-                    t_type = token_stats.get("task_type", "—")
-                    m_short = (token_stats.get("model_used") or "—").split("/")[-1]
-                    detail_str = "\n" + textwrap.indent("\n".join(detail), "  ") if detail else ""
-                    print(
-                        f"{style}[{task_id}] Score: {score:0.2f}"
-                        f" | {task_elapsed:.1f}s"
-                        f" | {steps}st {calls}rq"
-                        f" | in {in_t:,} / out {out_t:,} tok"
-                        f" | {t_type} | {m_short}"
-                        f"{detail_str}{CLI_CLR}"
-                    )
+                    _print_table_row(task_id, score, detail, task_elapsed, token_stats)
 
     except ConnectError as exc:
         print(f"{exc.code}: {exc.message}")
