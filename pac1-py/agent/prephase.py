@@ -1,6 +1,6 @@
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from bitgn.vm.pcm_pb2 import ContextRequest, ListRequest, ReadRequest, TreeRequest
@@ -29,6 +29,9 @@ class PrephaseResult:
     preserve_prefix: list  # messages to never compact
     agents_md_content: str = ""  # content of AGENTS.md if found
     agents_md_path: str = ""  # path where AGENTS.md was found
+    # Inbox files loaded during prephase: list of (path, content) sorted alphabetically.
+    # Used by _run_pre_route for preloop injection check before the main loop starts.
+    inbox_files: list = field(default_factory=list)
 
 
 def _format_tree_entry(entry, prefix: str = "", is_last: bool = True) -> list[str]:
@@ -96,7 +99,6 @@ def run_prephase(
         {"role": "system", "content": system_prompt_text},
         {"role": "user", "content": _FEW_SHOT_USER},
         {"role": "assistant", "content": _FEW_SHOT_ASSISTANT},
-        {"role": "user", "content": task_text},
     ]
 
     # Step 1: tree "/" -L 2 — gives the agent the top-level vault layout upfront
@@ -132,6 +134,7 @@ def run_prephase(
     #   3. Intersection → list + read each file in those dirs (skip templates/README)
     # No hardcoded folder names — works for any vault layout.
     docs_content_parts: list[str] = []
+    inbox_files: list[tuple[str, str]] = []
     if agents_md_content and tree_result is not None:
         # Top-level dirs from tree
         top_level_dirs = {entry.name for entry in tree_result.root.children if entry.children or True}
@@ -171,6 +174,9 @@ def run_prephase(
                                 f" For exact counts or full content use: read('{child_path}')]"
                             )
                         docs_content_parts.append(f"--- {child_path} ---\n{_fc}")
+                        # Collect raw content for inbox dirs — used for preloop injection check
+                        if "inbox" in dir_path.lower():
+                            inbox_files.append((child_path, file_r.content))
                         print(f"{CLI_BLUE}[prephase] read {child_path}:{CLI_CLR} {CLI_GREEN}ok{CLI_CLR}")
                         if _LOG_LEVEL == "DEBUG":
                             print(f"{CLI_BLUE}[prephase] {child_path} content:\n{file_r.content}{CLI_CLR}")
@@ -185,7 +191,7 @@ def run_prephase(
 
     # Inject vault layout + AGENTS.MD as context — the agent reads this to discover
     # where "cards", "threads", "inbox", etc. actually live in the vault.
-    prephase_parts = [f"VAULT STRUCTURE:\n{tree_txt}"]
+    prephase_parts = [f"TASK: {task_text}", f"VAULT STRUCTURE:\n{tree_txt}"]
     if agents_md_content:
         agents_md_injected, was_filtered = _filter_agents_md(agents_md_content, task_text)
         if was_filtered:
@@ -228,4 +234,5 @@ def run_prephase(
         preserve_prefix=preserve_prefix,
         agents_md_content=agents_md_content,
         agents_md_path=agents_md_path,
+        inbox_files=sorted(inbox_files, key=lambda x: x[0]),
     )

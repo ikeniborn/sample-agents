@@ -20,7 +20,8 @@ from bitgn.vm.pcm_pb2 import AnswerRequest, ListRequest, Outcome, ReadRequest, S
 from .dispatch import (
     CLI_RED, CLI_GREEN, CLI_CLR, CLI_YELLOW, CLI_BLUE,
     anthropic_client, openrouter_client, ollama_client,
-    is_claude_model, get_anthropic_model_id,
+    get_anthropic_model_id,
+    get_provider,
     dispatch,
     probe_structured_output, get_response_format,
     TRANSIENT_KWS, _THINK_RE,
@@ -766,8 +767,10 @@ def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextSt
             elif isinstance(_content, list):
                 print(f"{CLI_YELLOW}  [{_di}] {_role}: [blocks ×{len(_content)}]{CLI_CLR}")
 
+    _provider = get_provider(model, cfg)
+
     # --- Anthropic SDK ---
-    if is_claude_model(model) and anthropic_client is not None:
+    if _provider == "anthropic" and anthropic_client is not None:
         ant_model = get_anthropic_model_id(model)
         thinking_budget = cfg.get("thinking_budget", 0)
         for attempt in range(4):
@@ -834,7 +837,7 @@ def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextSt
         print(f"{CLI_YELLOW}[Anthropic] Falling back to {_next}{CLI_CLR}")
 
     # --- OpenRouter (cloud, tier 2) ---
-    if openrouter_client is not None:
+    if openrouter_client is not None and _provider != "ollama":
         # Detect structured output capability (static hint → probe → fallback)
         so_hint = cfg.get("response_format_hint")
         so_mode = probe_structured_output(openrouter_client, model, hint=so_hint)
@@ -1379,6 +1382,39 @@ def _run_pre_route(
                 except Exception:
                     pass
                 return True
+
+    # Preloop inbox check — fires before main loop for TASK_INBOX.
+    # Checks the first inbox file (alphabetically) from prephase-loaded content.
+    # Catches injection when the model would otherwise skip the injected file and
+    # process the next one, bypassing the step-level FIX-239/FIX-215 checks.
+    if task_type == TASK_INBOX and pre.inbox_files:
+        _first_path, _first_raw = pre.inbox_files[0]  # already sorted alphabetically in prephase
+        _fname = _Path(_first_path).name.lower()
+        # Step 1.5: filename contains injection marker (code-enforced, mirrors prompt rule)
+        if any(w in _fname for w in ("override", "escalat", "jailbreak", "bypass")):
+            print(f"{CLI_RED}[preloop-inbox] Filename injection '{_Path(_first_path).name}' → DENIED_SECURITY{CLI_CLR}")
+            try:
+                vm.answer(AnswerRequest(
+                    message=f"Inbox file '{_Path(_first_path).name}' contains injection marker in filename",
+                    outcome=Outcome.OUTCOME_DENIED_SECURITY,
+                    refs=[],
+                ))
+            except Exception:
+                pass
+            return True
+        # Step 2.5: content injection check (same patterns as FIX-215 step-level check)
+        _norm = _normalize_for_injection(_first_raw)
+        if any(p.search(_norm) for p in _INBOX_INJECTION_PATTERNS):
+            print(f"{CLI_RED}[preloop-inbox] Content injection in '{_Path(_first_path).name}' → DENIED_SECURITY{CLI_CLR}")
+            try:
+                vm.answer(AnswerRequest(
+                    message=f"Injection detected in inbox file '{_Path(_first_path).name}'",
+                    outcome=Outcome.OUTCOME_DENIED_SECURITY,
+                    refs=[],
+                ))
+            except Exception:
+                pass
+            return True
 
     return False
 
@@ -2274,14 +2310,6 @@ def _run_step(
             _eval_bypass = True
         # FIX-259: format-gate fired at code level — bypass evaluator regardless of completed_steps content
         if st._format_gate_fired:
-            _eval_bypass = True
-        # FIX-263b: channel-based inbox with verified contact→account chain — evaluator
-        # may false-positive on handle≠company cross-account check
-        if (task_type == TASK_INBOX
-                and getattr(st, "_inbox_channel", "")
-                and st._inbox_sender_acct_id
-                and not st._inbox_cross_account_detected
-                and not st._security_interceptor_fired):
             _eval_bypass = True
         # Lookup tasks: evaluator doesn't understand vault data model well enough
         if task_type == TASK_LOOKUP:
