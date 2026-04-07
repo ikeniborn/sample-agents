@@ -2320,9 +2320,6 @@ def _run_step(
         # Inbox admin-verified: code detected admin handle from channel file
         if task_type == TASK_INBOX and getattr(st, "_inbox_is_admin", False):
             _eval_bypass = True
-        # OTP-elevated: code confirmed OTP token match → trust
-        if task_type == TASK_INBOX and getattr(st, "_otp_matched", False):
-            _eval_bypass = True
         # FIX-266: email/CLARIFICATION when contact search returned 0 results — evaluator
         # false-positives on "clear action + target" rule when target doesn't exist in vault
         if (task_type == TASK_EMAIL
