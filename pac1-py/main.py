@@ -15,7 +15,6 @@ _task_local = threading.local()
 
 # Run-level state set by _setup_log_tee(), used by _run_single_task and main()
 _run_dir: "Path | None" = None   # logs/{ts}_{model}/ directory for this run
-_results_fh = None               # results.txt handle, active only during summary writing
 
 
 # ---------------------------------------------------------------------------
@@ -75,9 +74,6 @@ def _setup_log_tee() -> None:
                 task_fh.write(clean)
             else:
                 _fh.write(clean)
-            # Results file (active only during summary writing in main())
-            if _results_fh is not None:
-                _results_fh.write(clean)
 
         def flush(self) -> None:
             _orig.flush()
@@ -344,8 +340,21 @@ def main() -> None:
                     with scores_lock:
                         scores.append((task_id, score, detail, task_elapsed, token_stats))
                     style = CLI_GREEN if score == 1 else CLI_RED
+                    in_t  = token_stats.get("input_tokens", 0)
+                    out_t = token_stats.get("output_tokens", 0)
+                    steps = token_stats.get("step_count", 0)
+                    calls = token_stats.get("llm_call_count", 0)
+                    t_type = token_stats.get("task_type", "—")
+                    m_short = (token_stats.get("model_used") or "—").split("/")[-1]
                     detail_str = "\n" + textwrap.indent("\n".join(detail), "  ") if detail else ""
-                    print(f"{style}[{task_id}] Score: {score:0.2f}{detail_str}{CLI_CLR}")
+                    print(
+                        f"{style}[{task_id}] Score: {score:0.2f}"
+                        f" | {task_elapsed:.1f}s"
+                        f" | {steps}st {calls}rq"
+                        f" | in {in_t:,} / out {out_t:,} tok"
+                        f" | {t_type} | {m_short}"
+                        f"{detail_str}{CLI_CLR}"
+                    )
 
     except ConnectError as exc:
         print(f"{exc.code}: {exc.message}")
@@ -353,15 +362,7 @@ def main() -> None:
         print(f"{CLI_RED}Interrupted{CLI_CLR}")
 
     if scores:
-        global _results_fh
-        if _run_dir:
-            _results_fh = open(_run_dir / "results.txt", "w", encoding="utf-8")
-        try:
-            _write_summary(scores, run_start)
-        finally:
-            if _results_fh:
-                _results_fh.close()
-                _results_fh = None
+        _write_summary(scores, run_start)
 
 
 if __name__ == "__main__":
