@@ -137,6 +137,7 @@ _model_lookup  = os.getenv("MODEL_LOOKUP")  or _model_default
 _model_inbox   = os.getenv("MODEL_INBOX")   or _model_think
 _model_coder   = os.getenv("MODEL_CODER")   or _model_default
 _model_evaluator = os.getenv("MODEL_EVALUATOR") or _model_default  # FIX-218
+_model_prompt_builder = os.getenv("MODEL_PROMPT_BUILDER") or ""  # FIX-NNN: "" = use classifier
 
 # FIX-88: always use ModelRouter — classification runs for every task,
 # logs always show [MODEL_ROUTER] lines, stats always show Тип/Модель columns.
@@ -150,19 +151,21 @@ EFFECTIVE_MODEL: ModelRouter = ModelRouter(
     inbox=_model_inbox,
     coder=_model_coder,
     evaluator=_model_evaluator,
+    prompt_builder=_model_prompt_builder,
     configs=MODEL_CONFIGS,
 )
 print(
     f"[MODEL_ROUTER] Multi-model mode:\n"
-    f"  classifier  = {_model_classifier}\n"
-    f"  default     = {_model_default}\n"
-    f"  think       = {_model_think}\n"
-    f"  longContext = {_model_long_ctx}\n"
-    f"  email       = {_model_email}\n"
-    f"  lookup      = {_model_lookup}\n"
-    f"  inbox       = {_model_inbox}\n"
-    f"  coder       = {_model_coder}\n"
-    f"  evaluator   = {_model_evaluator}"
+    f"  classifier      = {_model_classifier}\n"
+    f"  default         = {_model_default}\n"
+    f"  think           = {_model_think}\n"
+    f"  longContext      = {_model_long_ctx}\n"
+    f"  email           = {_model_email}\n"
+    f"  lookup          = {_model_lookup}\n"
+    f"  inbox           = {_model_inbox}\n"
+    f"  coder           = {_model_coder}\n"
+    f"  evaluator       = {_model_evaluator}\n"
+    f"  prompt_builder  = {_model_prompt_builder or '(uses classifier)'}"
 )
 
 CLI_RED = "\x1B[31m"
@@ -218,7 +221,7 @@ def _run_single_task(task, router: ModelRouter, benchmark_id: str) -> tuple:
             fh.close()
 
 
-_TABLE_W = 178
+_TABLE_W = 196
 _TABLE_SEP = "=" * _TABLE_W
 
 
@@ -227,7 +230,7 @@ def _print_table_header() -> None:
     print(f"\n{_TABLE_SEP}")
     print(f"{'ИТОГОВАЯ СТАТИСТИКА':^{_TABLE_W}}")
     print(_TABLE_SEP)
-    print(f"{'Задание':<10} {'Оценка':>7} {'Время':>8}  {'Шаги':>5} {'Запр':>5} {'Eval':>4} {'EvMs':>6}  {'Вход(tok)':>10} {'Выход(tok)':>10} {'ток/с':>7}  {'Тип':<11} {'Модель':<34}  Проблемы")
+    print(f"{'Задание':<10} {'Оценка':>7} {'Время':>8}  {'Шаги':>5} {'Запр':>5} {'Eval':>4} {'EvMs':>6}  {'Вход(tok)':>10} {'Выход(tok)':>10} {'ток/с':>7}  {'B':>1} {'BIn':>6} {'BOt':>5}  {'Тип':<11} {'Модель':<34}  Проблемы")
     print("-" * _TABLE_W)
 
 
@@ -252,7 +255,10 @@ def _print_table_row(task_id: str, score: float, detail: list, elapsed: float, t
     m = ts.get("model_used", "—")
     m_short = m.split("/")[-1] if "/" in m else m
     t_type = ts.get("task_type", "—")
-    print(f"{task_id:<10} {score:>7.2f} {elapsed:>7.1f}s  {steps:>5} {calls:>5} {eval_c:>4} {eval_ms:>6}  {in_t:>10,} {out_t:>10,} {tps:>6.0f}  {t_type:<11} {m_short:<34}  {issues}")
+    b_flag = "✓" if ts.get("builder_used") else "—"
+    b_in   = ts.get("builder_in_tok", 0)
+    b_out  = ts.get("builder_out_tok", 0)
+    print(f"{task_id:<10} {score:>7.2f} {elapsed:>7.1f}s  {steps:>5} {calls:>5} {eval_c:>4} {eval_ms:>6}  {in_t:>10,} {out_t:>10,} {tps:>6.0f}  {b_flag:>1} {b_in:>6,} {b_out:>5,}  {t_type:<11} {m_short:<34}  {issues}")
 
 
 def _write_summary(scores: list, run_start: float) -> None:
@@ -262,6 +268,7 @@ def _write_summary(scores: list, run_start: float) -> None:
     total_elapsed = time.time() - run_start
     total_in = total_out = total_llm_ms = total_steps = total_calls = 0
     total_eval_calls = total_eval_ms_sum = 0
+    total_b_used = total_b_in = total_b_out = 0
     model_totals: dict[str, dict] = {}
     for task_id, score, detail, elapsed, ts in scores:
         in_t   = ts.get("input_tokens", 0)
@@ -275,6 +282,9 @@ def _write_summary(scores: list, run_start: float) -> None:
         total_calls += ts.get("llm_call_count", 0)
         total_eval_calls  += ts.get("evaluator_calls", 0)
         total_eval_ms_sum += ts.get("evaluator_ms", 0)
+        total_b_used += 1 if ts.get("builder_used") else 0
+        total_b_in   += ts.get("builder_in_tok", 0)
+        total_b_out  += ts.get("builder_out_tok", 0)
         m = ts.get("model_used", "—")
         if m not in model_totals:
             model_totals[m] = {"in": 0, "out": 0, "llm_ms": 0, "ev_c": 0, "ev_ms": 0, "elapsed": 0, "count": 0}
@@ -299,8 +309,8 @@ def _write_summary(scores: list, run_start: float) -> None:
     else:
         total_tps = 0.0
     print(_TABLE_SEP)
-    print(f"{'ИТОГО':<10} {total:>6.2f}% {total_elapsed:>7.1f}s  {total_steps:>5} {total_calls:>5} {total_eval_calls:>4} {total_eval_ms_sum:>6}  {total_in:>10,} {total_out:>10,} {total_tps:>6.0f}  {'':11} {'':34}")
-    print(f"{'СРЕДНЕЕ':<10} {'':>7} {avg_elapsed:>7.1f}s  {avg_steps:>5} {avg_calls:>5} {avg_eval_c:>4} {avg_eval_ms:>6}  {avg_in:>10,} {avg_out:>10,} {'':>6}  {'':11} {'':34}")
+    print(f"{'ИТОГО':<10} {total:>6.2f}% {total_elapsed:>7.1f}s  {total_steps:>5} {total_calls:>5} {total_eval_calls:>4} {total_eval_ms_sum:>6}  {total_in:>10,} {total_out:>10,} {total_tps:>6.0f}  {total_b_used:>1} {total_b_in:>6,} {total_b_out:>5,}  {'':11} {'':34}")
+    print(f"{'СРЕДНЕЕ':<10} {'':>7} {avg_elapsed:>7.1f}s  {avg_steps:>5} {avg_calls:>5} {avg_eval_c:>4} {avg_eval_ms:>6}  {avg_in:>10,} {avg_out:>10,} {'':>6}  {'':>1} {'':>6} {'':>5}  {'':11} {'':34}")
     print(_TABLE_SEP)
     if len(model_totals) > 1:
         print(f"\n{'─' * 84}")

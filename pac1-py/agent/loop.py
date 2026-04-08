@@ -22,6 +22,7 @@ from .dispatch import (
     anthropic_client, openrouter_client, ollama_client,
     get_anthropic_model_id,
     get_provider,
+    is_ollama_model,
     dispatch,
     probe_structured_output, get_response_format,
     TRANSIENT_KWS, _THINK_RE,
@@ -297,12 +298,28 @@ def _extract_fact(action_name: str, action, result_txt: str) -> "_StepFact | Non
         try:
             d = json.loads(result_txt)
             content = d.get("content", "").replace("\n", " ").strip()
-            # FIX-243/258: extended summary for account + inbox files (evaluator needs full context)
-            _limit = 120
             if "accounts/" in path:
-                _limit = 250  # FIX-243: evaluator needs name+industry
+                # [FIX-244] Structured digest for account files: extract key lookup fields
+                # instead of char-truncating. Truncation at 250 cuts off `account_manager`
+                # mid-value, causing agent to hallucinate manager names from partial data.
+                try:
+                    acct = json.loads(d.get("content", ""))
+                    summary = json.dumps(
+                        {
+                            "name": acct.get("name", ""),
+                            "account_manager": acct.get("account_manager", ""),
+                            "status": acct.get("status", ""),
+                            "industry": acct.get("industry", ""),
+                        },
+                        ensure_ascii=False,
+                    )
+                    return _StepFact("read", path, summary)
+                except (json.JSONDecodeError, ValueError):
+                    return _StepFact("read", path, content[:250])
             elif "inbox/" in path:
                 _limit = 500  # FIX-258: evaluator needs full message for cross-account check
+            else:
+                _limit = 120
             return _StepFact("read", path, content[:_limit])
         except (json.JSONDecodeError, ValueError):
             pass
@@ -1256,7 +1273,9 @@ def _run_pre_route(
     # Semantic routing via LLM — handles ambiguous injection + over-permissive cases
     # FIX-171: lookup tasks always EXECUTE — they only query vault files, never external services;
     # router LLM incorrectly returns UNSUPPORTED for vault data queries (counting, lookups)
-    _rr_client = openrouter_client or ollama_client
+    # Route client must match the model's configured provider — Ollama models must not
+    # be sent to OpenRouter (invalid model ID → 400). FIX-266.
+    _rr_client = ollama_client if is_ollama_model(model) else (openrouter_client or ollama_client)
     if _rr_client is not None and task_type != TASK_LOOKUP:
         # Route schema defined as _ROUTE_SCHEMA module constant
         # Include vault context so classifier knows what's supported
@@ -2251,12 +2270,19 @@ def _run_step(
     # Paths in step_facts have leading "/" — strip it (benchmark expects no leading slash)
     if (isinstance(job.function, ReportTaskCompletion)
             and task_type in (TASK_LOOKUP, TASK_INBOX)):
-        _auto_refs = list({
+        # [FIX-244] Collect contacts/ and accounts/ separately so contacts are always
+        # included first. The old single-set approach let accounts/ crowd out contacts/
+        # when the [:5] cap was hit (set iteration order is hash-based, not insertion order).
+        _contacts_refs = list(dict.fromkeys(
             f.path.lstrip("/") for f in st.step_facts
-            if f.kind == "read"
-            and f.path
-            and any(d in f.path for d in ("contacts/", "accounts/", "my-invoices/"))
-        })[:5]
+            if f.kind == "read" and f.path and "contacts/" in f.path
+        ))
+        _other_refs = list(dict.fromkeys(
+            f.path.lstrip("/") for f in st.step_facts
+            if f.kind == "read" and f.path
+            and any(d in f.path for d in ("accounts/", "my-invoices/"))
+        ))
+        _auto_refs = list(dict.fromkeys(_contacts_refs + _other_refs))[:10]
         # FIX-266b: if contact was read and account_id known, ensure accounts/ file is in refs
         _known_acct_id = getattr(st, "_inbox_contact_account_id", "")
         if _known_acct_id:
@@ -2266,7 +2292,7 @@ def _run_step(
         if _auto_refs:
             # FIX-241: merge instead of replace-if-empty — always combine agent refs with auto refs
             _existing = list(job.function.grounding_refs or [])
-            _merged = list(dict.fromkeys(_existing + _auto_refs))[:8]
+            _merged = list(dict.fromkeys(_existing + _auto_refs))[:12]
             job.function.grounding_refs = _merged
 
     # FIX-259: hard enforcement — format-gate forces CLARIFICATION
@@ -2429,6 +2455,33 @@ def _run_step(
             if _relist_extra:
                 st.listed_dirs.add(str(_Path(job.function.path).parent))
             txt += _relist_extra
+
+    except Exception as exc:
+        # Broad handler for non-ConnectError transport exceptions (e.g. gRPC deadline,
+        # raw socket timeout). Keeps the loop alive instead of crashing the task.
+        _err_path = getattr(job.function, "path", getattr(job.function, "from_name", "?"))
+        _exc_msg = str(exc)
+        txt = f"ERROR: {_exc_msg}"
+        print(f"{CLI_RED}[dispatch-err] {action_name} {_err_path}: {_exc_msg[:120]}{CLI_CLR}")
+        st.error_counts[(action_name, _err_path, "EXCEPTION")] += 1
+        st.stall_hint_active = False
+        st.steps_since_write += 1
+        st.step_facts.append(_StepFact(
+            kind=action_name.lower().replace("req_", ""),
+            path=_err_path,
+            summary="ERROR EXCEPTION",
+            error=_exc_msg[:120],
+        ))
+        # FIX-NNN: read timeout → inject code_eval hint so agent recovers without crashing
+        _is_timeout = any(kw in _exc_msg.lower() for kw in ("timed out", "timeout", "deadline"))
+        if isinstance(job.function, Req_Read) and _is_timeout:
+            _timeout_hint = (
+                f"[read-timeout] Reading '{_err_path}' timed out — file is too large for direct read. "
+                f"Use code_eval instead:\n"
+                f'{{"tool":"code_eval","task":"describe what to compute","paths":["{_err_path}"],"context_vars":{{}}}}'
+            )
+            print(f"{CLI_YELLOW}[read-timeout] Injecting code_eval hint for {_err_path}{CLI_CLR}")
+            st.log.append({"role": "user", "content": _timeout_hint})
 
     if isinstance(job.function, ReportTaskCompletion):
         status = CLI_GREEN if job.function.outcome == "OUTCOME_OK" else CLI_YELLOW

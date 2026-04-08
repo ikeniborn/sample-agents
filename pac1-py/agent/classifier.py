@@ -224,11 +224,14 @@ def classify_task_llm(task_text: str, model: str, model_config: dict,
 
     Returns one of the TASK_* literals defined in this module.
     """
-    # Regex pre-check fast-path: if regex is already confident, skip the LLM call.
-    # Explicit keywords (distill, analyze, all-files, batch) are unambiguous;
-    # LLM is only useful when regex returns 'default' and vault context might change the outcome.
+    # Regex pre-check fast-path: only skip LLM for lexically unambiguous types.
+    # LONG_CONTEXT (bulk/all-files) and EMAIL (send+recipient+subject) are unambiguous.
+    # THINK/DISTILL/LOOKUP/INBOX use generic verbs (review, analyze, check) that appear
+    # in many contexts — vault semantics (AGENTS.MD) can change the classification,
+    # so LLM must be consulted. FIX-265c: narrowed from != TASK_DEFAULT to high-conf only.
+    _HIGH_CONF_TYPES = frozenset({TASK_LONG_CONTEXT, TASK_EMAIL})
     _regex_pre = classify_task(task_text)
-    if _regex_pre != TASK_DEFAULT:
+    if _regex_pre in _HIGH_CONF_TYPES:
         print(f"[MODEL_ROUTER] Regex-confident type={_regex_pre!r}, skipping LLM")
         return _regex_pre
     user_msg = f"Task: {task_text[:150]}"  # truncate to 150 chars to avoid injection content
@@ -297,6 +300,8 @@ class ModelRouter:
     coder: str = ""
     # FIX-218: evaluator/critic model
     evaluator: str = ""
+    # FIX-NNN: prompt builder model (default: uses classifier model)
+    prompt_builder: str = ""
     configs: dict[str, dict] = field(default_factory=dict)
 
     def _select_model(self, task_type: str) -> str:

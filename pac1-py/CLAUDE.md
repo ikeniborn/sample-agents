@@ -77,7 +77,18 @@ Three signals, all task-agnostic:
 
 Resets on any successful write/delete/move/mkdir.
 
-### Prompt strategy (`agent/prompt.py`)
+### Prompt strategy (`agent/prompt.py`, `agent/prompt_builder.py`)
+
+**Dynamic system prompt** (FIX-NNN): assembled from task-type specific blocks.
+`build_system_prompt(task_type)` selects relevant sections only:
+- `email` → core + email workflow + delete workflow
+- `inbox` → core + inbox workflow + delete workflow
+- `lookup` / `think` / `distill` → core only
+- `longContext` → core + delete workflow
+- `default` → full prompt (all blocks, safe fallback)
+
+Optional LLM addendum via `prompt_builder.py` (`PROMPT_BUILDER_ENABLED=1`):
+activated for `default`/`think`/`longContext` types only.
 
 **Discovery-first**: zero hardcoded vault paths. Agent discovers folder roles from:
 1. Pre-loaded AGENTS.MD (from prephase)
@@ -120,6 +131,9 @@ Key env vars:
 - `EVAL_EFFICIENCY` — evaluator context depth: `low`, `mid` (default), `high`
 - `EVAL_MAX_REJECTIONS` — max evaluator rejections before forced approval (default: `2`)
 - `ROUTER_MAX_RETRIES` — max retry attempts for router empty response (default: `2`)
+- `PROMPT_BUILDER_ENABLED` — enable dynamic prompt addendum: `1` = on, `0` = off (default: `0`)
+- `MODEL_PROMPT_BUILDER` — model for prompt builder (default: uses `MODEL_CLASSIFIER`)
+- `PROMPT_BUILDER_MAX_TOKENS` — token budget for addendum (default: `300`)
 
 Per-model config defined in `main.py` `MODEL_CONFIGS` dict:
 - `max_completion_tokens`, `thinking_budget`, `response_format_hint`

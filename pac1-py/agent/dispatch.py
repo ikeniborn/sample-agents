@@ -95,16 +95,20 @@ def _execute_code_safe(code: str, context_vars: dict, timeout_s: int = 5) -> str
     def _alarm(_sig, _frame):
         raise TimeoutError("code_eval timeout")
 
-    # FIX-231: strip "import X" lines for pre-loaded modules — models write these despite
-    # the sandbox already providing datetime/json/re/math; __import__ is not in _SAFE_BUILTINS
+    # Strip ALL import statements — sandbox provides datetime/json/re/math directly;
+    # other modules (os, sys, collections…) are not in _SAFE_BUILTINS and would cause
+    # ImportError via __import__. Stripping is always safe: pre-loaded modules still work,
+    # disallowed modules will cause NameError (clearer than ImportError: __import__ not found).
     import re as _re_strip
-    code = _re_strip.sub(
-        r'^\s*import\s+(datetime|json|re|math)\b[^\n]*\n?', '',
-        code, flags=_re_strip.MULTILINE,
-    )
+    code = _re_strip.sub(r'^\s*import\s+[^\n]+\n?', '', code, flags=_re_strip.MULTILINE)
+    code = _re_strip.sub(r'^\s*from\s+\S+\s+import\s+[^\n]+\n?', '', code, flags=_re_strip.MULTILINE)
 
-    old_handler = signal.signal(signal.SIGALRM, _alarm)
-    signal.alarm(timeout_s)
+    # signal.alarm only works in the main thread; skip timeout in worker threads
+    _in_main = threading.current_thread() is threading.main_thread()
+    old_handler = None
+    if _in_main:
+        old_handler = signal.signal(signal.SIGALRM, _alarm)
+        signal.alarm(timeout_s)
     old_stdout = _sys.stdout
     try:
         _sys.stdout = buf
@@ -116,8 +120,9 @@ def _execute_code_safe(code: str, context_vars: dict, timeout_s: int = 5) -> str
         return f"[error] {type(e).__name__}: {e}"
     finally:
         _sys.stdout = old_stdout
-        signal.alarm(0)
-        signal.signal(signal.SIGALRM, old_handler)
+        if _in_main:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, old_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -139,24 +144,39 @@ def _call_coder_model(task: str, context_vars: dict, coder_model: str, coder_cfg
     Hard timeout: _CODER_TIMEOUT_S seconds (FIX-164)."""
     import signal as _signal
 
+    _var_names = list(context_vars.keys())
     system = (
-        "You are a Python 3 code generator. Output ONLY runnable Python code — "
-        "no markdown fences, no explanation.\n"
-        "Rules:\n"
-        "- Modules datetime/json/re/math are pre-loaded — use directly, NO import statements\n"
-        "- context_vars are injected as local variables — access by name (e.g. print(len(data)))\n"
+        "You are a Python 3 code generator for a restricted sandbox. Output ONLY runnable Python code "
+        "— no markdown fences, no explanation.\n"
+        "Sandbox rules:\n"
+        "- Modules available: datetime, json, re, math — use directly, NO import statements\n"
+        "- context_vars are injected as GLOBAL VARIABLES — reference them by their exact name\n"
+        "- FORBIDDEN: eval(), exec(), globals(), locals(), open(), __import__, any import statement\n"
+        "- To process multiple variables, put their names in a list literal — do NOT use eval:\n"
+        "    for content in [var1, var2, var3]:  # reference variable names directly\n"
+        "        data = json.loads(content)\n"
         "- Print the final answer with print()\n"
-        "Example task: 'count entries in list'\n"
-        "Example context_vars keys: ['data']\n"
-        "Example output: print(len(data))"
+        "Example task: find accounts where account_manager == 'Alice'\n"
+        "Example variables: ['accounts__acct_001_json', 'accounts__acct_002_json']\n"
+        "Example output:\n"
+        "results = []\n"
+        "for content in [accounts__acct_001_json, accounts__acct_002_json]:\n"
+        "    d = json.loads(content)\n"
+        "    if d.get('account_manager') == 'Alice':\n"
+        "        results.append(d['name'])\n"
+        "print('\\n'.join(sorted(results)))"
     )
-    user_msg = f"Task: {task}\nAvailable variables: {list(context_vars.keys())}"
+    user_msg = f"Task: {task}\nAvailable variables: {_var_names}"
 
     def _coder_timeout(_sig, _frame):
         raise TimeoutError(f"coder model timed out after {_CODER_TIMEOUT_S}s")
 
-    old_handler = _signal.signal(_signal.SIGALRM, _coder_timeout)
-    _signal.alarm(_CODER_TIMEOUT_S)
+    # signal.alarm only works in the main thread; skip timeout in worker threads
+    _in_main = threading.current_thread() is threading.main_thread()
+    old_handler = None
+    if _in_main:
+        old_handler = _signal.signal(_signal.SIGALRM, _coder_timeout)
+        _signal.alarm(_CODER_TIMEOUT_S)
     try:
         raw = call_llm_raw(
             system=system,
@@ -173,8 +193,9 @@ def _call_coder_model(task: str, context_vars: dict, coder_model: str, coder_cfg
         print(f"\033[33m[coder] {_te} — returning error stub\033[0m")
         return "print('[error] coder model timeout')"
     finally:
-        _signal.alarm(0)
-        _signal.signal(_signal.SIGALRM, old_handler)
+        if _in_main:
+            _signal.alarm(0)
+            _signal.signal(_signal.SIGALRM, old_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -372,6 +393,24 @@ def is_ollama_model(model: str) -> bool:
     return ":" in model and "/" not in model
 
 
+_VALID_PROVIDERS = frozenset({"anthropic", "openrouter", "ollama"})
+
+
+def get_provider(model: str, cfg: dict) -> str:
+    """Determine LLM provider for a model call.
+    Explicit cfg['provider'] wins; falls back to name heuristics for backward compat.
+    Values: 'anthropic' | 'openrouter' | 'ollama'."""
+    explicit = cfg.get("provider", "")
+    if explicit in _VALID_PROVIDERS:
+        return explicit
+    # Heuristic fallback — existing models follow naming conventions
+    if is_claude_model(model):
+        return "anthropic"
+    if is_ollama_model(model):
+        return "ollama"
+    return "openrouter"
+
+
 def call_llm_raw(
     system: str,
     user_msg: str,
@@ -381,6 +420,7 @@ def call_llm_raw(
     think: bool | None = None,  # None=use cfg, False=disable, True=enable
     max_retries: int = 3,  # classifier passes 0 → 1 attempt, no retries
     plain_text: bool = False,  # FIX-181: skip response_format (for code generation, not JSON)
+    token_out: dict | None = None,  # if provided, populated with {"input": N, "output": N}
 ) -> str | None:
     """Lightweight LLM call with 3-tier routing and transient-error retry.
     Returns raw text (think blocks stripped), or None if all tiers fail.
@@ -399,9 +439,11 @@ def call_llm_raw(
     if isinstance(_opts, dict):
         _seed = _opts.get("seed")
 
+    _provider = get_provider(model, cfg)
+
     # --- Tier 1: Anthropic SDK ---
     # FIX-197: Anthropic SDK has no seed param; temperature from cfg (FIX-187) is the best determinism lever
-    if is_claude_model(model) and anthropic_client is not None:
+    if _provider == "anthropic" and anthropic_client is not None:
         ant_model = get_anthropic_model_id(model)
         for attempt in range(max_retries + 1):
             try:
@@ -418,6 +460,9 @@ def call_llm_raw(
                 # Iterate blocks — take first type="text" (skip thinking blocks)
                 for block in resp.content:
                     if getattr(block, "type", None) == "text" and block.text.strip():
+                        if token_out is not None:
+                            token_out["input"] = getattr(resp.usage, "input_tokens", 0)
+                            token_out["output"] = getattr(resp.usage, "output_tokens", 0)
                         return block.text.strip()
                 if attempt < max_retries:
                     print(f"[Anthropic] Empty response (attempt {attempt + 1}) — retrying")
@@ -432,8 +477,8 @@ def call_llm_raw(
                 print(f"[Anthropic] Error: {e}")
                 break
 
-    # --- Tier 2: OpenRouter (skip Ollama-format models) ---
-    if openrouter_client is not None and not is_ollama_model(model):
+    # --- Tier 2: OpenRouter (skip Ollama models) ---
+    if openrouter_client is not None and _provider != "ollama":
         so_mode = probe_structured_output(openrouter_client, model, hint=cfg.get("response_format_hint"))
         rf = {"type": "json_object"} if (so_mode == "json_object" and not plain_text) else None  # FIX-181
         for attempt in range(max_retries + 1):
@@ -462,6 +507,10 @@ def call_llm_raw(
                         continue
                     print("[OpenRouter] Empty after all retries — falling through to next tier")
                     break  # do not return "" — let next tier try
+                if token_out is not None:
+                    _u = resp.usage
+                    token_out["input"] = getattr(_u, "prompt_tokens", 0)
+                    token_out["output"] = getattr(_u, "completion_tokens", 0)
                 return raw
             except Exception as e:
                 if any(kw.lower() in str(e).lower() for kw in TRANSIENT_KWS) and attempt < max_retries:
@@ -506,6 +555,10 @@ def call_llm_raw(
                     continue
                 print("[Ollama] Empty after all retries — returning None")
                 break  # do not return "" — fall through to return None
+            if token_out is not None:
+                _u = resp.usage
+                token_out["input"] = getattr(_u, "prompt_tokens", 0)
+                token_out["output"] = getattr(_u, "completion_tokens", 0)
             return raw
         except Exception as e:
             if any(kw.lower() in str(e).lower() for kw in TRANSIENT_KWS) and attempt < max_retries:
@@ -529,6 +582,10 @@ def call_llm_raw(
         raw = _THINK_RE.sub("", _content).strip()
         if raw:
             print(f"[Ollama] Plain-text retry succeeded: {raw[:60]!r}")
+            if token_out is not None:
+                _u = resp.usage
+                token_out["input"] = getattr(_u, "prompt_tokens", 0)
+                token_out["output"] = getattr(_u, "completion_tokens", 0)
             return raw
     except Exception as e:
         print(f"[Ollama] Plain-text retry failed: {e}")

@@ -1,6 +1,7 @@
 {
   "_comment": "Model capability configs. Key = model ID as used in env vars. Loaded by main.py at startup.",
   "_fields": {
+    "provider": "Explicit provider: 'anthropic' | 'openrouter' | 'ollama'. If omitted, inferred from model name (name:tag → ollama, anthropic/... or claude → anthropic, else openrouter).",
     "max_completion_tokens": "Max tokens the model may generate per step",
     "thinking_budget": "Token budget for extended thinking (Anthropic only); omit to disable",
     "response_format_hint": "Hint for OpenRouter tier: 'json_object' or 'json_schema'",
@@ -67,6 +68,7 @@
   },
   "_section_ollama_cloud": "--- Ollama cloud endpoint (OLLAMA_BASE_URL=https://your-cloud/v1) ---",
   "minimax-m2.7:cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -77,6 +79,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "qwen3.5:cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": true,
     "ollama_options": "default",
@@ -87,6 +90,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "qwen3.5:397b-cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": true,
     "ollama_options": "default",
@@ -97,6 +101,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "ministral-3:3b-cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -107,6 +112,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "ministral-3:8b-cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -117,6 +123,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "ministral-3:14b-cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -127,6 +134,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "nemotron-3-super:cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -137,6 +145,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "nemotron-3-nano:30b-cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -147,6 +156,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "glm-5:cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -157,6 +167,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "kimi-k2.5:cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -167,6 +178,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "kimi-k2-thinking:cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": true,
     "ollama_options": "default",
@@ -177,6 +189,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "gpt-oss:20b-cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -187,6 +200,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "gpt-oss:120b-cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -197,6 +211,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "deepseek-v3.1:671b-cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": true,
     "ollama_options": "default",
@@ -207,6 +222,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "rnj-1:8b-cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -217,6 +233,7 @@
     "ollama_options_evaluator": "evaluator"
   },
   "gemma4:31b-cloud": {
+    "provider": "ollama",
     "max_completion_tokens": 4000,
     "ollama_think": false,
     "ollama_options": "default",
@@ -228,27 +245,32 @@
   },
   "_section_anthropic": "--- Anthropic SDK ---",
   "anthropic/claude-haiku-4.5": {
+    "provider": "anthropic",
     "max_completion_tokens": 16384,
     "thinking_budget": 2000,
     "response_format_hint": "json_object"
   },
-  "anthropic/claude-sonnet-4.6": {
-    "max_completion_tokens": 16384,
-    "thinking_budget": 4000,
-    "response_format_hint": "json_object"
-  },
   "anthropic/claude-opus-4.6": {
+    "provider": "anthropic",
     "max_completion_tokens": 16384,
     "thinking_budget": 8000,
     "response_format_hint": "json_object"
   },
   "_section_openrouter": "--- OpenRouter ---",
   "qwen/qwen3.5-9b": {
+    "provider": "openrouter",
     "max_completion_tokens": 4000,
     "response_format_hint": "json_object",
     "temperature": 0.35
   },
   "meta-llama/llama-3.3-70b-instruct": {
+    "provider": "openrouter",
+    "max_completion_tokens": 4000,
+    "response_format_hint": "json_object",
+    "temperature": 0.35
+  },
+  "anthropic/claude-sonnet-4.6": {
+    "provider": "openrouter",
     "max_completion_tokens": 4000,
     "response_format_hint": "json_object",
     "temperature": 0.35

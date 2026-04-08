@@ -32,6 +32,8 @@ class PrephaseResult:
     # Inbox files loaded during prephase: list of (path, content) sorted alphabetically.
     # Used by _run_pre_route for preloop injection check before the main loop starts.
     inbox_files: list = field(default_factory=list)
+    # Vault tree text from step 1 — passed to prompt_builder for task-specific guidance.
+    vault_tree_text: str = ""
 
 
 def _format_tree_entry(entry, prefix: str = "", is_last: bool = True) -> list[str]:
@@ -181,9 +183,30 @@ def run_prephase(
                         if _LOG_LEVEL == "DEBUG":
                             print(f"{CLI_BLUE}[prephase] {child_path} content:\n{file_r.content}{CLI_CLR}")
                         continue
+                    # [FIX-244] Empty content = file too large for preload read.
+                    # Do NOT fall through to _read_dir — that would try to list the file as a
+                    # directory and produce a confusing "path must reference a folder" error.
+                    # Instead, annotate so the agent knows to use code_eval / read directly.
+                    docs_content_parts.append(
+                        f"--- {child_path} ---\n"
+                        f"[FILE TOO LARGE FOR PRELOAD — use code_eval to count/query or read directly]"
+                    )
+                    print(f"{CLI_YELLOW}[prephase] {child_path}: empty content (too large), annotated{CLI_CLR}")
+                    continue
                 except Exception:
                     pass
-                # No content → treat as subdirectory, recurse
+                # [FIX-244] Exception on read (e.g. timeout for large files) —
+                # if entry has a file extension it's a file, not a directory.
+                # Annotate so agent uses code_eval; do NOT recurse (_read_dir would
+                # call vm.list on a file path and log "path must reference a folder").
+                if "." in entry.name:
+                    docs_content_parts.append(
+                        f"--- {child_path} ---\n"
+                        f"[FILE UNREADABLE (read error/timeout) — use code_eval to count/query or read directly]"
+                    )
+                    print(f"{CLI_YELLOW}[prephase] {child_path}: read error (timeout?), annotated{CLI_CLR}")
+                    continue
+                # No file extension → treat as subdirectory, recurse
                 _read_dir(child_path, seen)
 
         for dir_name in to_preload:
@@ -235,4 +258,5 @@ def run_prephase(
         agents_md_content=agents_md_content,
         agents_md_path=agents_md_path,
         inbox_files=sorted(inbox_files, key=lambda x: x[0]),
+        vault_tree_text=tree_txt,
     )
