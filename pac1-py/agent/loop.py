@@ -1544,7 +1544,11 @@ def _post_dispatch(
                 print(f"{CLI_RED}{_sec_hint}{CLI_CLR}")
                 st.log.append({"role": "user", "content": _sec_hint})
                 st._security_interceptor_fired = True  # FIX-253
-            elif task_type == TASK_INBOX and not _FORMAT_GATE_RE.search(_gate_body):
+            # FIX-275: skip format-gate for README/template files (false positive on inbox/README.md)
+            elif (task_type == TASK_INBOX
+                  and not _FORMAT_GATE_RE.search(_gate_body)
+                  and not _inbox_fname.startswith("readme")
+                  and not _inbox_fname.startswith("_")):
                 _gate_hint = (
                     "[format-gate] Message has no From: or Channel: header. "
                     "Report OUTCOME_NONE_CLARIFICATION immediately — do not process."
