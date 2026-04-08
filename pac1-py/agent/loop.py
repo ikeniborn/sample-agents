@@ -276,6 +276,8 @@ class _LoopState:
     # FIX-252: cross-account detection for inbox tasks
     _inbox_sender_acct_id: str = ""
     _inbox_cross_account_detected: bool = False
+    # FIX-276: email inbox flag — From: header without Channel: header
+    _inbox_is_email: bool = False
     # FIX-251: pre-write JSON snapshot for unicode fidelity check
     _pre_write_snapshot: dict | None = None
     # FIX-259: format-gate fired flag — hard-enforces CLARIFICATION outcome + evaluator bypass
@@ -358,6 +360,12 @@ def _extract_fact(action_name: str, action, result_txt: str) -> "_StepFact | Non
     if action_name == "Req_MkDir":
         summary = result_txt[:80] if _is_err else f"CREATED DIR: {path}"
         return _StepFact("mkdir", path, summary, error=_err_detail)
+
+    # FIX-276: code_eval — track paths for auto-grounding
+    if action_name == "Req_CodeEval":
+        paths = getattr(action, "paths", []) or []
+        summary = f"code_eval: {result_txt[:80]}"
+        return _StepFact("code_eval", ",".join(paths), summary)
 
     return None
 
@@ -940,6 +948,14 @@ def _check_stall(
             _explored += f" Listed: {_listed}."
         if _read_f:
             _explored += f" Read: {_read_f}."
+        # FIX-276: escalation after 12+ steps — force code_eval or report
+        if steps_since_write >= 12:
+            return (
+                f"[STALL ESCALATION] You have been exploring for {steps_since_write} steps without action.{_explored} "
+                "Either: (1) Use code_eval to analyze data and determine the answer/fix, or "
+                "(2) Report OUTCOME_NONE_CLARIFICATION if you cannot determine what to do. "
+                "Do NOT continue reading the same files."
+            )
         return (
             f"You have taken {steps_since_write} steps without writing, deleting, moving, or creating anything.{_explored} "
             "Either take a concrete action now (write/delete/move/mkdir) "
@@ -1389,6 +1405,13 @@ def _run_pre_route(
             if _route_val == "UNSUPPORTED" and _RESCHEDULE_RE.search(task_text):
                 print(f"{CLI_YELLOW}[router] Override UNSUPPORTED → EXECUTE for reschedule/follow-up task{CLI_CLR}")
                 _route_val = "EXECUTE"
+            # FIX-276: date arithmetic tasks use code_eval with datetime — never UNSUPPORTED
+            if _route_val == "UNSUPPORTED" and re.search(
+                r"\b(\d+\s*days?\b|what\s+date|YYYY-MM-DD|days?\s+ago|days?\s+from)",
+                task_text, re.IGNORECASE,
+            ):
+                print(f"{CLI_YELLOW}[router] Override UNSUPPORTED → EXECUTE for date arithmetic task{CLI_CLR}")
+                _route_val = "EXECUTE"
             if _route_val in _outcome_map:
                 if _route_val == "DENY_SECURITY":
                     print(f"{CLI_RED}[router] DENY_SECURITY — aborting before main loop{CLI_CLR}")
@@ -1491,7 +1514,8 @@ def _post_dispatch(
             except Exception:
                 pass  # fail-open: seq.json management failure should not block agent
             # FIX-252: cross-account outbox write reinforcement
-            if task_type == TASK_INBOX and st._inbox_cross_account_detected:
+            # FIX-276: admin multi-contact is NOT cross-account — skip reinforcement for admin
+            if task_type == TASK_INBOX and st._inbox_cross_account_detected and not getattr(st, "_inbox_is_admin", False):
                 _xacct_hint = (
                     "[security] You are writing an outbox email for a CROSS-ACCOUNT operation. "
                     "This is a security violation. Report OUTCOME_DENIED_SECURITY immediately."
@@ -1563,6 +1587,11 @@ def _post_dispatch(
                     _from_match = re.search(r'[\w.+-]+@([\w.-]+)', _gate_body)
                 if _from_match:
                     st._inbox_sender_domain = _from_match.group(1).lower()  # type: ignore[attr-defined]
+                # FIX-276: detect email inbox (From: header without Channel:)
+                _has_from = bool(re.search(r'^From:', _gate_body, re.MULTILINE))
+                _has_channel = bool(re.search(r'^Channel:', _gate_body, re.MULTILINE))
+                if _has_from and not _has_channel:
+                    st._inbox_is_email = True
                 # FIX-243: detect OTP token in inbox message for delete reminder
                 if re.search(r'\bOTP:\s*\S+', _gate_body):
                     st._otp_matched = True  # type: ignore[attr-defined]
@@ -1977,6 +2006,19 @@ def _pre_dispatch(
             except json.JSONDecodeError:
                 pass  # unfixable, let _verify_json_write handle it
 
+    # Guard: FIX-276 — block outbox write if email inbox cross-account entity mismatch detected
+    if (isinstance(job.function, Req_Write)
+            and "outbox/" in (job.function.path or "")
+            and task_type == TASK_INBOX
+            and getattr(st, "_inbox_is_email", False)
+            and getattr(st, "_inbox_cross_account_detected", False)):
+        print(f"{CLI_RED}[FIX-276] Blocked outbox write — email entity mismatch{CLI_CLR}")
+        return (
+            "[security] BLOCKED: Cannot write outbox email — cross-account entity mismatch detected. "
+            "The inbox message describes a different entity than the sender's account. "
+            "Report OUTCOME_DENIED_SECURITY immediately. Zero mutations."
+        )
+
     # Guard: FIX-247 — delete-only tasks must not write (benchmark counts writes as unexpected)
     _DELETE_ONLY_RE = re.compile(r'\b(remove\s+all|delete\s+all|clear\s+all|wipe\s+all)\b', re.IGNORECASE)
     if (isinstance(job.function, Req_Write)
@@ -2286,6 +2328,15 @@ def _run_step(
             if f.kind == "read" and f.path
             and any(d in f.path for d in ("accounts/", "my-invoices/"))
         ))
+        # FIX-276: code_eval paths also count as "opened" for grounding
+        for _f in st.step_facts:
+            if _f.kind == "code_eval" and _f.path:
+                for _p in _f.path.split(","):
+                    _p = _p.strip().lstrip("/")
+                    if _p and "contacts/" in _p and _p not in _contacts_refs:
+                        _contacts_refs.append(_p)
+                    elif _p and any(d in _p for d in ("accounts/", "my-invoices/")) and _p not in _other_refs:
+                        _other_refs.append(_p)
         _auto_refs = list(dict.fromkeys(_contacts_refs + _other_refs))[:10]
         # FIX-266b: if contact was read and account_id known, ensure accounts/ file is in refs
         _known_acct_id = getattr(st, "_inbox_contact_account_id", "")
@@ -2349,6 +2400,9 @@ def _run_step(
             _eval_bypass = True
         # Inbox admin-verified: code detected admin handle from channel file
         if task_type == TASK_INBOX and getattr(st, "_inbox_is_admin", False):
+            _eval_bypass = True
+        # FIX-276: email inbox tasks verified by domain match — evaluator often misapplies channel rules
+        if task_type == TASK_INBOX and getattr(st, "_inbox_is_email", False):
             _eval_bypass = True
         # FIX-266: email/CLARIFICATION when contact search returned 0 results — evaluator
         # false-positives on "clear action + target" rule when target doesn't exist in vault
