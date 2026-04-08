@@ -21,16 +21,14 @@ runner.py
 ## Запуск
 
 ```bash
-# Из директории cc-agent/
-# (зависимости берутся из pac1-py/pyproject.toml через PYTHONPATH)
-
-cd cc-agent
+# Зависимости — из pac1-py (uv sync если не установлены)
+cd pac1-py && uv sync
 
 # Все задания
-python runner.py
+uv run python ../cc-agent/runner.py
 
 # Конкретные задания
-python runner.py t01 t03
+uv run python ../cc-agent/runner.py t01 t03
 ```
 
 Переменные окружения те же, что у pac1-py (читаются из `pac1-py/.env` и `pac1-py/.secrets`):
@@ -44,7 +42,7 @@ python runner.py t01 t03
 2. На каждое задание:
    - `start_playground` → получает `harness_url` и `instruction`
    - Записывает temp JSON с MCP конфигом: `{"mcpServers": {"pcm": {..., "env": {"HARNESS_URL": "..."}}}}`
-   - Запускает `claude --print --mcp-config <cfg> -p "<instruction>"`
+   - Запускает `iclaude --no-save --print --mcp-config <cfg> -p "<instruction>"`
    - Claude Code думает и вызывает MCP tools (tree/list/read/write/...)
    - `mcp_pcm.py` (subprocess, stdio) транслирует вызовы в PCM API
    - Когда задание выполнено, Claude вызывает `report_completion`

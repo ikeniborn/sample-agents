@@ -106,9 +106,9 @@ def run_task(client: HarnessServiceClientSync, task_id: str) -> dict:
     try:
         result = subprocess.run(
             [
-                "claude",
+                "iclaude",
+                "--no-save",
                 "--print",
-                "--dangerously-skip-permissions",
                 "--strict-mcp-config",
                 "--mcp-config", cfg_path,
                 "--system-prompt", SYSTEM_PROMPT,
