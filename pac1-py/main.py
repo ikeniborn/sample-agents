@@ -98,7 +98,11 @@ _setup_log_tee()
 
 
 from bitgn.harness_connect import HarnessServiceClientSync
-from bitgn.harness_pb2 import EndTrialRequest, EvalPolicy, GetBenchmarkRequest, StartPlaygroundRequest, StatusRequest
+from bitgn.harness_pb2 import (
+    EndTrialRequest, EvalPolicy, GetBenchmarkRequest,
+    StartRunRequest, StartTrialRequest,
+    StatusRequest, SubmitRunRequest,
+)
 from connectrpc.errors import ConnectError
 
 from agent import run_agent
@@ -106,6 +110,8 @@ from agent.classifier import ModelRouter
 
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/pac1-dev"
+BITGN_API_KEY = os.getenv("BITGN_API_KEY") or ""
+BITGN_RUN_NAME = os.getenv("BITGN_RUN_NAME") or ""
 PARALLEL_TASKS = max(1, int(os.getenv("PARALLEL_TASKS", "1")))
 
 _MODELS_JSON = Path(__file__).parent / "models.json"
@@ -174,18 +180,22 @@ CLI_CLR = "\x1B[0m"
 CLI_BLUE = "\x1B[34m"
 
 
-def _run_single_task(task, router: ModelRouter, benchmark_id: str) -> tuple:
-    """Execute one benchmark task in its own thread with a dedicated harness client."""
-    _task_local.task_id = task.task_id  # stdout prefix for this thread
+def _run_single_task(trial_id: str, task_filter: list, router: ModelRouter) -> tuple:
+    """Execute one benchmark trial in its own thread with a dedicated harness client."""
+    client = HarnessServiceClientSync(BITGN_URL)
+    trial = client.start_trial(StartTrialRequest(trial_id=trial_id))
+    task_id = trial.task_id
+
+    if task_filter and task_id not in task_filter:
+        # Skip filtered-out tasks — do not end trial; submit_run(force=True) handles cleanup
+        return (task_id, -1, [], 0.0, {})
+
+    _task_local.task_id = task_id  # stdout prefix for this thread
     assert _run_dir is not None, "_run_dir not initialised by _setup_log_tee"
-    _task_local.log_fh = open(_run_dir / f"{task.task_id}.log", "w", buffering=1, encoding="utf-8")
+    _task_local.log_fh = open(_run_dir / f"{task_id}.log", "w", buffering=1, encoding="utf-8")
     try:
-        client = HarnessServiceClientSync(BITGN_URL)
         task_start = time.time()
-        trial = client.start_playground(
-            StartPlaygroundRequest(benchmark_id=benchmark_id, task_id=task.task_id)
-        )
-        print(f"\n{'=' * 30} Starting task: {task.task_id} {'=' * 30}")
+        print(f"\n{'=' * 30} Starting task: {task_id} {'=' * 30}")
         print(f"{CLI_BLUE}{trial.instruction}{CLI_CLR}\n{'-' * 80}")
         token_stats: dict = {"input_tokens": 0, "output_tokens": 0}
         try:
@@ -205,14 +215,14 @@ def _run_single_task(task, router: ModelRouter, benchmark_id: str) -> tuple:
         m_short = (token_stats.get("model_used") or "—").split("/")[-1]
         detail_str = "\n" + textwrap.indent("\n".join(detail), "  ") if detail else ""
         print(
-            f"{style}[{task.task_id}] Score: {score:0.2f}"
+            f"{style}[{task_id}] Score: {score:0.2f}"
             f" | {task_elapsed:.1f}s"
             f" | {steps}st {calls}rq"
             f" | in {in_t:,} / out {out_t:,} tok"
             f" | {t_type} | {m_short}"
             f"{detail_str}{CLI_CLR}"
         )
-        return (task.task_id, score, detail, task_elapsed, token_stats)
+        return (task_id, score, detail, task_elapsed, token_stats)
     finally:
         fh = _task_local.log_fh
         _task_local.log_fh = None
@@ -336,7 +346,7 @@ def _write_summary(scores: list, run_start: float) -> None:
 
 
 def main() -> None:
-    task_filter = os.sys.argv[1:]
+    task_filter = sys.argv[1:]
 
     scores = []
     scores_lock = threading.Lock()
@@ -350,24 +360,34 @@ def main() -> None:
             f"with {len(res.tasks)} tasks.\n{CLI_GREEN}{res.description}{CLI_CLR}"
         )
 
-        tasks_to_run = [t for t in res.tasks if not task_filter or t.task_id in task_filter]
-        _print_table_header()
-        with ThreadPoolExecutor(max_workers=PARALLEL_TASKS) as pool:
-            futures = {
-                pool.submit(_run_single_task, t, EFFECTIVE_MODEL, BENCHMARK_ID): t
-                for t in tasks_to_run
-            }
-            for fut in as_completed(futures):
-                try:
-                    task_id, score, detail, task_elapsed, token_stats = fut.result()
-                except Exception as exc:
-                    failed_task = futures[fut]
-                    print(f"{CLI_RED}[{failed_task.task_id}] Task error: {exc}{CLI_CLR}")
-                    continue
-                if score >= 0:
-                    with scores_lock:
-                        scores.append((task_id, score, detail, task_elapsed, token_stats))
-                    _print_table_row(task_id, score, detail, task_elapsed, token_stats)
+        run = client.start_run(StartRunRequest(
+            name=BITGN_RUN_NAME,
+            benchmark_id=BENCHMARK_ID,
+            api_key=BITGN_API_KEY,
+        ))
+        print(f"Run started: {run.run_id} ({len(run.trial_ids)} trials)")
+
+        try:
+            _print_table_header()
+            with ThreadPoolExecutor(max_workers=PARALLEL_TASKS) as pool:
+                futures = {
+                    pool.submit(_run_single_task, tid, task_filter, EFFECTIVE_MODEL): tid
+                    for tid in run.trial_ids
+                }
+                for fut in as_completed(futures):
+                    try:
+                        task_id, score, detail, task_elapsed, token_stats = fut.result()
+                    except Exception as exc:
+                        failed_tid = futures[fut]
+                        print(f"{CLI_RED}[{failed_tid}] Task error: {exc}{CLI_CLR}")
+                        continue
+                    if score >= 0:
+                        with scores_lock:
+                            scores.append((task_id, score, detail, task_elapsed, token_stats))
+                        _print_table_row(task_id, score, detail, task_elapsed, token_stats)
+        finally:
+            client.submit_run(SubmitRunRequest(run_id=run.run_id, force=True))
+            print(f"Run submitted: {run.run_id}")
 
     except ConnectError as exc:
         print(f"{exc.code}: {exc.message}")

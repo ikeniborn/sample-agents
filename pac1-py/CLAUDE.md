@@ -8,6 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Do NOT modify `.secrets`
 - Do NOT hardcode — work through logic when extending agent behavior
 - Never edit pac1-py/.env and pac1-py/.secrets
+- Start agent only from dev git branch
 
 ## Commands
 

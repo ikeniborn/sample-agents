@@ -11,7 +11,7 @@ from .prompt import build_system_prompt
 from .prompt_builder import build_dynamic_addendum
 
 _PROMPT_BUILDER_ENABLED = os.getenv("PROMPT_BUILDER_ENABLED", "0") == "1"
-_PROMPT_BUILDER_MAX_TOKENS = int(os.getenv("PROMPT_BUILDER_MAX_TOKENS", "300"))
+_PROMPT_BUILDER_MAX_TOKENS = int(os.getenv("PROMPT_BUILDER_MAX_TOKENS", "2000"))
 
 
 def run_agent(router: ModelRouter, harness_url: str, task_text: str) -> dict:

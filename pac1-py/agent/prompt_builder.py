@@ -70,7 +70,7 @@ def build_dynamic_addendum(
     vault_tree: str,
     model: str,
     cfg: dict,
-    max_tokens: int = 300,
+    max_tokens: int = 2000,
 ) -> tuple[str, int, int]:
     """Return (addendum, in_tokens, out_tokens). addendum='' if skipped or failed.
 
@@ -92,7 +92,7 @@ def build_dynamic_addendum(
     user_msg = (
         f"TASK_TYPE: {task_type}\n"
         f"TASK: {task_text}\n"
-        f"VAULT TREE:\n{vault_tree[:600]}\n"
+        f"VAULT TREE:\n{vault_tree}\n"
     )
     if agents_md:
         user_msg += f"\nAGENTS.MD:\n{agents_md}"

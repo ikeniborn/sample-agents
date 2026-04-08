@@ -274,5 +274,17 @@
     "max_completion_tokens": 4000,
     "response_format_hint": "json_object",
     "temperature": 0.35
+  },
+  "anthropic/claude-haiku-4.5": {
+    "provider": "openrouter",
+    "max_completion_tokens": 4000,
+    "response_format_hint": "json_object",
+    "temperature": 0.35
+  },
+  "anthropic/claude-opus-4.6": {
+    "provider": "openrouter",
+    "max_completion_tokens": 4000,
+    "response_format_hint": "json_object",
+    "temperature": 0.35
   }
 }

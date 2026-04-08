@@ -12,7 +12,10 @@ service HarnessService {
   rpc Status(StatusRequest) returns (StatusResponse);
   rpc GetBenchmark(GetBenchmarkRequest) returns (GetBenchmarkResponse);
   rpc StartPlayground(StartPlaygroundRequest) returns (StartPlaygroundResponse);
+  rpc StartRun(StartRunRequest) returns (StartRunResponse);
+  rpc StartTrial(StartTrialRequest) returns (StartTrialResponse);
   rpc EndTrial(EndTrialRequest) returns (EndTrialResponse);
+  rpc SubmitRun(SubmitRunRequest) returns (SubmitRunResponse);
 }
 
 message StatusRequest {}
@@ -51,6 +54,28 @@ message StartPlaygroundResponse {
   string trial_id = 3;
 }
 
+message StartRunRequest {
+  string name = 1;
+  string benchmark_id = 2;
+  string api_key = 3;
+}
+
+message StartRunResponse {
+  string run_id = 1;
+  repeated string trial_ids = 2;
+}
+
+message StartTrialRequest {
+  string trial_id = 1;
+}
+
+message StartTrialResponse {
+  string harness_url = 1;
+  string instruction = 2;
+  string trial_id = 3;
+  string task_id = 4;
+}
+
 message EndTrialRequest {
   string trial_id = 1;
 }
@@ -59,3 +84,10 @@ message EndTrialResponse {
   float score = 1;
   repeated string score_detail = 2;
 }
+
+message SubmitRunRequest {
+  string run_id = 1;
+  bool force = 2;
+}
+
+message SubmitRunResponse {}
