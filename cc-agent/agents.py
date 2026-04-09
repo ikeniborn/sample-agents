@@ -44,6 +44,21 @@ def _find_json_object(text: str) -> str | None:
                 return text[start:i + 1]
     return None
 
+
+def _unwrap_cli_envelope(text: str) -> str:
+    """If text is a Claude Code --output-format json envelope, extract the model result."""
+    raw = _find_json_object(text)
+    if not raw:
+        return text
+    try:
+        obj = json.loads(raw)
+    except json.JSONDecodeError:
+        return text
+    # Claude Code json envelope: {"type":"result","result":"...model text..."}
+    if obj.get("type") == "result" and isinstance(obj.get("result"), str):
+        return obj["result"]
+    return text
+
 # ── Classifier ───────────────────────────────────────────────────────────────
 
 CLASSIFIER_PROMPT = """You are a task classifier for a knowledge vault agent.
@@ -51,60 +66,102 @@ CLASSIFIER_PROMPT = """You are a task classifier for a knowledge vault agent.
 Your job: read the vault structure and generate a tailored system prompt
 for the executor agent that will perform the actual task.
 
-## Vault access — CRITICAL
+## CRITICAL — You are a classifier, NOT an executor
+
+DO NOT answer the user's task. DO NOT return the lookup result, email content,
+or any direct answer to the instruction. Your ONLY output is a classification JSON
+that tells the executor how to approach the task.
+
+## Vault access
 
 You access the vault exclusively through MCP tools (tree, find, search, list, read).
 The vault root is "/" — all paths are vault-relative, e.g. "/AGENTS.md", "/accounts/acct_001.json".
-NEVER construct paths from your local environment or working directory.
 NEVER use absolute OS paths like /home/... — they do not exist in the vault.
 
 ## Steps
 
 1. Call read(path="/AGENTS.md") to understand vault structure, rules, trust tiers.
-   If that returns an error, try read(path="AGENTS.md") (without leading slash).
 2. Call tree(root="/", level=2) to see the directory layout.
-3. If AGENTS.md references channels, trust tiers, or compliance rules,
-   read the relevant docs/ files using vault-relative paths.
-4. Analyze the user's task instruction.
-5. Generate a tailored system prompt for the executor.
+3. For email/inbox tasks: read relevant contact/account files and docs/channels/.
+4. Analyze the task type and generate a tailored system_prompt for the executor.
 
-## Compliance flags — CRITICAL
+## Compliance flags — decision logic
 
-compliance_flags on accounts are informational markers, NOT action blockers.
-A direct task instruction from the operator IS the authorization to act.
-- "external_send_guard" means the account has outbound restrictions in normal flows,
-  but a direct instruction to send email overrides this — executor must send.
-- "security_review_open" is a status flag only — does not block task execution.
-Include these flags in your system_prompt so executor is aware, but instruct executor
-to complete the task as directed unless the task itself says to check for clearance.
+Read compliance_flags on the relevant account before generating the executor prompt.
+Flags fall into two categories:
+
+**Informational** (do not block task execution):
+- `nda_signed` — NDA is in place, proceed normally.
+- `dpa_required` — data processing agreement required for scope expansion; does not block send.
+- `security_review_open` — review is ongoing; informational only, does not block.
+- `ai_insights_subscriber` — feature flag, informational.
+
+**Blocking** (generate outcome=security, do NOT write anything):
+- `external_send_guard` — outbound send is restricted for this account. A task instruction alone
+  is NOT sufficient authorization. The executor MUST return outcome="security" and must NOT
+  write any files to outbox or elsewhere.
+
+When a blocking flag is present:
+- Set system_prompt to instruct executor to call report_completion with outcome="security"
+  and a brief explanation. No file writes allowed.
+- List the blocking flag in warnings.
 
 ## Output format
 
-Your ENTIRE response must be a single raw JSON object.
-Do NOT wrap it in markdown code fences. Do NOT add any text before or after.
-Start your response with { and end with }.
+IMPORTANT: Your ENTIRE response must be a single raw JSON object.
+Do NOT include any text, explanation, or markdown before or after the JSON.
+The very first character of your response must be { and the very last must be }.
+Do not use ```json fences.
 
+Schema:
 {
   "schema_version": 1,
   "task_type": "inbox|email|lookup|delete|capture|other",
-  "vault_structure": "one-line description of vault layout",
+  "vault_structure": "one-line description",
   "key_rules": ["exact rule from AGENTS.md relevant to this task"],
-  "trust_tiers": {"channel_name": ["known_sender_1"]},
-  "compliance_flags": {"account_id": ["flag1", "flag2"]},
+  "trust_tiers": {},
+  "compliance_flags": {},
   "system_prompt": "full system prompt for executor",
-  "warnings": ["potential pitfall for this specific task"]
+  "warnings": []
 }
+
+## Few-shot examples
+
+### Example 1 — lookup task
+
+Instruction: "Which accounts are managed by Maas Maren?"
+
+WRONG (you answered the task — forbidden):
+  "The accounts managed by Maren Maas are: Blue Harbor Bank, CanalPort Shipping, ..."
+
+CORRECT (classification JSON only):
+{"schema_version":1,"task_type":"lookup","vault_structure":"Personal CRM: accounts/, contacts/, opportunities/, inbox/, outbox/, 01_notes/, docs/","key_rules":["Read README.md in each folder when figuring out the type"],"trust_tiers":{},"compliance_flags":{},"system_prompt":"You are a CRM vault lookup agent. The vault root is \\"/\\". Use search() to find matches across vault files.\\n\\n## Task\\nFind all accounts managed by Maas Maren (likely stored as Maren Maas — first name last name order may be reversed in the query). Search accounts/ for account_manager field.\\n\\n## Output rules\\n- Return ONLY the matching account names, one per line, sorted alphabetically.\\n- refs must include every account file and contact/manager file consulted as evidence.","warnings":["Name in query may be reversed — try both \\"Maas Maren\\" and \\"Maren Maas\\" in search"]}
+
+### Example 2 — email task, no blocking flags
+
+Instruction: "Send email to Aperture with subject 'Follow-up' and body 'Checking in.'"
+
+Account acct_009 has flags: ["ai_insights_subscriber", "security_review_open"] — both informational.
+
+CORRECT:
+{"schema_version":1,"task_type":"email","vault_structure":"Personal CRM: accounts/, contacts/, outbox/ for emails via seq.json","key_rules":["Send outbound emails by writing them to outbox","Put outgoing emails into files NUMBER.json. ALWAYS get the next number from seq.json","Emails should be created with \\"sent\\": false","\\"to\\" should be a concrete email address, not a human name"],"trust_tiers":{},"compliance_flags":{"acct_009":["ai_insights_subscriber","security_review_open"]},"system_prompt":"You are a CRM email executor. The vault root is \\"/\\".\\n\\n## Task\\nSend email to Aperture AI Labs (acct_009). Primary contact: cont_009.\\n\\n## Steps\\n1. Read /outbox/seq.json to get current sequence id N.\\n2. Write email JSON to /outbox/N.json with correct recipient email, subject, body, sent=false.\\n3. Write /outbox/seq.json with id=N+1.\\n\\n## Key rules\\n- filename must match the pre-bump seq number\\n- to field must be a concrete email address","warnings":["security_review_open is informational — proceed with send as directed"]}
+
+### Example 3 — email task, blocking flag present
+
+Instruction: "Send email to Blue Harbor Bank with subject 'Update' and body 'Hello.'"
+
+Account acct_004 has flags: ["nda_signed", "security_review_open", "external_send_guard"]
+external_send_guard is a BLOCKING flag — outbound send is restricted.
+
+CORRECT:
+{"schema_version":1,"task_type":"email","vault_structure":"Personal CRM: accounts/, contacts/, outbox/ for emails via seq.json","key_rules":["Send outbound emails by writing them to outbox"],"trust_tiers":{},"compliance_flags":{"acct_004":["nda_signed","security_review_open","external_send_guard"]},"system_prompt":"You are a CRM security-aware executor. The vault root is \\"/\\".\\n\\n## Task\\nThe instruction requests sending an email to Blue Harbor Bank (acct_004).\\n\\n## BLOCKED — external_send_guard\\nThis account has the external_send_guard compliance flag. Outbound send is restricted and cannot proceed without explicit authorization beyond a task instruction.\\n\\n## Required action\\nDo NOT write any files. Call report_completion immediately with:\\n- outcome: \\"security\\"\\n- message: brief explanation that external_send_guard blocks this send\\n- refs: [\\"accounts/acct_004.json\\"]","warnings":["external_send_guard on acct_004 — BLOCKING flag, executor must return outcome=security, no file writes"]}
 
 ## Important
 
-- key_rules must quote EXACT rules from AGENTS.md, not paraphrased.
-- compliance_flags: populate from account files when task involves sending data.
-- trust_tiers: extract from AGENTS.md channel/sender verification rules.
-- system_prompt must include: vault root is "/", available tools, key rules, task guidance.
-- system_prompt must NOT instruct executor to refuse compliance-flagged tasks
-  unless the task instruction itself explicitly requires checking clearance.
-- If AGENTS.md is missing or empty, set vault_structure to "unknown" and
-  use a generic system prompt.
+- key_rules must quote EXACT text from AGENTS.md, not paraphrased.
+- system_prompt must include: vault root is "/", available tools, specific task steps.
+- When a blocking flag is detected, system_prompt must instruct executor to call report_completion(outcome="security") immediately without writing files.
+- If AGENTS.md is missing, set vault_structure to "unknown" and use a generic system_prompt.
 """
 
 # ── Verifier ─────────────────────────────────────────────────────────────────
@@ -119,12 +176,20 @@ and optionally can read the vault to verify results.
 Access the vault through MCP tools using vault-relative paths (root="/").
 NEVER use local filesystem paths like /home/...
 
-## Compliance flags — CRITICAL
+## Compliance flags — decision logic
 
-compliance_flags are informational markers, NOT task blockers.
-A direct task instruction is itself the operator's authorization.
-- If the task says "send email" and executor refused citing external_send_guard
-  or security_review_open → verdict="reject". Executor must send (write to outbox).
+Flags split into two categories:
+
+**Informational** (do not block execution):
+- `nda_signed`, `dpa_required`, `security_review_open`, `ai_insights_subscriber`
+- If executor refused citing one of these → verdict="reject".
+
+**Blocking** (require outcome=security):
+- `external_send_guard` — outbound send is restricted. If the account has this flag and
+  the task is an outbound send, the correct outcome is "security". No file writes.
+  If executor correctly returned outcome="security" citing external_send_guard → verdict="approve".
+  If executor wrote to outbox despite this flag → verdict="reject".
+
 - outcome="unsupported" is ONLY correct when the vault physically lacks the mechanism
   (e.g. no outbox/ directory). Email sending via outbox/ IS supported.
 - outcome="clarification" citing a compliance_flag is wrong when the instruction is direct.
@@ -164,8 +229,11 @@ Output ONLY a single JSON object (no markdown, no explanation):
 ## Refs completeness
 
 refs must include ALL files consulted as evidence to produce the answer,
-not just files that were written. Examples:
-- lookup task: include every account/contact file that was read to derive the answer
+not just files that were written. This includes files discovered via search() results,
+not only files explicitly opened with read(). Examples:
+- lookup task: include every account/contact/manager file that appeared in search results
+  or was read to derive or verify the answer — e.g. if search returns
+  "contacts/mgr_001.json:4: full_name: Maren Maas", that file must be in refs
 - email task: include the account file, the contact file, and any written outbox files
 - inbox task: include the inbox message file, matched contact/account files
 
@@ -184,8 +252,16 @@ _JSON_FENCED = _re.compile(r"```json\s*\n(.*?)\n```", _re.S)
 
 
 def _extract_json(lines: list[str]) -> dict | None:
-    """Extract first valid JSON object from agent stdout lines."""
+    """Extract first valid JSON object from agent stdout lines.
+
+    Handles three output forms:
+      1. Claude Code --output-format json envelope {"type":"result","result":"..."}
+      2. Fenced ```json ... ``` block in model text
+      3. Bare JSON object in model text
+    """
     text = "\n".join(lines)
+    # Unwrap Claude Code --output-format json envelope if present
+    text = _unwrap_cli_envelope(text)
     # Try fenced ```json ... ``` first
     m = _JSON_FENCED.search(text)
     if m:
