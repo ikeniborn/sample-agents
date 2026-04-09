@@ -94,13 +94,19 @@ NEVER use absolute OS paths like /home/... — they do not exist in the vault.
    AND to extract the vault's current date (look for "Today:", "current_date:", or
    any YYYY-MM-DD pattern in the file). Note this date — it is needed for date tasks.
    **If AGENTS.md contains no date**: do NOT fall back to your system clock. Instead note
-   the vault type and instruct the executor to search for the vault date at runtime:
-   - CRM vaults: executor should search /accounts/ for the most recent `last_contacted_on`
-     value across all account files (do NOT use `next_follow_up_on` — it is a future
-     scheduled date, not today; executor may also overwrite it during the task).
-     Cross-check with dated inbox messages under /inbox/ if last_contacted_on is absent.
-   - Knowledge vaults: executor should list BOTH /01_capture/ AND /00_inbox/ — filenames
-     are YYYY-MM-DD prefixed; the highest date found across both directories is vault_today.
+   the vault type and instruct the executor to search for the vault date at runtime.
+   Vault_today lookup order (try each step until a date is found):
+   - Step A — search the ENTIRE vault for explicit "today" or "current date" markers:
+       search(root="/", pattern="[Tt]oday[ :=]|current_date[ :=]|date:[ ]?20[0-9]{2}")
+     If any match is found, use that date as vault_today.
+   - Step B (CRM vaults): read /docs/ files (AGENTS.md instructs to read docs/);
+     read /README.md at vault root if present.
+     Then search /01_notes/ for the most recently dated YYYY-MM-DD entry.
+   - Step B (Knowledge vaults): read /README.md and /CLAUDE.md at vault root;
+     then check /90_memory/ and /99_process/ files for dated context.
+   - Step C — field-based fallback (use only if steps A and B fail):
+     CRM: max `last_contacted_on` across all /accounts/ files (NOT next_follow_up_on).
+     Knowledge: highest YYYY-MM-DD filename prefix across /01_capture/ AND /00_inbox/.
 2. Call tree(root="/", level=2) to see the directory layout.
    EXCEPTION: for pure date/arithmetic tasks, skip tree and go directly to step 5.
 3. For email/inbox tasks: read relevant account/contact files AND list/read docs/channels/ for channel-specific rules.
@@ -250,7 +256,7 @@ WRONG — hardcoded date in system_prompt (forbidden):
   "system_prompt": "... today is 2026-03-17, so add 2 days to get 2026-03-19 ..."
 
 CORRECT (executor reads vault date at runtime, no hardcoded snapshot):
-{"schema_version":1,"task_type":"other","vault_structure":"Personal CRM vault","key_rules":["The evaluator uses the vault date from AGENTS.md, NOT the system clock"],"trust_tiers":{},"compliance_flags":{},"system_prompt":"You are a date calculator for this vault. The vault root is \"/\".\n\n## CRITICAL: Vault date\nThe evaluator scores based on the vault's own date, NOT the system clock.\nDo NOT use your system clock. Do NOT assume you know today's date.\n\n## Steps\n1. Read /AGENTS.md — scan for any YYYY-MM-DD pattern, 'today', or 'current_date' line. If found, that is vault_today.\n2. If no date in AGENTS.md: search for vault date in other files.\n   - List /accounts/ and search for the most recent `next_follow_up_on` or `last_contacted_on` value across account files.\n   - Check /inbox/ for any dated messages.\n   - Use the most recently dated entry as vault_today.\n3. Add 2 days to vault_today.\n4. Call report_completion(outcome=\"ok\", message=\"YYYY-MM-DD\", refs=[\"/AGENTS.md\"] plus any other files used to determine vault date).","warnings":["Must use vault date from vault files — system clock gives wrong answer","If AGENTS.md has no date, search accounts/ and inbox/ for date signals"]}
+{"schema_version":1,"task_type":"other","vault_structure":"Personal CRM vault","key_rules":["The evaluator uses the vault date from AGENTS.md, NOT the system clock"],"trust_tiers":{},"compliance_flags":{},"system_prompt":"You are a date calculator for this vault. The vault root is \"/\".\n\n## CRITICAL: Vault date\nThe evaluator scores based on the vault's own date, NOT the system clock.\nDo NOT use your system clock. Do NOT assume you know today's date.\n\n## Vault date lookup — try in order until found\n1. Read /AGENTS.md — scan for any YYYY-MM-DD, 'today', or 'current_date' pattern.\n2. If not found: search(root=\"/\", pattern=\"[Tt]oday[ :=]|current_date\") across ALL vault files.\n3. If not found: read /docs/ files and /README.md at vault root.\n4. If not found (CRM): search /01_notes/ for the most recent YYYY-MM-DD entry.\n5. Last resort: max `last_contacted_on` across all /accounts/ files (NOT next_follow_up_on).\n\n## Task\nAdd 2 days to vault_today.\nCall report_completion(outcome=\"ok\", message=\"YYYY-MM-DD\", refs=[all files consulted to determine vault date]).","warnings":["Must use vault date from vault files — system clock gives wrong answer","Search docs/ and 01_notes/ before falling back to last_contacted_on"]}
 
 ## Important
 
@@ -296,16 +302,28 @@ If you cannot find a date on the first scan, read AGENTS.md again with number=tr
 to see line numbers, then look for any 4-digit year.
 
 **Vault date fallback — when AGENTS.md has no date:**
-If AGENTS.md contains no date, DO NOT fall back to your system clock. Search other vault files:
-- CRM vaults: search /accounts/ files for `last_contacted_on` fields only; use the most
-  recent YYYY-MM-DD found across all account files as vault_today. Do NOT use
-  `next_follow_up_on` — it is a future scheduled date, not today; the executor may also
-  have just written a new value to it, which would contaminate vault_date.
-  If no `last_contacted_on` exists, cross-check dated inbox messages under /inbox/.
-- Knowledge vaults: list BOTH /01_capture/ AND /00_inbox/ — filenames are YYYY-MM-DD
-  prefixed; the highest date found across both directories is vault_today.
-Set vault_date to the best date found this way. Only set vault_date="unknown" if no date
-can be found anywhere in the vault.
+If AGENTS.md contains no date, DO NOT fall back to your system clock.
+Use the following lookup order:
+
+Step A — search the ENTIRE vault for explicit today/current_date markers:
+  search(root="/", pattern="[Tt]oday[ :=]|current_date[ :=]|date:[ ]?20[0-9]{2}")
+  Use any match found as vault_today.
+
+Step B — vault-type-specific secondary sources:
+- CRM vaults: read /docs/ files (CRM AGENTS.md often instructs to read docs/);
+  read /README.md at vault root if it exists.
+  Then search /01_notes/ for the most recently dated YYYY-MM-DD entry.
+- Knowledge vaults: read /README.md and /CLAUDE.md at vault root (these often
+  contain current-date metadata); check /90_memory/ and /99_process/ files.
+
+Step C — field-based fallback (only if A and B yield nothing):
+- CRM: use the most recent `last_contacted_on` across all /accounts/ files.
+  Do NOT use `next_follow_up_on` — it is a future scheduled date; executor
+  may also have just written the answer into it, contaminating vault_date.
+- Knowledge: use the highest YYYY-MM-DD filename across /01_capture/ AND /00_inbox/.
+
+Set vault_date to the best date found. Only set vault_date="unknown" if no date
+can be found anywhere in the vault after all three steps.
 
 Your output JSON MUST include `"vault_date"`. If truly absent, set `"vault_date": "unknown"`.
 Setting it to your system date without finding it in vault files is WRONG.
