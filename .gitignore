@@ -5,3 +5,4 @@
 .secrets.backup
 .secrets
 tmp/
+cc-agent/logs

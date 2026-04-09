@@ -36,6 +36,16 @@ from bitgn.vm.pcm_pb2 import (
 HARNESS_URL = os.environ["HARNESS_URL"]
 _vm = PcmRuntimeClientSync(HARNESS_URL)
 
+_TRACE_FILE = os.environ.get("MCP_TRACE_FILE")
+
+
+def _trace(prefix: str, text: str) -> None:
+    if not _TRACE_FILE:
+        return
+    with open(_TRACE_FILE, "a", encoding="utf-8") as f:
+        for line in text.splitlines():
+            f.write(f"{prefix} {line}\n")
+
 # ── MCP stdio protocol (JSON-RPC 2.0) ─────────────────────────────────────
 
 TOOLS: list[dict] = [
@@ -306,8 +316,10 @@ def _handle(req: dict) -> None:
         params = req.get("params", {})
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
+        _trace("[tool>>>]", f"{tool_name} {json.dumps(tool_args, ensure_ascii=False)}")
         try:
             result_text = _call_tool(tool_name, tool_args)
+            _trace("[tool<<<]", result_text)
             _send({
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -316,6 +328,7 @@ def _handle(req: dict) -> None:
                 },
             })
         except Exception as exc:
+            _trace("[tool!!!]", f"ERROR: {exc}")
             _send({
                 "jsonrpc": "2.0",
                 "id": req_id,
