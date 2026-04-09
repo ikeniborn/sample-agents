@@ -93,20 +93,11 @@ NEVER use absolute OS paths like /home/... — they do not exist in the vault.
 1. Call read(path="/AGENTS.md") to understand vault structure, rules, trust tiers,
    AND to extract the vault's current date (look for "Today:", "current_date:", or
    any YYYY-MM-DD pattern in the file). Note this date — it is needed for date tasks.
-   **If AGENTS.md contains no date**: do NOT fall back to your system clock. Instead note
-   the vault type and instruct the executor to search for the vault date at runtime.
-   Vault_today lookup order (try each step until a date is found):
-   - Step A — search the ENTIRE vault for explicit "today" or "current date" markers:
-       search(root="/", pattern="[Tt]oday[ :=]|current_date[ :=]|date:[ ]?20[0-9]{2}")
-     If any match is found, use that date as vault_today.
-   - Step B (CRM vaults): read /docs/ files (AGENTS.md instructs to read docs/);
-     read /README.md at vault root if present.
-     Then search /01_notes/ for the most recently dated YYYY-MM-DD entry.
-   - Step B (Knowledge vaults): read /README.md and /CLAUDE.md at vault root;
-     then check /90_memory/ and /99_process/ files for dated context.
-   - Step C — field-based fallback (use only if steps A and B fail):
-     CRM: max `last_contacted_on` across all /accounts/ files (NOT next_follow_up_on).
-     Knowledge: highest YYYY-MM-DD filename prefix across /01_capture/ AND /00_inbox/.
+   **If AGENTS.md contains no date**: call get_context() — this returns harness-provided
+   vault context including vault_today. Instruct the executor to call get_context() FIRST
+   (before any other reads) on any task that involves dates, date arithmetic, or scheduling.
+   get_context() is the authoritative source of vault_today. Only if get_context() returns
+   empty/unavailable should the executor fall back to searching vault files.
 2. Call tree(root="/", level=2) to see the directory layout.
    EXCEPTION: for pure date/arithmetic tasks, skip tree and go directly to step 5.
 3. For email/inbox tasks: read relevant account/contact files AND list/read docs/channels/ for channel-specific rules.
@@ -301,29 +292,19 @@ After reading AGENTS.md, scan the ENTIRE content for a date. Look for:
 If you cannot find a date on the first scan, read AGENTS.md again with number=true
 to see line numbers, then look for any 4-digit year.
 
-**Vault date fallback — when AGENTS.md has no date:**
-If AGENTS.md contains no date, DO NOT fall back to your system clock.
-Use the following lookup order:
+**Vault date — use get_context() as the authoritative source:**
+If AGENTS.md contains no date, call get_context() — this returns harness-provided
+vault context including vault_today. Call it BEFORE any other date-inference steps.
+Only if get_context() returns empty or unavailable should you fall back to vault files.
 
-Step A — search the ENTIRE vault for explicit today/current_date markers:
-  search(root="/", pattern="[Tt]oday[ :=]|current_date[ :=]|date:[ ]?20[0-9]{2}")
-  Use any match found as vault_today.
-
-Step B — vault-type-specific secondary sources:
-- CRM vaults: read /docs/ files (CRM AGENTS.md often instructs to read docs/);
-  read /README.md at vault root if it exists.
-  Then search /01_notes/ for the most recently dated YYYY-MM-DD entry.
-- Knowledge vaults: read /README.md and /CLAUDE.md at vault root (these often
-  contain current-date metadata); check /90_memory/ and /99_process/ files.
-
-Step C — field-based fallback (only if A and B yield nothing):
+Field-based fallback (only when get_context() fails):
 - CRM: use the most recent `last_contacted_on` across all /accounts/ files.
   Do NOT use `next_follow_up_on` — it is a future scheduled date; executor
   may also have just written the answer into it, contaminating vault_date.
 - Knowledge: use the highest YYYY-MM-DD filename across /01_capture/ AND /00_inbox/.
 
 Set vault_date to the best date found. Only set vault_date="unknown" if no date
-can be found anywhere in the vault after all three steps.
+can be found anywhere after calling get_context() and checking vault files.
 
 Your output JSON MUST include `"vault_date"`. If truly absent, set `"vault_date": "unknown"`.
 Setting it to your system date without finding it in vault files is WRONG.

@@ -37,6 +37,7 @@ if str(_pac1) not in sys.path:
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from bitgn.vm.pcm_pb2 import (
     AnswerRequest,
+    ContextRequest,
     DeleteRequest,
     FindRequest,
     ListRequest,
@@ -247,6 +248,16 @@ def _evaluate_outcome(outcome: str, message: str = "") -> list[str]:
 
 TOOLS: list[dict] = [
     {
+        "name": "get_context",
+        "description": (
+            "Return task-level context provided by the harness, including the vault's "
+            "current date (vault_today). Call this FIRST on any task involving dates, "
+            "date arithmetic, or scheduling. The response may contain 'Today: YYYY-MM-DD' "
+            "or similar vault metadata. Never skip this call for date tasks."
+        ),
+        "inputSchema": {"type": "object", "properties": {}, "required": []},
+    },
+    {
         "name": "tree",
         "description": "Show directory tree of the vault. Use root='/' for full tree.",
         "inputSchema": {
@@ -385,7 +396,7 @@ TOOLS: list[dict] = [
     },
 ]
 
-_READONLY_TOOLS = {"tree", "find", "search", "list", "read"}
+_READONLY_TOOLS = {"get_context", "tree", "find", "search", "list", "read"}
 _VISIBLE_TOOLS = [t for t in TOOLS if t["name"] in _READONLY_TOOLS] if _MCP_MODE == "readonly" else TOOLS
 
 _OUTCOME_MAP = {
@@ -406,7 +417,14 @@ def _tree_node_to_text(node, indent: int = 0) -> str:
 
 
 def _call_tool(name: str, args: dict) -> str:
-    if name == "tree":
+    if name == "get_context":
+        try:
+            resp = _vm.context(ContextRequest())
+            return resp.content if resp.content else "(no context available)"
+        except Exception as exc:
+            return f"(context unavailable: {exc})"
+
+    elif name == "tree":
         resp = _vm.tree(TreeRequest(root=args["root"], level=args.get("level", 0)))
         return _tree_node_to_text(resp.root)
 
