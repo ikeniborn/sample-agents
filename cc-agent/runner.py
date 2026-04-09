@@ -153,58 +153,76 @@ def _execute_iclaude(
     instruction: str,
     run_dir: Path,
 ) -> dict:
-    """Run iclaude subprocess for one trial. Log: status only. Returns score dict."""
-    with _open_log(run_dir, task_id) as log:
+    """Run iclaude subprocess for one trial. Returns score dict."""
+    with _STDOUT_LOCK:
+        print(f"\n{'=' * 30} {task_id} {'=' * 30}")
+        print(f"{CLI_BLUE}{instruction}{CLI_CLR}\n{'-' * 80}")
+
+    trace_file = run_dir / f"{task_id}.trace"
+    mcp_cfg = _build_mcp_config(harness_url, trace_file)
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, prefix=f"mcp_{task_id}_"
+    ) as f:
+        json.dump(mcp_cfg, f)
+        cfg_path = f.name
+
+    start = time.time()
+    exit_code = -1
+    stdout_lines: list[str] = []
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [
+                "iclaude",
+                "--no-save",
+                "--print",
+                "--strict-mcp-config",
+                "--mcp-config", cfg_path,
+                "--system-prompt", SYSTEM_PROMPT,
+                instruction,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(_PAC1_DIR)},
+        )
+        stdout_lines = _collect_stdout(proc.stdout)
+        proc.wait(timeout=TASK_TIMEOUT)
+        exit_code = proc.returncode
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            proc.kill()
         with _STDOUT_LOCK:
-            print(f"\n{'=' * 30} {task_id} {'=' * 30}")
-            print(f"{CLI_BLUE}{instruction}{CLI_CLR}\n{'-' * 80}")
-        log.write(f"task: {task_id}\ninstruction: {instruction}\n\n")
-
-        log_file = run_dir / f"{task_id}.log"
-        mcp_cfg = _build_mcp_config(harness_url, log_file)
-        with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".json", delete=False, prefix=f"mcp_{task_id}_"
-        ) as f:
-            json.dump(mcp_cfg, f)
-            cfg_path = f.name
-
-        start = time.time()
+            print(f"{CLI_RED}[TIMEOUT] task {task_id}{CLI_CLR}")
         exit_code = -1
-        proc = None
-        try:
-            proc = subprocess.Popen(
-                [
-                    "iclaude",
-                    "--no-save",
-                    "--print",
-                    "--strict-mcp-config",
-                    "--mcp-config", cfg_path,
-                    "--system-prompt", SYSTEM_PROMPT,
-                    instruction,
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                env={**os.environ, "PYTHONPATH": str(_PAC1_DIR)},
-            )
-            log.write(f"[STARTED] pid={proc.pid}  started={datetime.now().isoformat()}\n")
-            _tee(proc.stdout, log)
-            proc.wait(timeout=TASK_TIMEOUT)
-            exit_code = proc.returncode
-            log.write(f"[DONE]    exit={exit_code}  elapsed={time.time() - start:.1f}s\n")
-        except subprocess.TimeoutExpired:
-            if proc is not None:
-                proc.kill()
-            log.write(f"[TIMEOUT] elapsed={time.time() - start:.1f}s\n")
-            with _STDOUT_LOCK:
-                print(f"{CLI_RED}[TIMEOUT] task {task_id}{CLI_CLR}")
-            exit_code = -1
-        finally:
-            Path(cfg_path).unlink(missing_ok=True)
+    finally:
+        Path(cfg_path).unlink(missing_ok=True)
 
-        elapsed = time.time() - start
+    elapsed = time.time() - start
+
+    # Assemble log after process ends — no concurrent writes
+    with _open_log(run_dir, task_id) as log:
+        log.write(f"task:        {task_id}\n")
+        log.write(f"instruction: {instruction}\n")
+        log.write(f"pid:         {proc.pid if proc else '?'}  started: {datetime.fromtimestamp(start).isoformat()}\n\n")
+
+        # Tool trace (written by mcp_pcm.py to separate file)
+        if trace_file.exists():
+            log.write("── tool trace ───────────────────────────────────────────\n")
+            log.write(trace_file.read_text(encoding="utf-8"))
+            log.write("─────────────────────────────────────────────────────────\n\n")
+            trace_file.unlink()
+
+        # Agent response (proxy preamble filtered out)
+        response_lines = _agent_response(stdout_lines)
+        if response_lines:
+            log.write("── agent response ───────────────────────────────────────\n")
+            log.write("\n".join(response_lines) + "\n")
+            log.write("─────────────────────────────────────────────────────────\n\n")
+
+        log.write(f"[DONE] exit={exit_code}  elapsed={elapsed:.1f}s\n\n")
+
         trial_result = client.end_trial(EndTrialRequest(trial_id=trial_id))
-
         score = trial_result.score
         detail = list(trial_result.score_detail)
         style = CLI_GREEN if score == 1 else CLI_RED
