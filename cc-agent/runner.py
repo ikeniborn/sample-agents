@@ -1,26 +1,35 @@
 """
 CC Agent runner — executes pac1 benchmark tasks via Claude Code CLI.
 
-Workflow per task:
-  1. start_playground / start_trial → harness_url + instruction
-  2. write temp MCP config pointing to mcp_pcm.py with HARNESS_URL set
-  3. run: iclaude --print --mcp-config <cfg> -p "<instruction>"
-  4. end_trial → score
+Supports two modes:
+  - MULTI_AGENT=1 (default): Classifier → Executor → Verifier pipeline
+  - MULTI_AGENT=0: Legacy single-agent (one iclaude call per task)
 
-Usage:
-    python runner.py [task_id ...]
+Workflow (multi-agent):
+  1. start_playground / start_trial → harness_url + instruction
+  2. Classifier (readonly MCP) → reads vault → classification.json
+  3. Executor (draft MCP) → performs task → draft.json
+  4. Verifier (readonly MCP, different model) → verdict.json
+  5. If reject → retry executor with feedback (up to MAX_RETRIES)
+  6. Submit final answer → end_trial → score
 
 Env vars (from cc-agent/.env, .secrets, or shell):
-    BITGN_HOST       default: https://api.bitgn.com
-    BENCH_ID         default: bitgn/pac1-dev
-    TASK_TIMEOUT_S   default: 300
-    PARALLEL_TASKS   default: 1
-    BITGN_API_KEY    set to enable run mode (vs playground mode)
-    BITGN_RUN_NAME   run label shown on the leaderboard
+    BITGN_HOST              default: https://api.bitgn.com
+    BENCH_ID                default: bitgn/pac1-dev
+    TASK_TIMEOUT_S          default: 300
+    PARALLEL_TASKS          default: 1
+    BITGN_API_KEY           set to enable run mode (vs playground mode)
+    BITGN_RUN_NAME          run label shown on the leaderboard
+    MULTI_AGENT             default: 1 (0 = legacy single-agent)
+    MAX_RETRIES             default: 1 (executor retries on verifier reject)
+    CLAUDE_MODEL            executor model (default: CLI default)
+    CLAUDE_CLASSIFIER_MODEL default: haiku
+    CLAUDE_VERIFIER_MODEL   default: auto (picks model different from executor)
 """
 
 import json
 import os
+import re as _re
 import shlex
 import subprocess
 import sys
@@ -60,9 +69,21 @@ from bitgn.harness_pb2 import (
     StatusRequest,
     SubmitRunRequest,
 )
+from bitgn.vm.pcm_connect import PcmRuntimeClientSync
+from bitgn.vm.pcm_pb2 import AnswerRequest, Outcome
 from connectrpc.errors import ConnectError
 
+from agents import (
+    CLASSIFIER_PROMPT,
+    VERIFIER_PROMPT,
+    apply_verdict,
+    build_executor_prompt,
+    parse_classifier_output,
+    parse_verifier_output,
+)
 from prompt import get_prompt
+
+# ── Configuration ────────────────────────────────────────────────────────────
 
 BITGN_URL = os.getenv("BITGN_HOST", "https://api.bitgn.com")
 BENCHMARK_ID = os.getenv("BENCH_ID", "bitgn/pac1-dev")
@@ -71,6 +92,12 @@ PARALLEL_TASKS = int(os.getenv("PARALLEL_TASKS", "1"))
 BITGN_API_KEY = os.getenv("BITGN_API_KEY", "")
 BITGN_RUN_NAME = os.getenv("BITGN_RUN_NAME", "")
 ICLAUDE_CMD = os.getenv("ICLAUDE_CMD", "iclaude")
+CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "")
+CLAUDE_CLASSIFIER_MODEL = os.getenv("CLAUDE_CLASSIFIER_MODEL", "haiku")
+CLAUDE_VERIFIER_MODEL = os.getenv("CLAUDE_VERIFIER_MODEL", "")
+MULTI_AGENT = os.getenv("MULTI_AGENT", "1") != "0"
+MAX_RETRIES = int(os.getenv("MAX_RETRIES", "1"))
+CLASSIFIER_TIMEOUT = int(os.getenv("CLASSIFIER_TIMEOUT_S", "60"))
 
 _MCP_SERVER = Path(__file__).parent / "mcp_pcm.py"
 _PAC1_DIR = Path(__file__).parent.parent / "pac1-py"
@@ -79,10 +106,22 @@ CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"
 CLI_CLR = "\x1B[0m"
 CLI_BLUE = "\x1B[34m"
+CLI_YELLOW = "\x1B[33m"
 
 _LOGS_DIR = Path(__file__).parent / "logs"
 _STDOUT_LOCK = threading.Lock()
 
+_ANSI = _re.compile(r"\x1B\[[0-9;]*[mA-Za-z]")
+
+_OUTCOME_MAP = {
+    "ok": Outcome.OUTCOME_OK,
+    "security": Outcome.OUTCOME_DENIED_SECURITY,
+    "clarification": Outcome.OUTCOME_NONE_CLARIFICATION,
+    "unsupported": Outcome.OUTCOME_NONE_UNSUPPORTED,
+}
+
+
+# ── Utilities ────────────────────────────────────────────────────────────────
 
 def _make_run_dir() -> Path:
     """Create and return logs/<timestamp>/ directory for this run."""
@@ -92,47 +131,100 @@ def _make_run_dir() -> Path:
     return run_dir
 
 
-def _open_log(run_dir: Path, name: str):
-    """Open a log file inside run_dir."""
-    return open(run_dir / f"{name}.log", "w", encoding="utf-8", buffering=1)
+def _make_task_dir(run_dir: Path, task_id: str) -> Path:
+    """Create and return task subdirectory inside run_dir."""
+    task_dir = run_dir / task_id
+    task_dir.mkdir(parents=True, exist_ok=True)
+    return task_dir
 
 
-import re as _re
-_ANSI = _re.compile(r"\x1B\[[0-9;]*[mA-Za-z]")
+def _open_log(path: Path):
+    """Open a log file."""
+    return open(path, "w", encoding="utf-8", buffering=1)
 
 
-def _collect_stdout(src) -> list[str]:
-    """Drain subprocess stdout to terminal; return clean lines (ANSI stripped)."""
+def _append_jsonl(path: Path, data: dict) -> None:
+    """Append one JSON line to a JSONL file."""
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(data, ensure_ascii=False) + "\n")
+
+
+def _read_json(path: Path) -> dict | None:
+    """Read a JSON file, return None on failure."""
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+
+
+def _write_json(path: Path, data: dict) -> None:
+    """Write a JSON file with indent."""
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _collect_stdout(src, echo: bool = True) -> list[str]:
+    """Drain subprocess stdout; optionally echo to terminal. Return clean lines."""
     lines: list[str] = []
     for raw in src:
-        with _STDOUT_LOCK:
-            sys.stdout.write(raw)
-            sys.stdout.flush()
+        if echo:
+            with _STDOUT_LOCK:
+                sys.stdout.write(raw)
+                sys.stdout.flush()
         lines.extend(_ANSI.sub("", raw).splitlines())
     return lines
 
 
-def _agent_response(lines: list[str]) -> list[str]:
-    """Drop the iclaude proxy preamble (everything up to and including 'PII proxy:')."""
-    for i, line in enumerate(lines):
-        if "PII proxy:" in line:
-            # skip blank lines immediately after the preamble
-            j = i + 1
-            while j < len(lines) and not lines[j].strip():
-                j += 1
-            return lines[j:]
-    return lines  # no preamble found — return as-is
+def _pick_verifier_model() -> str:
+    """Pick a verifier model different from executor."""
+    if CLAUDE_MODEL in ("opus", "claude-opus-4-6"):
+        return "sonnet"
+    return "opus"
 
 
-def _build_mcp_config(harness_url: str, trace_file: Path, task_id: str, instruction: str) -> dict:
-    """Build MCP server config for this trial."""
+_RESOLVED_VERIFIER_MODEL = CLAUDE_VERIFIER_MODEL or _pick_verifier_model()
+
+
+def _models_info() -> dict:
+    """Return models config dict for logging."""
+    return {
+        "executor": CLAUDE_MODEL or "default",
+        "classifier": CLAUDE_CLASSIFIER_MODEL if MULTI_AGENT else None,
+        "verifier": _RESOLVED_VERIFIER_MODEL if MULTI_AGENT else None,
+    }
+
+
+def _time_budget(remaining: float, attempt: int, max_attempts: int) -> tuple[int, int]:
+    """Return (executor_timeout, verifier_timeout) for this attempt."""
+    remaining_attempts = max_attempts - attempt + 1
+    if remaining_attempts <= 0:
+        return int(remaining * 0.8), int(remaining * 0.2)
+    per_attempt = remaining / remaining_attempts
+    verifier_t = min(30, per_attempt * 0.25)
+    executor_t = per_attempt - verifier_t
+    return max(int(executor_t), 10), max(int(verifier_t), 10)
+
+
+# ── MCP config builder ──────────────────────────────────────────────────────
+
+def _build_mcp_config(
+    harness_url: str,
+    trace_file: Path,
+    task_id: str,
+    instruction: str,
+    mode: str = "full",
+    extra_env: dict | None = None,
+) -> dict:
+    """Build MCP server config for a given mode."""
     env = {
         "HARNESS_URL": harness_url,
         "PYTHONPATH": str(_PAC1_DIR),
         "MCP_TRACE_FILE": str(trace_file),
         "TASK_ID": task_id,
         "TASK_INSTRUCTION": instruction,
+        "MCP_MODE": mode,
     }
+    if extra_env:
+        env.update(extra_env)
 
     return {
         "mcpServers": {
@@ -146,7 +238,254 @@ def _build_mcp_config(harness_url: str, trace_file: Path, task_id: str, instruct
     }
 
 
-def _execute_iclaude(
+# ── Spawn iclaude subprocess ────────────────────────────────────────────────
+
+def _spawn_iclaude(
+    mcp_cfg: dict,
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    timeout: int,
+    echo: bool = True,
+) -> tuple[list[str], int]:
+    """Spawn iclaude subprocess. Returns (stdout_lines, exit_code)."""
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".json", delete=False, prefix="mcp_"
+    ) as f:
+        json.dump(mcp_cfg, f)
+        cfg_path = f.name
+
+    cmd = [
+        *shlex.split(ICLAUDE_CMD),
+        "--no-save",
+        "--print",
+        "--strict-mcp-config",
+        "--mcp-config", cfg_path,
+        "--system-prompt", system_prompt,
+    ]
+    if model:
+        cmd.extend(["--model", model])
+    cmd.append(user_prompt)
+
+    exit_code = -1
+    stdout_lines: list[str] = []
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            env={**os.environ, "PYTHONPATH": str(_PAC1_DIR)},
+        )
+        stdout_lines = _collect_stdout(proc.stdout, echo=echo)
+        proc.wait(timeout=timeout)
+        exit_code = proc.returncode
+    except subprocess.TimeoutExpired:
+        if proc is not None:
+            proc.kill()
+        exit_code = -1
+    finally:
+        Path(cfg_path).unlink(missing_ok=True)
+
+    return stdout_lines, exit_code
+
+
+# ── Submit answer directly ──────────────────────────────────────────────────
+
+def _submit_answer(harness_url: str, answer: dict) -> None:
+    """Submit final answer directly via PcmRuntimeClient (bypassing MCP)."""
+    vm = PcmRuntimeClientSync(harness_url)
+    outcome = _OUTCOME_MAP.get(answer.get("outcome", "ok"), Outcome.OUTCOME_OK)
+    vm.answer(AnswerRequest(
+        message=answer.get("message", ""),
+        outcome=outcome,
+        refs=answer.get("refs", []),
+    ))
+
+
+# ── Multi-agent pipeline ────────────────────────────────────────────────────
+
+def _run_pipeline(
+    harness_url: str,
+    task_id: str,
+    instruction: str,
+    task_dir: Path,
+) -> None:
+    """Run Classifier → Executor → Verifier pipeline."""
+    pipeline_start = time.monotonic()
+
+    with _STDOUT_LOCK:
+        print(f"  {CLI_YELLOW}[pipeline] classifier → executor → verifier{CLI_CLR}")
+
+    # ── Phase 1: Classifier ──
+    classifier_trace = task_dir / "classifier.events.jsonl"
+    classifier_cfg = _build_mcp_config(
+        harness_url, classifier_trace, task_id, instruction, mode="readonly",
+    )
+
+    with _STDOUT_LOCK:
+        print(f"  {CLI_YELLOW}[classifier] model={CLAUDE_CLASSIFIER_MODEL}{CLI_CLR}")
+
+    cls_lines, cls_exit = _spawn_iclaude(
+        mcp_cfg=classifier_cfg,
+        system_prompt=CLASSIFIER_PROMPT,
+        user_prompt=instruction,
+        model=CLAUDE_CLASSIFIER_MODEL,
+        timeout=CLASSIFIER_TIMEOUT,
+        echo=False,
+    )
+    classification = parse_classifier_output(cls_lines)
+
+    if classification:
+        _write_json(task_dir / "classification.json", classification)
+        executor_prompt = build_executor_prompt(classification)
+        with _STDOUT_LOCK:
+            print(f"  {CLI_GREEN}[classifier] type={classification.get('task_type', '?')}{CLI_CLR}")
+    else:
+        executor_prompt = get_prompt(instruction)
+        _append_jsonl(task_dir / "pipeline.events.jsonl", {
+            "type": "classifier_fallback", "reason": "parse_failed", "exit_code": cls_exit,
+        })
+        with _STDOUT_LOCK:
+            print(f"  {CLI_RED}[classifier] fallback to static prompt{CLI_CLR}")
+
+    # ── Phase 2+3: Executor → Verifier loop ──
+    time_remaining = TASK_TIMEOUT - (time.monotonic() - pipeline_start)
+    _executor_verify_loop(
+        harness_url, task_id, instruction, task_dir,
+        executor_prompt, attempt=1, time_remaining=time_remaining,
+    )
+
+
+def _executor_verify_loop(
+    harness_url: str,
+    task_id: str,
+    instruction: str,
+    task_dir: Path,
+    executor_prompt: str,
+    attempt: int,
+    time_remaining: float,
+) -> None:
+    """Run executor + verifier with retry on reject."""
+    exec_t, ver_t = _time_budget(time_remaining, attempt, MAX_RETRIES + 1)
+    attempt_start = time.monotonic()
+
+    verifier_model = _RESOLVED_VERIFIER_MODEL
+
+    with _STDOUT_LOCK:
+        print(f"  {CLI_YELLOW}[executor] attempt={attempt} model={CLAUDE_MODEL or 'default'} timeout={exec_t}s{CLI_CLR}")
+
+    # ── Executor ──
+    draft_file = task_dir / f"draft_{attempt}.json"
+    exec_trace = task_dir / f"executor_{attempt}.events.jsonl"
+    executor_cfg = _build_mcp_config(
+        harness_url, exec_trace, task_id, instruction,
+        mode="draft",
+        extra_env={"DRAFT_FILE": str(draft_file)},
+    )
+    _spawn_iclaude(
+        mcp_cfg=executor_cfg,
+        system_prompt=executor_prompt,
+        user_prompt=instruction,
+        model=CLAUDE_MODEL,
+        timeout=exec_t,
+    )
+
+    draft = _read_json(draft_file)
+    if not draft:
+        draft = {"schema_version": 1, "outcome": "clarification", "message": "Executor did not produce a result", "refs": []}
+        _append_jsonl(task_dir / "pipeline.events.jsonl", {
+            "type": "executor_no_draft", "attempt": attempt,
+        })
+
+    with _STDOUT_LOCK:
+        print(f"  {CLI_YELLOW}[verifier] model={verifier_model} timeout={ver_t}s{CLI_CLR}")
+
+    # ── Verifier ──
+    ver_trace = task_dir / f"verifier_{attempt}.events.jsonl"
+    verifier_cfg = _build_mcp_config(
+        harness_url, ver_trace, task_id, instruction, mode="readonly",
+    )
+    verifier_input = json.dumps({
+        "instruction": instruction,
+        "draft_answer": draft,
+    }, ensure_ascii=False)
+
+    ver_lines, ver_exit = _spawn_iclaude(
+        mcp_cfg=verifier_cfg,
+        system_prompt=VERIFIER_PROMPT,
+        user_prompt=verifier_input,
+        model=verifier_model,
+        timeout=ver_t,
+        echo=False,
+    )
+    verdict = parse_verifier_output(ver_lines)
+
+    if verdict:
+        _write_json(task_dir / f"verdict_{attempt}.json", verdict)
+        with _STDOUT_LOCK:
+            print(f"  {CLI_GREEN}[verifier] verdict={verdict.get('verdict', '?')}{CLI_CLR}")
+    else:
+        _append_jsonl(task_dir / "pipeline.events.jsonl", {
+            "type": "verifier_fallback", "reason": "parse_failed",
+            "exit_code": ver_exit, "attempt": attempt,
+        })
+        with _STDOUT_LOCK:
+            print(f"  {CLI_RED}[verifier] fallback — submitting draft as-is{CLI_CLR}")
+
+    # ── Retry on reject ──
+    if (verdict and verdict.get("verdict") == "reject"
+            and attempt <= MAX_RETRIES):
+        elapsed = time.monotonic() - attempt_start
+        new_remaining = time_remaining - elapsed
+        if new_remaining > 30:  # enough time for another attempt
+            with _STDOUT_LOCK:
+                print(f"  {CLI_YELLOW}[retry] attempt {attempt + 1}, reason: {verdict.get('reason', '?')[:80]}{CLI_CLR}")
+            feedback_prompt = (
+                f"{executor_prompt}\n\n"
+                f"## Feedback from verifier (attempt {attempt})\n"
+                f"{verdict.get('reason', 'Unknown issue')}\n"
+                f"Fix the issues above and try again."
+            )
+            return _executor_verify_loop(
+                harness_url, task_id, instruction, task_dir,
+                feedback_prompt, attempt + 1, new_remaining,
+            )
+
+    # ── Submit final answer ──
+    final = apply_verdict(draft, verdict)
+    _write_json(task_dir / "final_answer.json", final)
+    _submit_answer(harness_url, final)
+
+    with _STDOUT_LOCK:
+        print(f"  {CLI_GREEN}[submitted] outcome={final.get('outcome', '?')}{CLI_CLR}")
+
+
+# ── Legacy single-agent execution ───────────────────────────────────────────
+
+def _execute_single(
+    harness_url: str,
+    task_id: str,
+    instruction: str,
+    task_dir: Path,
+) -> None:
+    """Legacy single-agent: one iclaude call with full MCP mode."""
+    trace_file = task_dir / "executor.events.jsonl"
+    mcp_cfg = _build_mcp_config(harness_url, trace_file, task_id, instruction, mode="full")
+
+    _spawn_iclaude(
+        mcp_cfg=mcp_cfg,
+        system_prompt=get_prompt(instruction),
+        user_prompt=instruction,
+        model=CLAUDE_MODEL,
+        timeout=TASK_TIMEOUT,
+    )
+
+
+# ── Task execution (unified entry point) ────────────────────────────────────
+
+def _execute_task(
     client: HarnessServiceClientSync,
     task_id: str,
     trial_id: str,
@@ -154,99 +493,90 @@ def _execute_iclaude(
     instruction: str,
     run_dir: Path,
 ) -> dict:
-    """Run iclaude subprocess for one trial. Returns score dict."""
+    """Execute one task (multi-agent or single). Returns score dict."""
     with _STDOUT_LOCK:
         print(f"\n{'=' * 30} {task_id} {'=' * 30}")
-        print(f"{CLI_BLUE}{instruction}{CLI_CLR}\n{'-' * 80}")
+        print(f"{CLI_BLUE}{instruction}{CLI_CLR}")
+        print(f"mode={'multi-agent' if MULTI_AGENT else 'single'}  timeout={TASK_TIMEOUT}s")
+        print("-" * 70)
 
-    trace_file = run_dir / f"{task_id}.trace"
-    mcp_cfg = _build_mcp_config(harness_url, trace_file, task_id, instruction)
-    with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".json", delete=False, prefix=f"mcp_{task_id}_"
-    ) as f:
-        json.dump(mcp_cfg, f)
-        cfg_path = f.name
-
+    task_dir = _make_task_dir(run_dir, task_id)
     start = time.time()
-    exit_code = -1
-    stdout_lines: list[str] = []
-    proc = None
+
     try:
-        proc = subprocess.Popen(
-            [
-                *shlex.split(ICLAUDE_CMD),
-                "--no-save",
-                "--print",
-                "--strict-mcp-config",
-                "--mcp-config", cfg_path,
-                "--system-prompt", get_prompt(instruction),
-                instruction,
-            ],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            env={**os.environ, "PYTHONPATH": str(_PAC1_DIR)},
-        )
-        stdout_lines = _collect_stdout(proc.stdout)
-        proc.wait(timeout=TASK_TIMEOUT)
-        exit_code = proc.returncode
-    except subprocess.TimeoutExpired:
-        if proc is not None:
-            proc.kill()
+        if MULTI_AGENT:
+            _run_pipeline(harness_url, task_id, instruction, task_dir)
+        else:
+            _execute_single(harness_url, task_id, instruction, task_dir)
+    except Exception as exc:
         with _STDOUT_LOCK:
-            print(f"{CLI_RED}[TIMEOUT] task {task_id}{CLI_CLR}")
-        exit_code = -1
-    finally:
-        Path(cfg_path).unlink(missing_ok=True)
+            print(f"{CLI_RED}[ERROR] {task_id}: {exc}{CLI_CLR}")
+        _append_jsonl(task_dir / "pipeline.events.jsonl", {
+            "type": "pipeline_error", "error": str(exc),
+        })
 
     elapsed = time.time() - start
 
-    # Assemble log after process ends — no concurrent writes
-    with _open_log(run_dir, task_id) as log:
+    # ── Score ──
+    trial_result = client.end_trial(EndTrialRequest(trial_id=trial_id))
+    score = trial_result.score
+    detail = list(trial_result.score_detail)
+
+    style = CLI_GREEN if score == 1 else CLI_RED
+    explain = textwrap.indent("\n".join(detail), "  ")
+    with _STDOUT_LOCK:
+        print(f"\n{style}[{task_id}] Score: {score:.2f}\n{explain}{CLI_CLR}")
+
+    # ── Write text log ──
+    with _open_log(task_dir / f"{task_id}.log") as log:
         log.write(f"task:        {task_id}\n")
         log.write(f"instruction: {instruction}\n")
-        log.write(f"pid:         {proc.pid if proc else '?'}  started: {datetime.fromtimestamp(start).isoformat()}\n\n")
+        log.write(f"mode:        {'multi-agent' if MULTI_AGENT else 'single'}\n")
+        log.write(f"started:     {datetime.fromtimestamp(start).isoformat()}\n\n")
 
-        # Tool trace (written by mcp_pcm.py to separate file)
-        if trace_file.exists():
-            log.write("── tool trace ───────────────────────────────────────────\n")
-            log.write(trace_file.read_text(encoding="utf-8"))
-            log.write("─────────────────────────────────────────────────────────\n\n")
-            trace_file.unlink()
-
-        # Agent response (proxy preamble filtered out)
-        response_lines = _agent_response(stdout_lines)
-        if response_lines:
-            log.write("── agent response ───────────────────────────────────────\n")
-            log.write("\n".join(response_lines) + "\n")
+        # Include all JSONL event files
+        for events_file in sorted(task_dir.glob("*.events.jsonl")):
+            log.write(f"── {events_file.name} ─────────────────────────────────\n")
+            log.write(events_file.read_text(encoding="utf-8"))
             log.write("─────────────────────────────────────────────────────────\n\n")
 
-        log.write(f"[DONE] exit={exit_code}  elapsed={elapsed:.1f}s\n\n")
+        # Include JSON exchange files
+        for json_file in sorted(task_dir.glob("*.json")):
+            log.write(f"── {json_file.name} ─────────────────────────────────\n")
+            log.write(json_file.read_text(encoding="utf-8"))
+            log.write("\n─────────────────────────────────────────────────────────\n\n")
 
-        trial_result = client.end_trial(EndTrialRequest(trial_id=trial_id))
-        score = trial_result.score
-        detail = list(trial_result.score_detail)
-        style = CLI_GREEN if score == 1 else CLI_RED
-        explain = textwrap.indent("\n".join(detail), "  ")
-        with _STDOUT_LOCK:
-            print(f"\n{style}[{task_id}] Score: {score:.2f}\n{explain}{CLI_CLR}")
+        log.write(f"[DONE] elapsed={elapsed:.1f}s\n")
         log.write(f"score: {score:.2f}\n{textwrap.indent(chr(10).join(detail), '  ')}\n")
+
+    # ── JSONL run event ──
+    _append_jsonl(run_dir / "run.jsonl", {
+        "type": "task_result",
+        "task_id": task_id,
+        "score": score,
+        "elapsed_s": round(elapsed, 1),
+        "outcome": _read_json(task_dir / "final_answer.json") if MULTI_AGENT else None,
+        "agent_mode": "multi-agent" if MULTI_AGENT else "single",
+        "models": _models_info(),
+        "timestamp": datetime.now().isoformat(),
+    })
 
     return {
         "task_id": task_id,
         "score": score,
         "detail": detail,
         "elapsed": elapsed,
-        "exit_code": exit_code,
     }
 
 
+# ── Entry points ─────────────────────────────────────────────────────────────
+
 def run_task(client: HarnessServiceClientSync, task_id: str, run_dir: Path) -> dict:
-    """Playground mode: start_playground → _execute_iclaude."""
+    """Playground mode: start_playground → _execute_task."""
     trial = client.start_playground(
         StartPlaygroundRequest(benchmark_id=BENCHMARK_ID, task_id=task_id)
     )
-    return _execute_iclaude(client, task_id, trial.trial_id, trial.harness_url, trial.instruction, run_dir)
+    return _execute_task(client, task_id, trial.trial_id, trial.harness_url, trial.instruction, run_dir)
 
 
 def run_trial(
@@ -255,11 +585,11 @@ def run_trial(
     task_filter: list[str],
     run_dir: Path,
 ) -> dict | None:
-    """Run mode: start_trial → filter → _execute_iclaude. Returns None if filtered out."""
+    """Run mode: start_trial → filter → _execute_task. Returns None if filtered out."""
     trial = client.start_trial(StartTrialRequest(trial_id=trial_id))
     if task_filter and trial.task_id not in task_filter:
         return None
-    return _execute_iclaude(client, trial.task_id, trial.trial_id, trial.harness_url, trial.instruction, run_dir)
+    return _execute_task(client, trial.task_id, trial.trial_id, trial.harness_url, trial.instruction, run_dir)
 
 
 def main() -> None:
@@ -269,7 +599,10 @@ def main() -> None:
     print("Connecting to BitGN:", client.status(StatusRequest()))
 
     bench = client.get_benchmark(GetBenchmarkRequest(benchmark_id=BENCHMARK_ID))
-    print(f"Benchmark: {bench.benchmark_id} — {len(bench.tasks)} tasks  (parallel={PARALLEL_TASKS})")
+    mode_label = "multi-agent" if MULTI_AGENT else "single"
+    print(f"Benchmark: {bench.benchmark_id} — {len(bench.tasks)} tasks  (parallel={PARALLEL_TASKS}, mode={mode_label})")
+    if MULTI_AGENT:
+        print(f"Models: classifier={CLAUDE_CLASSIFIER_MODEL}  executor={CLAUDE_MODEL or 'default'}  verifier={_RESOLVED_VERIFIER_MODEL}  retries={MAX_RETRIES}")
     print(f"{CLI_GREEN}{bench.description}{CLI_CLR}\n")
 
     scores: list[dict] = []
@@ -329,18 +662,37 @@ def main() -> None:
         total = sum(r["score"] for r in scores) / len(scores) * 100
         total_elapsed = time.time() - run_start
 
-        with _open_log(run_dir, "summary") as log:
+        # ── Summary ──
+        print("\n" + "=" * 60)
+        for r in scores:
+            style = CLI_GREEN if r["score"] == 1 else CLI_RED
+            print(f"{r['task_id']}: {style}{r['score']:.2f}{CLI_CLR}  ({r['elapsed']:.1f}s)")
+        final_line = f"\nFINAL: {total:.2f}%  total: {total_elapsed:.1f}s"
+        print(final_line)
+
+        # Legacy summary.log
+        with _open_log(run_dir / "summary.log") as log:
             run_id = "_".join(task_filter) if task_filter else "all"
             mode = f"run:{BITGN_RUN_NAME}" if BITGN_API_KEY else "playground"
             log.write(f"benchmark: {bench.benchmark_id}  tasks: {run_id}  mode: {mode}  parallel: {PARALLEL_TASKS}\n\n")
-            print("\n" + "=" * 60)
             for r in scores:
-                style = CLI_GREEN if r["score"] == 1 else CLI_RED
-                print(f"{r['task_id']}: {style}{r['score']:.2f}{CLI_CLR}  ({r['elapsed']:.1f}s)")
                 log.write(f"{r['task_id']}: {r['score']:.2f}  ({r['elapsed']:.1f}s)\n")
-            final = f"\nFINAL: {total:.2f}%  total: {total_elapsed:.1f}s"
-            print(final)
-            log.write(final + "\n")
+            log.write(f"\nFINAL: {total:.2f}%  total: {total_elapsed:.1f}s\n")
+
+        # Run summary JSONL event
+        _append_jsonl(run_dir / "run.jsonl", {
+            "type": "run_summary",
+            "benchmark": bench.benchmark_id,
+            "tasks_total": len(scores),
+            "tasks_passed": sum(1 for r in scores if r["score"] == 1.0),
+            "score_avg": round(total / 100, 4),
+            "elapsed_total_s": round(total_elapsed, 1),
+            "agent_mode": "multi-agent" if MULTI_AGENT else "single",
+            "models": _models_info(),
+            "parallel": PARALLEL_TASKS,
+            "max_retries": MAX_RETRIES,
+            "timestamp": datetime.now().isoformat(),
+        })
 
 
 if __name__ == "__main__":
