@@ -61,6 +61,14 @@ _DRAFT_FILE = os.environ.get("DRAFT_FILE", "")
 
 _mono_start = _time.monotonic()
 
+# Fetch vault context once at startup — injected into every agent's system prompt
+# via MCP initialize.instructions so all agents (classifier/executor/verifier)
+# receive vault_today and other harness metadata without explicit tool calls.
+try:
+    _vault_context: str = _vm.context(ContextRequest()).content or ""
+except Exception:
+    _vault_context = ""
+
 # ── Draft mode write buffer ───────────────────────────────────────────────────
 # In draft mode all vault mutations are buffered and only committed when
 # report_completion(outcome="ok") is called. Non-ok outcomes discard the buffer
@@ -250,10 +258,9 @@ TOOLS: list[dict] = [
     {
         "name": "get_context",
         "description": (
-            "Return task-level context provided by the harness, including the vault's "
-            "current date (vault_today). Call this FIRST on any task involving dates, "
-            "date arithmetic, or scheduling. The response may contain 'Today: YYYY-MM-DD' "
-            "or similar vault metadata. Never skip this call for date tasks."
+            "Return task-level context from the harness (vault_today and other metadata). "
+            "This context is also pre-injected into your system prompt at startup. "
+            "Call this tool if you need to re-read the context mid-task."
         ),
         "inputSchema": {"type": "object", "properties": {}, "required": []},
     },
@@ -589,15 +596,14 @@ def _handle(req: dict) -> None:
     req_id = req.get("id")
 
     if method == "initialize":
-        _send({
-            "jsonrpc": "2.0",
-            "id": req_id,
-            "result": {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"tools": {}},
-                "serverInfo": {"name": "pcm-mcp", "version": "2.0.0"},
-            },
-        })
+        result: dict = {
+            "protocolVersion": "2024-11-05",
+            "capabilities": {"tools": {}},
+            "serverInfo": {"name": "pcm-mcp", "version": "2.0.0"},
+        }
+        if _vault_context:
+            result["instructions"] = f"TASK CONTEXT (from harness):\n{_vault_context}"
+        _send({"jsonrpc": "2.0", "id": req_id, "result": result})
 
     elif method == "tools/list":
         _send({

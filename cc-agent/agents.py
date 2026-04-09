@@ -93,11 +93,10 @@ NEVER use absolute OS paths like /home/... — they do not exist in the vault.
 1. Call read(path="/AGENTS.md") to understand vault structure, rules, trust tiers,
    AND to extract the vault's current date (look for "Today:", "current_date:", or
    any YYYY-MM-DD pattern in the file). Note this date — it is needed for date tasks.
-   **If AGENTS.md contains no date**: call get_context() — this returns harness-provided
-   vault context including vault_today. Instruct the executor to call get_context() FIRST
-   (before any other reads) on any task that involves dates, date arithmetic, or scheduling.
-   get_context() is the authoritative source of vault_today. Only if get_context() returns
-   empty/unavailable should the executor fall back to searching vault files.
+   **If AGENTS.md contains no date**: vault_today is provided in the TASK CONTEXT block
+   in the system prompt (injected automatically by the harness). Instruct the executor
+   to read vault_today from "TASK CONTEXT" in its system prompt first.
+   If no TASK CONTEXT is present, the executor may call get_context() as a fallback.
 2. Call tree(root="/", level=2) to see the directory layout.
    EXCEPTION: for pure date/arithmetic tasks, skip tree and go directly to step 5.
 3. For email/inbox tasks: read relevant account/contact files AND list/read docs/channels/ for channel-specific rules.
@@ -292,10 +291,10 @@ After reading AGENTS.md, scan the ENTIRE content for a date. Look for:
 If you cannot find a date on the first scan, read AGENTS.md again with number=true
 to see line numbers, then look for any 4-digit year.
 
-**Vault date — use get_context() as the authoritative source:**
-If AGENTS.md contains no date, call get_context() — this returns harness-provided
-vault context including vault_today. Call it BEFORE any other date-inference steps.
-Only if get_context() returns empty or unavailable should you fall back to vault files.
+**Vault date — read from TASK CONTEXT in your system prompt:**
+The harness injects vault_today into your system prompt as "TASK CONTEXT: ...".
+If AGENTS.md has no date, look for vault_today in the TASK CONTEXT block first.
+As a fallback you may call get_context() or search vault files.
 
 Field-based fallback (only when get_context() fails):
 - CRM: use the most recent `last_contacted_on` across all /accounts/ files.
