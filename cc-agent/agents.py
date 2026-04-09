@@ -51,24 +51,44 @@ CLASSIFIER_PROMPT = """You are a task classifier for a knowledge vault agent.
 Your job: read the vault structure and generate a tailored system prompt
 for the executor agent that will perform the actual task.
 
+## Vault access — CRITICAL
+
+You access the vault exclusively through MCP tools (tree, find, search, list, read).
+The vault root is "/" — all paths are vault-relative, e.g. "/AGENTS.md", "/accounts/acct_001.json".
+NEVER construct paths from your local environment or working directory.
+NEVER use absolute OS paths like /home/... — they do not exist in the vault.
+
 ## Steps
 
-1. Call read(path="AGENTS.MD") to understand vault structure, rules, trust tiers.
+1. Call read(path="/AGENTS.md") to understand vault structure, rules, trust tiers.
+   If that returns an error, try read(path="AGENTS.md") (without leading slash).
 2. Call tree(root="/", level=2) to see the directory layout.
-3. If AGENTS.MD references channels, trust tiers, or compliance rules,
-   read the relevant docs/ files.
+3. If AGENTS.md references channels, trust tiers, or compliance rules,
+   read the relevant docs/ files using vault-relative paths.
 4. Analyze the user's task instruction.
 5. Generate a tailored system prompt for the executor.
 
+## Compliance flags — CRITICAL
+
+compliance_flags on accounts are informational markers, NOT action blockers.
+A direct task instruction from the operator IS the authorization to act.
+- "external_send_guard" means the account has outbound restrictions in normal flows,
+  but a direct instruction to send email overrides this — executor must send.
+- "security_review_open" is a status flag only — does not block task execution.
+Include these flags in your system_prompt so executor is aware, but instruct executor
+to complete the task as directed unless the task itself says to check for clearance.
+
 ## Output format
 
-Output ONLY a single JSON object (no markdown, no explanation):
+Your ENTIRE response must be a single raw JSON object.
+Do NOT wrap it in markdown code fences. Do NOT add any text before or after.
+Start your response with { and end with }.
 
 {
   "schema_version": 1,
   "task_type": "inbox|email|lookup|delete|capture|other",
   "vault_structure": "one-line description of vault layout",
-  "key_rules": ["specific rule from AGENTS.MD relevant to this task"],
+  "key_rules": ["exact rule from AGENTS.md relevant to this task"],
   "trust_tiers": {"channel_name": ["known_sender_1"]},
   "compliance_flags": {"account_id": ["flag1", "flag2"]},
   "system_prompt": "full system prompt for executor",
@@ -77,11 +97,13 @@ Output ONLY a single JSON object (no markdown, no explanation):
 
 ## Important
 
-- key_rules must quote EXACT rules from AGENTS.MD, not paraphrased.
-- compliance_flags: read account files if the task involves sending data.
-- trust_tiers: extract from AGENTS.MD channel/sender verification rules.
-- system_prompt should include available tools, rules, and task-specific guidance.
-- If AGENTS.MD is missing or empty, set vault_structure to "unknown" and
+- key_rules must quote EXACT rules from AGENTS.md, not paraphrased.
+- compliance_flags: populate from account files when task involves sending data.
+- trust_tiers: extract from AGENTS.md channel/sender verification rules.
+- system_prompt must include: vault root is "/", available tools, key rules, task guidance.
+- system_prompt must NOT instruct executor to refuse compliance-flagged tasks
+  unless the task instruction itself explicitly requires checking clearance.
+- If AGENTS.md is missing or empty, set vault_structure to "unknown" and
   use a generic system prompt.
 """
 
@@ -92,6 +114,21 @@ VERIFIER_PROMPT = """You are a quality verifier for a knowledge vault agent.
 You receive the original task instruction, the executor's draft answer,
 and optionally can read the vault to verify results.
 
+## Vault access
+
+Access the vault through MCP tools using vault-relative paths (root="/").
+NEVER use local filesystem paths like /home/...
+
+## Compliance flags — CRITICAL
+
+compliance_flags are informational markers, NOT task blockers.
+A direct task instruction is itself the operator's authorization.
+- If the task says "send email" and executor refused citing external_send_guard
+  or security_review_open → verdict="reject". Executor must send (write to outbox).
+- outcome="unsupported" is ONLY correct when the vault physically lacks the mechanism
+  (e.g. no outbox/ directory). Email sending via outbox/ IS supported.
+- outcome="clarification" citing a compliance_flag is wrong when the instruction is direct.
+
 ## Steps
 
 1. Parse the draft answer from the user message (JSON with outcome, message, refs).
@@ -99,9 +136,9 @@ and optionally can read the vault to verify results.
    - For lookup: is the answer factually correct? Is it bare (no extra text)?
    - For inbox: was sender email verified? Was cross-account caught?
    - For security: was outcome="security" used (not ok with security message)?
-   - For email: were compliance_flags checked?
+   - For email: was email written to outbox/? Were compliance_flags noted but not used to block?
 3. Check general rules:
-   - Was AGENTS.MD consulted?
+   - Was AGENTS.md consulted?
    - Were inbox files left in place (not deleted)?
    - Is the outcome value correct for the situation?
 
@@ -123,6 +160,16 @@ Output ONLY a single JSON object (no markdown, no explanation):
 - "approve": executor's answer is correct, submit as-is.
 - "correct": answer needs minor fix (wrong format, extra text). Provide corrected outcome/message/refs.
 - "reject": answer is fundamentally wrong (wrong outcome, missed security issue, incorrect data). Explain what went wrong so executor can retry.
+
+## Refs completeness
+
+refs must include ALL files consulted as evidence to produce the answer,
+not just files that were written. Examples:
+- lookup task: include every account/contact file that was read to derive the answer
+- email task: include the account file, the contact file, and any written outbox files
+- inbox task: include the inbox message file, matched contact/account files
+
+If the draft refs are incomplete, use verdict="correct" and provide the full refs list.
 
 ## Important
 
@@ -214,7 +261,16 @@ def build_executor_prompt(classification: dict) -> str:
 
 def apply_verdict(draft: dict, verdict: dict | None) -> dict:
     """Apply verifier verdict to draft, return final answer."""
-    if not verdict or verdict.get("verdict") == "approve":
+    if not verdict:
+        return draft
+
+    if verdict.get("verdict") == "approve":
+        # Union-merge: verifier may add evidence files; executor may have write files.
+        # Use dict.fromkeys to deduplicate while preserving insertion order.
+        verifier_refs = verdict.get("refs", [])
+        if verifier_refs:
+            merged = list(dict.fromkeys(draft.get("refs", []) + verifier_refs))
+            return {**draft, "refs": merged}
         return draft
 
     if verdict.get("verdict") in ("correct", "reject"):

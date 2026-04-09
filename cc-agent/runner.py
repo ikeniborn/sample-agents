@@ -247,8 +247,13 @@ def _spawn_iclaude(
     model: str,
     timeout: int,
     echo: bool = True,
+    bare: bool = False,
 ) -> tuple[list[str], int]:
-    """Spawn iclaude subprocess. Returns (stdout_lines, exit_code)."""
+    """Spawn iclaude subprocess. Returns (stdout_lines, exit_code).
+
+    bare=True: adds --bare flag to strip project CLAUDE.md context and cwd
+    awareness — use for classifier/verifier that must not inherit project paths.
+    """
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, prefix="mcp_"
     ) as f:
@@ -263,6 +268,8 @@ def _spawn_iclaude(
         "--mcp-config", cfg_path,
         "--system-prompt", system_prompt,
     ]
+    if bare:
+        cmd.append("--bare")
     if model:
         cmd.extend(["--model", model])
     cmd.append(user_prompt)
@@ -334,6 +341,7 @@ def _run_pipeline(
         model=CLAUDE_CLASSIFIER_MODEL,
         timeout=CLASSIFIER_TIMEOUT,
         echo=False,
+        bare=True,
     )
     classification = parse_classifier_output(cls_lines)
 
@@ -390,6 +398,7 @@ def _executor_verify_loop(
         user_prompt=instruction,
         model=CLAUDE_MODEL,
         timeout=exec_t,
+        bare=True,
     )
 
     draft = _read_json(draft_file)
@@ -418,6 +427,7 @@ def _executor_verify_loop(
         user_prompt=verifier_input,
         model=verifier_model,
         timeout=ver_t,
+        bare=True,
         echo=False,
     )
     verdict = parse_verifier_output(ver_lines)
@@ -480,6 +490,7 @@ def _execute_single(
         user_prompt=instruction,
         model=CLAUDE_MODEL,
         timeout=TASK_TIMEOUT,
+        bare=True,
     )
 
 
