@@ -248,11 +248,17 @@ def _spawn_iclaude(
     timeout: int,
     echo: bool = True,
     bare: bool = False,
+    output_format: str = "",
 ) -> tuple[list[str], int]:
     """Spawn iclaude subprocess. Returns (stdout_lines, exit_code).
 
-    bare=True: adds --bare flag to strip project CLAUDE.md context and cwd
-    awareness — use for classifier/verifier that must not inherit project paths.
+    bare=True: runs from /tmp to prevent CLAUDE.md auto-discovery from
+    the project directory — Claude walks up from cwd to find CLAUDE.md files.
+    Does NOT use --bare CLI flag (that flag disables OAuth/keychain auth).
+
+    output_format: passed as --output-format <value> (e.g. "json").
+    With "json" the CLI wraps model output in a JSON envelope; _extract_json
+    in agents.py unwraps it transparently.
     """
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, prefix="mcp_"
@@ -268,11 +274,14 @@ def _spawn_iclaude(
         "--mcp-config", cfg_path,
         "--system-prompt", system_prompt,
     ]
-    if bare:
-        cmd.append("--bare")
     if model:
         cmd.extend(["--model", model])
+    if output_format:
+        cmd.extend(["--output-format", output_format])
     cmd.append(user_prompt)
+
+    # bare=True: use neutral cwd to prevent project CLAUDE.md discovery
+    cwd = Path("/tmp") if bare else None
 
     exit_code = -1
     stdout_lines: list[str] = []
@@ -283,6 +292,7 @@ def _spawn_iclaude(
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            cwd=cwd,
             env={**os.environ, "PYTHONPATH": str(_PAC1_DIR)},
         )
         stdout_lines = _collect_stdout(proc.stdout, echo=echo)
@@ -342,6 +352,7 @@ def _run_pipeline(
         timeout=CLASSIFIER_TIMEOUT,
         echo=False,
         bare=True,
+        output_format="json",
     )
     classification = parse_classifier_output(cls_lines)
 
@@ -352,8 +363,12 @@ def _run_pipeline(
             print(f"  {CLI_GREEN}[classifier] type={classification.get('task_type', '?')}{CLI_CLR}")
     else:
         executor_prompt = get_prompt(instruction)
+        # Save raw output for post-mortem debugging
+        raw_out = "\n".join(cls_lines)
+        (task_dir / "classifier_raw.txt").write_text(raw_out, encoding="utf-8")
         _append_jsonl(task_dir / "pipeline.events.jsonl", {
             "type": "classifier_fallback", "reason": "parse_failed", "exit_code": cls_exit,
+            "raw_lines": len(cls_lines),
         })
         with _STDOUT_LOCK:
             print(f"  {CLI_RED}[classifier] fallback to static prompt{CLI_CLR}")
@@ -429,6 +444,7 @@ def _executor_verify_loop(
         timeout=ver_t,
         bare=True,
         echo=False,
+        output_format="json",
     )
     verdict = parse_verifier_output(ver_lines)
 

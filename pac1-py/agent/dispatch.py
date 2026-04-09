@@ -212,7 +212,8 @@ def _load_secrets(path: str = ".secrets") -> None:
             continue
         key, _, value = line.partition("=")
         key = key.strip()
-        value = value.strip()
+        # Strip inline comments: split on unescaped '#' (e.g. "300   # comment")
+        value = value.split("#")[0].strip() if "#" in value else value.strip()
         if key and key not in os.environ:
             os.environ[key] = value
 

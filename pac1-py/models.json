@@ -89,6 +89,17 @@
     "ollama_options_coder": "coder",
     "ollama_options_evaluator": "evaluator"
   },
+  "qwen3-coder-next:cloud": {
+    "provider": "ollama",
+    "max_completion_tokens": 4000,
+    "ollama_think": true,
+    "ollama_options": "default",
+    "ollama_options_think": "think",
+    "ollama_options_longContext": "long_ctx",
+    "ollama_options_classifier": "classifier",
+    "ollama_options_coder": "coder",
+    "ollama_options_evaluator": "evaluator"
+  },
   "qwen3.5:397b-cloud": {
     "provider": "ollama",
     "max_completion_tokens": 4000,

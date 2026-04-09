@@ -139,7 +139,7 @@ def _scan_for_injection(content: str) -> bool:
 
 _MUTATION_TOOLS = {"write", "delete", "move", "mkdir"}
 _STALL_REPEAT = 3
-_STALL_NO_MUTATION = 12
+_STALL_NO_MUTATION = 12  # only checked in full/draft modes
 
 _tool_history: list[str] = []
 _last_mutation_step: int = 0
@@ -154,9 +154,11 @@ def _check_stall() -> str | None:
     if len(_tool_history) >= _STALL_REPEAT:
         if len(set(_tool_history[-_STALL_REPEAT:])) == 1:
             return f"STALL: identical tool call repeated {_STALL_REPEAT} times"
-    steps_since = len(_tool_history) - _last_mutation_step
-    if steps_since >= _STALL_NO_MUTATION:
-        return f"STALL: {steps_since} steps without mutation"
+    # Readonly agents never mutate by design — skip no-mutation stall check
+    if _MCP_MODE != "readonly":
+        steps_since = len(_tool_history) - _last_mutation_step
+        if steps_since >= _STALL_NO_MUTATION:
+            return f"STALL: {steps_since} steps without mutation"
     return None
 
 
@@ -558,7 +560,10 @@ def _handle(req: dict) -> None:
                 _last_mutation_step = len(_tool_history)
             stall = _check_stall()
             if stall:
-                result_text += f"\n\n[SYSTEM HINT: {stall}. Change your approach or call report_completion.]"
+                if _MCP_MODE == "readonly":
+                    result_text += f"\n\n[SYSTEM HINT: {stall}. Output your JSON result now.]"
+                else:
+                    result_text += f"\n\n[SYSTEM HINT: {stall}. Change your approach or call report_completion.]"
                 _emit_event("stall_detected", {"reason": stall, "step_count": len(_tool_history)})
 
             _send({
