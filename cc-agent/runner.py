@@ -25,6 +25,8 @@ Env vars (from cc-agent/.env, .secrets, or shell):
     CLAUDE_MODEL            executor model (default: CLI default)
     CLAUDE_CLASSIFIER_MODEL default: haiku
     CLAUDE_VERIFIER_MODEL   default: auto (picks model different from executor)
+    CLASSIFIER_TIMEOUT_S    default: 60  (hard cap for classifier subprocess)
+    VERIFIER_TIMEOUT_S      default: 90  (hard cap for verifier subprocess; overrides dynamic budget cap)
 """
 
 import json
@@ -98,6 +100,7 @@ CLAUDE_VERIFIER_MODEL = os.getenv("CLAUDE_VERIFIER_MODEL", "")
 MULTI_AGENT = os.getenv("MULTI_AGENT", "1") != "0"
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "1"))
 CLASSIFIER_TIMEOUT = int(os.getenv("CLASSIFIER_TIMEOUT_S", "60"))
+VERIFIER_TIMEOUT = int(os.getenv("VERIFIER_TIMEOUT_S", "90"))
 
 _MCP_SERVER = Path(__file__).parent / "mcp_pcm.py"
 _PAC1_DIR = Path(__file__).parent.parent / "pac1-py"
@@ -199,7 +202,7 @@ def _time_budget(remaining: float, attempt: int, max_attempts: int) -> tuple[int
     if remaining_attempts <= 0:
         return int(remaining * 0.8), int(remaining * 0.2)
     per_attempt = remaining / remaining_attempts
-    verifier_t = min(30, per_attempt * 0.25)
+    verifier_t = min(VERIFIER_TIMEOUT, per_attempt * 0.25)
     executor_t = per_attempt - verifier_t
     return max(int(executor_t), 10), max(int(verifier_t), 10)
 
@@ -630,6 +633,7 @@ def main() -> None:
     print(f"Benchmark: {bench.benchmark_id} — {len(bench.tasks)} tasks  (parallel={PARALLEL_TASKS}, mode={mode_label})")
     if MULTI_AGENT:
         print(f"Models: classifier={CLAUDE_CLASSIFIER_MODEL}  executor={CLAUDE_MODEL or 'default'}  verifier={_RESOLVED_VERIFIER_MODEL}  retries={MAX_RETRIES}")
+        print(f"Timeouts: task={TASK_TIMEOUT}s  classifier={CLASSIFIER_TIMEOUT}s  verifier={VERIFIER_TIMEOUT}s")
     print(f"{CLI_GREEN}{bench.description}{CLI_CLR}\n")
 
     scores: list[dict] = []

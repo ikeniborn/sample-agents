@@ -60,6 +60,46 @@ _DRAFT_FILE = os.environ.get("DRAFT_FILE", "")
 
 _mono_start = _time.monotonic()
 
+# ── Draft mode write buffer ───────────────────────────────────────────────────
+# In draft mode all vault mutations are buffered and only committed when
+# report_completion(outcome="ok") is called. Non-ok outcomes discard the buffer
+# so no vault changes survive a clarification/security/unsupported result.
+_draft_buffer: list[dict] = []  # [{"op": str, "args": dict}, ...]
+_draft_had_writes = False
+
+
+def _buffer_write(op: str, args: dict) -> None:
+    global _draft_had_writes
+    _draft_buffer.append({"op": op, "args": args})
+    _draft_had_writes = True
+
+
+def _draft_get_buffered(path: str) -> str | None:
+    """Return content most recently buffered for path, or None."""
+    norm = "/" + path.lstrip("/")
+    for item in reversed(_draft_buffer):
+        if item["op"] == "write":
+            if "/" + item["args"].get("path", "").lstrip("/") == norm:
+                return item["args"].get("content", "")
+    return None
+
+
+def _draft_replay_buffer() -> None:
+    """Replay buffered vault mutations to the real vault (called on ok outcome)."""
+    for item in _draft_buffer:
+        op, args = item["op"], item["args"]
+        if op == "write":
+            _vm.write(WriteRequest(
+                path=args["path"], content=args["content"],
+                start_line=args.get("start_line", 0), end_line=args.get("end_line", 0),
+            ))
+        elif op == "delete":
+            _vm.delete(DeleteRequest(path=args["path"]))
+        elif op == "mkdir":
+            _vm.mk_dir(MkDirRequest(path=args["path"]))
+        elif op == "move":
+            _vm.move(MoveRequest(from_name=args["from_name"], to_name=args["to_name"]))
+
 
 # ── JSONL event logging ────────────────────────────────────────────────────
 
@@ -398,6 +438,11 @@ def _call_tool(name: str, args: dict) -> str:
         )
 
     elif name == "read":
+        # In draft mode, return buffered content for files written in this session
+        if _MCP_MODE == "draft":
+            buffered = _draft_get_buffered(args["path"])
+            if buffered is not None:
+                return buffered or "(empty)"
         resp = _vm.read(ReadRequest(
             path=args["path"],
             number=args.get("number", False),
@@ -425,6 +470,10 @@ def _call_tool(name: str, args: dict) -> str:
         if block:
             _emit_event("guard_block", {"tool": "write", "path": args["path"], "reason": block})
             return block
+        if _MCP_MODE == "draft":
+            _buffer_write("write", args)
+            _emit_event("write_buffered", {"path": args["path"]})
+            return f"Staged (will commit on ok): {args['path']}"
         _vm.write(WriteRequest(
             path=args["path"],
             content=args["content"],
@@ -438,10 +487,18 @@ def _call_tool(name: str, args: dict) -> str:
         if block:
             _emit_event("guard_block", {"tool": "delete", "path": args["path"], "reason": block})
             return block
+        if _MCP_MODE == "draft":
+            _buffer_write("delete", args)
+            _emit_event("write_buffered", {"path": args["path"], "op": "delete"})
+            return f"Staged delete (will commit on ok): {args['path']}"
         _vm.delete(DeleteRequest(path=args["path"]))
         return f"Deleted: {args['path']}"
 
     elif name == "mkdir":
+        if _MCP_MODE == "draft":
+            _buffer_write("mkdir", args)
+            _emit_event("write_buffered", {"path": args["path"], "op": "mkdir"})
+            return f"Staged mkdir (will commit on ok): {args['path']}"
         _vm.mk_dir(MkDirRequest(path=args["path"]))
         return f"Created: {args['path']}"
 
@@ -450,10 +507,15 @@ def _call_tool(name: str, args: dict) -> str:
         if block:
             _emit_event("guard_block", {"tool": "move", "path": args["to_name"], "reason": block})
             return block
+        if _MCP_MODE == "draft":
+            _buffer_write("move", args)
+            _emit_event("write_buffered", {"path": args["to_name"], "op": "move"})
+            return f"Staged move (will commit on ok): {args['from_name']} → {args['to_name']}"
         _vm.move(MoveRequest(from_name=args["from_name"], to_name=args["to_name"]))
         return f"Moved: {args['from_name']} → {args['to_name']}"
 
     elif name == "report_completion":
+        global _draft_had_writes, _draft_buffer
         outcome_key = args.get("outcome", "ok")
         msg = args.get("message", "")
         refs = args.get("refs", [])
@@ -464,7 +526,20 @@ def _call_tool(name: str, args: dict) -> str:
             _emit_event("eval_warning", {"warning": w, "outcome": outcome_key, "message": _truncate(msg, 500)})
 
         if _MCP_MODE == "draft":
-            # Draft mode: save to file, do NOT call vm.answer()
+            if outcome_key == "ok":
+                # Commit buffered vault mutations, then save draft
+                if _draft_buffer:
+                    _draft_replay_buffer()
+                    _emit_event("draft_writes_committed", {"count": len(_draft_buffer)})
+            else:
+                # Non-ok outcome: discard buffer — no vault changes
+                if _draft_had_writes:
+                    _emit_event("draft_writes_discarded", {
+                        "count": len(_draft_buffer), "outcome": outcome_key,
+                    })
+            _draft_buffer = []
+            _draft_had_writes = False
+
             draft = {"schema_version": 1, "outcome": outcome_key, "message": msg, "refs": refs}
             if _DRAFT_FILE:
                 Path(_DRAFT_FILE).write_text(json.dumps(draft, ensure_ascii=False, indent=2))
