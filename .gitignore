@@ -6,3 +6,4 @@
 .secrets
 tmp/
 cc-agent/logs
+cc-agent/.claude/plans

@@ -96,6 +96,10 @@ def _setup_log_tee() -> None:
 LOG_LEVEL = (os.getenv("LOG_LEVEL") or "INFO").upper()  # re-exported for external use
 _setup_log_tee()
 
+from agent.tracer import init_tracer as _init_tracer, close_tracer as _close_tracer, set_task_id as _set_task_id
+if _run_dir is not None:
+    _init_tracer(str(_run_dir))
+
 
 from bitgn.harness_connect import HarnessServiceClientSync
 from bitgn.harness_pb2 import (
@@ -191,6 +195,7 @@ def _run_single_task(trial_id: str, task_filter: list, router: ModelRouter) -> t
         return (task_id, -1, [], 0.0, {})
 
     _task_local.task_id = task_id  # stdout prefix for this thread
+    _set_task_id(task_id)          # tracer thread-local (TRACE_ENABLED=1 only, no-op otherwise)
     assert _run_dir is not None, "_run_dir not initialised by _setup_log_tee"
     _task_local.log_fh = open(_run_dir / f"{task_id}.log", "w", buffering=1, encoding="utf-8")
     try:
@@ -399,4 +404,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    finally:
+        _close_tracer()

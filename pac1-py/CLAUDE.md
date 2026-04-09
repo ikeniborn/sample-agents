@@ -36,10 +36,34 @@ main.py → run_agent() [__init__.py]
   ├── ModelRouter.resolve() [classifier.py]  ← classify task type, pick model
   ├── run_prephase() [prephase.py]           ← tree + read AGENTS.MD → PrephaseResult
   └── run_loop() [loop.py]                   ← 30-step loop, returns token stats
-        ├── compact log (keep prefix + last 5 pairs)
+        ├── compact log (keep prefix + last 5 pairs) [log_compaction.py]
         ├── call LLM → NextStep [dispatch.py]
-        ├── stall detection [FIX-74]
+        ├── stall detection [stall.py, FIX-74]
+        ├── security gates [security.py, FIX-203/206/214/215/250]
+        ├── JSON extraction [json_extract.py, FIX-146]
         └── dispatch tool → PCM runtime
+```
+
+### Extracted modules (decomposed from loop.py)
+
+| Module | Contents |
+|--------|----------|
+| `agent/log_compaction.py` | `_StepFact`, `build_digest`, `_compact_log`, `_compact_tool_result`, `_history_action_repr` |
+| `agent/json_extract.py` | 7-level JSON extraction (`_extract_json_from_text`), `_normalize_parsed` |
+| `agent/stall.py` | `_check_stall`, `_handle_stall_retry` (dependency-injected `call_llm_fn`) |
+| `agent/security.py` | FIX-203/206/214/215/250 constants and functions, `_check_write_scope` |
+| `agent/tracer.py` | JSONL replay tracer — `init_tracer`, `get_task_tracer`, `TaskTracer.emit` |
+
+### Replay tracer (`agent/tracer.py`)
+
+Controlled by `TRACE_ENABLED=1` env var (default: 0, no overhead in prod).
+Output: `logs/{ts}_{model}/traces.jsonl` — one JSON line per event.
+
+Event types: `task_start`, `llm_response`, `dispatch_result`, `stall_detected`, `evaluator_call`, `task_end`.
+
+```bash
+TRACE_ENABLED=1 uv run python main.py t01
+cat logs/*/traces.jsonl | python -c "import sys,json; [print(json.loads(l)['event']) for l in sys.stdin]"
 ```
 
 ### LLM dispatch (`agent/dispatch.py`)

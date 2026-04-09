@@ -4,7 +4,6 @@ import os
 import re
 import threading
 import time
-import unicodedata
 from collections import Counter, deque
 from dataclasses import dataclass, field
 
@@ -29,6 +28,15 @@ from .dispatch import (
 )
 from .classifier import TASK_EMAIL, TASK_LOOKUP, TASK_INBOX, TASK_DISTILL
 from .evaluator import evaluate_completion  # FIX-218
+from .tracer import get_task_tracer  # П3: replay tracer (no-op when TRACE_ENABLED=0)
+from .security import (  # FIX-203/206/214/215/250
+    _normalize_for_injection,
+    _CONTAM_PATTERNS,
+    _FORMAT_GATE_RE,
+    _INBOX_INJECTION_PATTERNS,
+    _INBOX_ACTION_RE,
+    _check_write_scope,
+)
 from .models import NextStep, ReportTaskCompletion, Req_Delete, Req_List, Req_Read, Req_Search, Req_Write, Req_MkDir, Req_Move, TaskRoute, EmailOutbox
 from .prephase import PrephaseResult
 
@@ -59,39 +67,7 @@ _INJECTION_RE = re.compile(
     re.IGNORECASE,
 )
 
-# FIX-203: text normalization for injection detection — strips zero-width chars,
-# NFKC-normalizes unicode (homoglyphs → ASCII), and replaces common leet substitutions.
-_LEET_MAP = str.maketrans("01345@", "oleasa")  # 0→o, 1→l, 3→e, 4→a, 5→s, @→a
-_ZERO_WIDTH_RE = re.compile(r"[\u200b\u200c\u200d\u2060\ufeff]")
-
-def _normalize_for_injection(text: str) -> str:
-    """FIX-203: Normalize text before injection regex check."""
-    t = _ZERO_WIDTH_RE.sub("", text)
-    t = unicodedata.normalize("NFKC", t)
-    t = t.translate(_LEET_MAP)
-    return t
-
-# FIX-206: body anti-contamination patterns for outbox email verification.
-# Detects vault paths, tree output, tool results, and system file references leaked into email body.
-_CONTAM_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"^/[a-zA-Z_\-]+/", re.MULTILINE), "vault path"),
-    (re.compile(r"VAULT STRUCTURE:"), "vault tree"),
-    (re.compile(r"[├└│]──"), "tree output"),
-    (re.compile(r"\bResult of Req_"), "tool result"),
-    (re.compile(r"\bAGENTS\.MD\b"), "system file ref"),
-]
-
-# FIX-214: format gate — inbox message must have From: or Channel: header
-_FORMAT_GATE_RE = re.compile(r"^\s*(from|channel)\s*:", re.IGNORECASE | re.MULTILINE)
-
-# FIX-215: inbox injection patterns — code-level security check
-_INBOX_INJECTION_PATTERNS = [
-    re.compile(r"(read|list|open|check|inspect)\s+(docs/|AGENTS|otp\.txt)", re.IGNORECASE),
-    re.compile(r"(override|escalat|jailbreak|bypass|system\s*override|forget\s*(your|the)\s*rules)", re.IGNORECASE),
-    re.compile(r"(you\s+are\s+now|as\s+admin|special\s+authority)", re.IGNORECASE),
-    re.compile(r"if\s+(char|otp|the\s+first)", re.IGNORECASE),
-]
-_INBOX_ACTION_RE = re.compile(r"\b(please\s+do|follow\s+this|run|execute)\b", re.IGNORECASE)
+# FIX-203/206/214/215: security constants/functions imported from agent/security.py
 
 # FIX-226: reschedule date verification — detects reschedule tasks for +8 day rule check
 _RESCHEDULE_RE = re.compile(
@@ -162,81 +138,19 @@ def _format_result(result, txt: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Tool result compaction for log history
+# Tool result compaction, step facts, digest and log compaction
+# — extracted to agent/log_compaction.py
 # ---------------------------------------------------------------------------
 
-_MAX_READ_HISTORY = 4000  # chars of file content kept in history (model saw full text already)  # FIX-147
-
-
-def _compact_tool_result(action_name: str, txt: str) -> str:
-    """Compact tool result before storing in log history.
-    The model already received the full result in the current step's user message;
-    history only needs a reference-quality summary to avoid token accumulation."""
-    if txt.startswith("WRITTEN:") or txt.startswith("DELETED:") or \
-            txt.startswith("CREATED DIR:") or txt.startswith("MOVED:") or \
-            txt.startswith("ERROR") or txt.startswith("VAULT STRUCTURE:"):
-        return txt  # already compact or important verbatim
-
-    if action_name == "Req_Read":
-        try:
-            d = json.loads(txt)
-            content = d.get("content", "")
-            path = d.get("path", "")
-            if len(content) > _MAX_READ_HISTORY:
-                return f"{path}: {content[:_MAX_READ_HISTORY]}...[+{len(content) - _MAX_READ_HISTORY} chars]"
-        except (json.JSONDecodeError, ValueError):
-            pass
-        return txt[:_MAX_READ_HISTORY + 30] + ("..." if len(txt) > _MAX_READ_HISTORY + 30 else "")
-
-    if action_name == "Req_List":
-        try:
-            d = json.loads(txt)
-            names = [e["name"] for e in d.get("entries", [])]
-            return f"entries: {', '.join(names)}" if names else "entries: (empty)"
-        except (json.JSONDecodeError, ValueError, KeyError):
-            pass
-
-    if action_name == "Req_Search":
-        try:
-            d = json.loads(txt)
-            hits = [f"{m['path']}:{m.get('line', '')}" for m in d.get("matches", [])]
-            if hits:
-                return f"matches: {', '.join(hits)}"
-            return "matches: (none)"
-        except (json.JSONDecodeError, ValueError, KeyError):
-            pass
-
-    return txt  # fallback: unchanged
-
-
-# ---------------------------------------------------------------------------
-# Assistant message schema strip for log history
-# ---------------------------------------------------------------------------
-
-def _history_action_repr(action_name: str, action) -> str:
-    """Compact function call representation for log history.
-    Drops None/False/0/'' defaults (e.g. number=false, start_line=0) that waste tokens
-    without carrying information. Full args still used for actual dispatch."""
-    try:
-        d = action.model_dump(exclude_none=True)
-        d = {k: v for k, v in d.items() if v not in (False, 0, "")}
-        args_str = json.dumps(d, ensure_ascii=False, separators=(",", ":"))
-        return f"Action: {action_name}({args_str})"
-    except Exception:
-        return f"Action: {action_name}({action.model_dump_json()})"
-
-
-# ---------------------------------------------------------------------------
-# Step facts accumulation for rolling state digest
-# ---------------------------------------------------------------------------
-
-@dataclass
-class _StepFact:
-    """One key fact extracted from a completed step for rolling digest."""
-    kind: str    # "list", "read", "search", "write", "delete", "move", "mkdir", "stall"
-    path: str
-    summary: str  # compact 1-line description
-    error: str = ""  # FIX-199: preserve error details through compaction
+from .log_compaction import (
+    _MAX_READ_HISTORY,
+    _compact_tool_result,
+    _history_action_repr,
+    _StepFact,
+    _extract_fact,
+    build_digest,
+    _compact_log,
+)
 
 
 @dataclass
@@ -292,166 +206,7 @@ class _LoopState:
     llm_call_count: int = 0
 
 
-def _extract_fact(action_name: str, action, result_txt: str) -> "_StepFact | None":
-    """Extract key fact from a completed step — used to build state digest."""
-    path = getattr(action, "path", getattr(action, "from_name", ""))
-
-    if action_name == "Req_Read":
-        try:
-            d = json.loads(result_txt)
-            content = d.get("content", "").replace("\n", " ").strip()
-            if "accounts/" in path:
-                # [FIX-244] Structured digest for account files: extract key lookup fields
-                # instead of char-truncating. Truncation at 250 cuts off `account_manager`
-                # mid-value, causing agent to hallucinate manager names from partial data.
-                try:
-                    acct = json.loads(d.get("content", ""))
-                    summary = json.dumps(
-                        {
-                            "name": acct.get("name", ""),
-                            "account_manager": acct.get("account_manager", ""),
-                            "status": acct.get("status", ""),
-                            "industry": acct.get("industry", ""),
-                        },
-                        ensure_ascii=False,
-                    )
-                    return _StepFact("read", path, summary)
-                except (json.JSONDecodeError, ValueError):
-                    return _StepFact("read", path, content[:250])
-            elif "inbox/" in path:
-                _limit = 500  # FIX-258: evaluator needs full message for cross-account check
-            else:
-                _limit = 120
-            return _StepFact("read", path, content[:_limit])
-        except (json.JSONDecodeError, ValueError):
-            pass
-        return _StepFact("read", path, result_txt[:80].replace("\n", " "))
-
-    if action_name == "Req_List":
-        try:
-            d = json.loads(result_txt)
-            names = [e["name"] for e in d.get("entries", [])]
-            return _StepFact("list", path, ", ".join(names[:10]))
-        except (json.JSONDecodeError, ValueError, KeyError):
-            return _StepFact("list", path, result_txt[:60])
-
-    if action_name == "Req_Search":
-        try:
-            d = json.loads(result_txt)
-            hits = [f"{m['path']}:{m.get('line', '')}" for m in d.get("matches", [])]
-            summary = ", ".join(hits) if hits else "(no matches)"
-            return _StepFact("search", path, summary)
-        except (json.JSONDecodeError, ValueError, KeyError):
-            return _StepFact("search", path, result_txt[:60])
-
-    # For mutating operations, check result_txt for errors before reporting success
-    _is_err = result_txt.startswith("ERROR")
-    _err_detail = result_txt[:120] if _is_err else ""  # FIX-199: capture error for digest
-    if action_name == "Req_Write":
-        summary = result_txt[:80] if _is_err else f"WRITTEN: {path}"
-        return _StepFact("write", path, summary, error=_err_detail)
-    if action_name == "Req_Delete":
-        summary = result_txt[:80] if _is_err else f"DELETED: {path}"
-        return _StepFact("delete", path, summary, error=_err_detail)
-    if action_name == "Req_Move":
-        to = getattr(action, "to_name", "?")
-        summary = result_txt[:80] if _is_err else f"MOVED: {path} → {to}"
-        return _StepFact("move", path, summary, error=_err_detail)
-    if action_name == "Req_MkDir":
-        summary = result_txt[:80] if _is_err else f"CREATED DIR: {path}"
-        return _StepFact("mkdir", path, summary, error=_err_detail)
-
-    # FIX-276: code_eval — track paths for auto-grounding
-    if action_name == "Req_CodeEval":
-        paths = getattr(action, "paths", []) or []
-        summary = f"code_eval: {result_txt[:80]}"
-        return _StepFact("code_eval", ",".join(paths), summary)
-
-    return None
-
-
-def build_digest(facts: "list[_StepFact]") -> str:
-    """Build compact state digest from accumulated step facts."""
-    sections: dict[str, list[str]] = {
-        "LISTED": [], "READ": [], "FOUND": [], "DONE": [],
-        "ERRORS": [],   # FIX-199: preserve error details through compaction
-        "STALLS": [],   # FIX-200: preserve stall events through compaction
-    }
-    for f in facts:
-        if f.kind == "list":
-            sections["LISTED"].append(f"  {f.path}: {f.summary}")
-        elif f.kind == "read":
-            sections["READ"].append(f"  {f.path}: {f.summary}")
-        elif f.kind == "search":
-            sections["FOUND"].append(f"  {f.summary}")
-        elif f.kind in ("write", "delete", "move", "mkdir"):
-            sections["DONE"].append(f"  {f.summary}")
-        elif f.kind == "stall":  # FIX-200
-            sections["STALLS"].append(f"  {f.summary}")
-        if f.error:  # FIX-199: errors on any kind propagate to ERRORS section
-            sections["ERRORS"].append(f"  {f.kind}({f.path}): {f.error}")
-    parts = [
-        f"{label}:\n" + "\n".join(lines)
-        for label, lines in sections.items()
-        if lines
-    ]
-    return "State digest:\n" + ("\n".join(parts) if parts else "(no facts)")
-
-
-# ---------------------------------------------------------------------------
-# Log compaction (sliding window)
-# ---------------------------------------------------------------------------
-
-def _compact_log(log: list, max_tool_pairs: int = 7, preserve_prefix: list | None = None,
-                 step_facts: "list[_StepFact] | None" = None) -> list:
-    """Keep preserved prefix + last N assistant/tool message pairs.
-    Older pairs are replaced with a single summary message.
-    If step_facts provided, uses build_digest() instead of 'Actions taken:'."""
-    prefix_len = len(preserve_prefix) if preserve_prefix else 0
-    tail = log[prefix_len:]
-    max_msgs = max_tool_pairs * 2
-
-    if len(tail) <= max_msgs:
-        return log
-
-    old = tail[:-max_msgs]
-    kept = tail[-max_msgs:]
-
-    # Extract confirmed operations from compacted pairs (safety net for done_ops)
-    confirmed_ops = []
-    for msg in old:
-        role = msg.get("role", "")
-        content = msg.get("content", "")
-        if role == "user" and content:
-            for line in content.splitlines():
-                if line.startswith(("WRITTEN:", "DELETED:", "MOVED:", "CREATED DIR:")):
-                    confirmed_ops.append(line)
-
-    parts: list[str] = []
-    if confirmed_ops:
-        parts.append("Confirmed ops (already done, do NOT redo):\n" + "\n".join(f"  {op}" for op in confirmed_ops))
-
-    # Use ALL accumulated step facts as the complete state digest.
-    # Always use the full step_facts list — never slice by old_step_count, because:
-    # 1. Extra injected messages (auto-lists, stall hints, JSON retries) shift len(old)//2
-    # 2. After a previous compaction the old summary message itself lands in `old`, skewing the count
-    # 3. step_facts is the authoritative ground truth regardless of how many compactions occurred
-    if step_facts:
-        parts.append(build_digest(step_facts))
-        print(f"\x1B[33m[compact] Compacted {len(old)} msgs into digest ({len(step_facts)} facts)\x1B[0m")
-    else:
-        # Fallback: plain text summary from assistant messages (legacy behaviour)
-        summary_parts = []
-        for msg in old:
-            if msg.get("role") == "assistant" and msg.get("content"):
-                summary_parts.append(f"- {msg['content'][:120]}")
-        if summary_parts:
-            parts.append("Actions taken:\n" + "\n".join(summary_parts[-5:]))
-
-    summary = "Previous steps summary:\n" + ("\n".join(parts) if parts else "(none)")
-
-    base = preserve_prefix if preserve_prefix is not None else log[:prefix_len]
-    return list(base) + [{"role": "user", "content": summary}] + kept
+# _extract_fact, build_digest, _compact_log — imported from agent/log_compaction.py above
 
 
 # ---------------------------------------------------------------------------
@@ -488,180 +243,21 @@ def _to_anthropic_messages(log: list) -> tuple[str, list]:
 
 
 # ---------------------------------------------------------------------------
-# JSON extraction from free-form text (fallback when SO not supported)
+# JSON extraction — extracted to agent/json_extract.py
 # ---------------------------------------------------------------------------
 
-_MUTATION_TOOLS = frozenset({"write", "delete", "move", "mkdir"})
-
-# Maps Req_XXX class names to canonical tool names used in JSON payloads.
-# Some models (e.g. minimax) emit "Action: Req_Read({...})" without a "tool" field inside the JSON.
-_REQ_CLASS_TO_TOOL: dict[str, str] = {
-    "req_read": "read", "req_write": "write", "req_delete": "delete",
-    "req_list": "list", "req_search": "search", "req_find": "find",
-    "req_tree": "tree", "req_move": "move", "req_mkdir": "mkdir",
-    "req_code_eval": "code_eval",
-}
-# Regex: capture "Req_Xxx" prefix immediately before a JSON object — FIX-150
-_REQ_PREFIX_RE = re.compile(r"Req_(\w+)\s*\(", re.IGNORECASE)
+from .json_extract import (
+    _MUTATION_TOOLS,
+    _REQ_CLASS_TO_TOOL,
+    _REQ_PREFIX_RE,
+    _obj_mutation_tool,
+    _richness_key,
+    _extract_json_from_text,
+    _normalize_parsed,
+)
 
 
-def _obj_mutation_tool(obj: dict) -> str | None:
-    """Return the mutation tool name if obj is a write/delete/move/mkdir action, else None."""
-    tool = obj.get("tool") or (obj.get("function") or {}).get("tool", "")
-    return tool if tool in _MUTATION_TOOLS else None
-
-
-def _richness_key(obj: dict) -> tuple:  # FIX-212: deterministic tie-break for same-tier candidates
-    """Lower tuple = preferred. Used by min() to break ties when multiple candidates share a tier."""
-    has_full = "current_state" in obj and "function" in obj
-    fn_tool = (obj.get("function") or {}).get("tool", "")
-    return (
-        -len(obj),                          # more keys = richer
-        not has_full,                       # full NextStep preferred (False < True)
-        fn_tool == "report_completion",     # actionable tools preferred over report
-    )
-
-
-def _extract_json_from_text(text: str) -> dict | None:  # FIX-146 (revised FIX-149, FIX-150)
-    """Extract the most actionable valid JSON object from free-form model output.
-
-    Priority (highest first):
-    1. ```json fenced block — explicit, return immediately
-    2. First object whose tool is a mutation (write/delete/move/mkdir) — bare or wrapped
-       Rationale: multi-action responses often end with report_completion AFTER the writes;
-       executing report_completion first would skip the writes entirely.
-    3. First bare object with any known 'tool' key (non-mutation, e.g. search/read/list)
-    4. First full NextStep (current_state + function) with a non-report_completion tool
-    5. First full NextStep with any tool (including report_completion)
-    6. First object with a 'function' key
-    7. First valid JSON object
-    8. YAML fallback
-    """
-    # 1. ```json ... ``` fenced block — explicit, return immediately
-    m = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except (json.JSONDecodeError, ValueError):
-            pass
-
-    # Collect ALL valid bracket-matched JSON objects.
-    # FIX-150: also detect "Req_XXX({...})" patterns and inject "tool" when absent,
-    # since some models (minimax) omit the tool field inside the JSON payload.
-    candidates: list[dict] = []
-    pos = 0
-    while True:
-        start = text.find("{", pos)
-        if start == -1:
-            break
-        # Check for Req_XXX prefix immediately before this {
-        prefix_match = None
-        prefix_region = text[max(0, start - 20):start]
-        pm = _REQ_PREFIX_RE.search(prefix_region)
-        if pm:
-            req_name = pm.group(1).lower()
-            inferred_tool = _REQ_CLASS_TO_TOOL.get(f"req_{req_name}")
-            if inferred_tool:
-                prefix_match = inferred_tool
-        depth = 0
-        for idx in range(start, len(text)):
-            if text[idx] == "{":
-                depth += 1
-            elif text[idx] == "}":
-                depth -= 1
-                if depth == 0:
-                    try:
-                        obj = json.loads(text[start:idx + 1])
-                        if isinstance(obj, dict):
-                            # Inject inferred tool name when model omits it (e.g. Req_Read({"path":"..."}))
-                            if prefix_match and "tool" not in obj:
-                                obj = {"tool": prefix_match, **obj}
-                            candidates.append(obj)
-                    except (json.JSONDecodeError, ValueError):
-                        pass
-                    pos = idx + 1
-                    break
-        else:
-            break
-
-    if candidates:
-        # FIX-265: multi-step plan detection — when model outputs ≥3 full NextStep objects
-        # (a sequence of planned actions), take the first non-mutation step to force
-        # step-by-step execution. Without this, the mutation-priority rule (below) picks
-        # a write whose arguments were hallucinated (reads never actually executed).
-        _full_steps = [o for o in candidates if "current_state" in o and "function" in o]
-        if len(_full_steps) >= 3:
-            _SKIP_TOOLS = {"write", "delete", "move", "mkdir", "report_completion"}
-            _first_read = [o for o in _full_steps
-                           if (o.get("function") or {}).get("tool", "") not in _SKIP_TOOLS]
-            if _first_read:
-                print(f"{CLI_YELLOW}[FIX-265] Multi-step plan detected ({len(_full_steps)} steps) "
-                      f"— taking first non-mutation step{CLI_CLR}")
-                return _first_read[0]
-        # FIX-212: use min(filtered, key=_richness_key) for deterministic tie-breaking
-        # 2. Mutation (write/delete/move/mkdir) — bare {"tool":...} or wrapped {"function":{...}}
-        _muts = [o for o in candidates if _obj_mutation_tool(o)]
-        if _muts:
-            return min(_muts, key=_richness_key)
-        # 3. Bare object with any known tool key (non-mutation: search/read/list/etc.)
-        _bare = [o for o in candidates if "tool" in o and "current_state" not in o]
-        if _bare:
-            return min(_bare, key=_richness_key)
-        # 4. Full NextStep with non-report_completion tool
-        _full_nr = [o for o in candidates
-                     if "current_state" in o and "function" in o
-                     and (o.get("function") or {}).get("tool", "") != "report_completion"]
-        if _full_nr:
-            return min(_full_nr, key=_richness_key)
-        # 5. Full NextStep (any tool, including report_completion)
-        _full = [o for o in candidates if "current_state" in o and "function" in o]
-        if _full:
-            return min(_full, key=_richness_key)
-        # 6. Object with function key
-        _fn = [o for o in candidates if "function" in o]
-        if _fn:
-            return min(_fn, key=_richness_key)
-        # 7. Richest candidate
-        return min(candidates, key=_richness_key)
-
-    # 8. YAML fallback — for models that output YAML or Markdown when JSON schema not supported
-    try:
-        import yaml  # pyyaml
-        stripped = re.sub(r"```(?:yaml|markdown)?\s*", "", text.strip()).replace("```", "").strip()
-        parsed_yaml = yaml.safe_load(stripped)
-        if isinstance(parsed_yaml, dict) and any(k in parsed_yaml for k in ("current_state", "function", "tool")):
-            print(f"\x1B[33m[fallback] YAML fallback parsed successfully\x1B[0m")
-            return parsed_yaml
-    except Exception:
-        pass
-
-    return None
-
-
-def _normalize_parsed(parsed: dict) -> dict:
-    """Normalize a raw parsed dict into a valid NextStep structure.  # FIX-207
-    Handles bare function objects, plan truncation, and missing task_completed.
-    Shared by Anthropic and OpenRouter/Ollama tiers."""
-    if "tool" in parsed and "current_state" not in parsed:
-        parsed = {
-            "current_state": "continuing",
-            "plan_remaining_steps_brief": ["execute action"],
-            "task_completed": False,
-            "function": parsed,
-        }
-    elif "reasoning" in parsed and "current_state" not in parsed:
-        parsed = {
-            "current_state": "reasoning stripped",
-            "plan_remaining_steps_brief": ["explore vault"],
-            "task_completed": False,
-            "function": {"tool": "list", "path": "/"},
-        }
-    if isinstance(parsed.get("plan_remaining_steps_brief"), list):
-        steps = [s for s in parsed["plan_remaining_steps_brief"] if s]
-        parsed["plan_remaining_steps_brief"] = steps[:5] if steps else ["continue"]
-    if "task_completed" not in parsed:
-        parsed["task_completed"] = False
-    return parsed
+# _extract_json_from_text, _normalize_parsed — imported from agent/json_extract.py above
 
 
 # ---------------------------------------------------------------------------
@@ -902,72 +498,12 @@ def _call_llm(log: list, model: str, max_tokens: int, cfg: dict) -> tuple[NextSt
 # Adaptive stall detection
 # ---------------------------------------------------------------------------
 
-def _check_stall(
-    fingerprints: deque,
-    steps_since_write: int,
-    error_counts: Counter,
-    step_facts: "list[_StepFact] | None" = None,
-) -> str | None:
-    """Detect stall patterns and return an adaptive, task-agnostic hint.
-
-    Signals checked (in priority order):
-    1. Last 3 action fingerprints are identical → stuck in action loop.
-    2. Repeated error (same tool:path:code ≥ 2 times) → path doesn't exist.
-    3. ≥ 6 steps without any write/delete/move/mkdir → stuck in exploration.
-    Returns None if no stall detected."""
-    # Signal 1: repeated identical action
-    if len(fingerprints) >= 3 and fingerprints[-1] == fingerprints[-2] == fingerprints[-3]:
-        tool_name = fingerprints[-1].split(":")[0]
-        # Include recent exploration context in hint
-        _recent = [f"{f.kind}({f.path})" for f in step_facts[-4:]] if step_facts else []
-        _ctx = f" Recent actions: {_recent}." if _recent else ""
-        return (
-            f"You have called {tool_name} with the same arguments 3 times in a row without progress.{_ctx} "
-            "Try a different tool, a different path, or use search/find with different terms. "
-            "If the task is complete or cannot be completed, call report_completion."
-        )
-
-    # Signal 2: repeated error on same path
-    for (tool_name, path, code), count in error_counts.items():
-        if count >= 2:
-            # Name the parent dir explicitly in hint
-            _parent = str(_Path(path).parent)
-            return (
-                f"Error {code!r} on path '{path}' has occurred {count} times — path does not exist. "
-                f"List the parent directory '{_parent}' to see what files are actually there, "
-                "then use the exact filename from that listing."
-            )
-
-    # Signal 3: long exploration without writing
-    if steps_since_write >= 6:
-        # Include explored dirs/files from step_facts in hint
-        _listed = [f.path for f in step_facts if f.kind == "list"][-5:] if step_facts else []
-        _read_f = [f.path for f in step_facts if f.kind == "read"][-3:] if step_facts else []
-        _explored = ""
-        if _listed:
-            _explored += f" Listed: {_listed}."
-        if _read_f:
-            _explored += f" Read: {_read_f}."
-        # FIX-276: escalation after 12+ steps — force code_eval or report
-        if steps_since_write >= 12:
-            return (
-                f"[STALL ESCALATION] You have been exploring for {steps_since_write} steps without action.{_explored} "
-                "Either: (1) Use code_eval to analyze data and determine the answer/fix, or "
-                "(2) Report OUTCOME_NONE_CLARIFICATION if you cannot determine what to do. "
-                "Do NOT continue reading the same files."
-            )
-        return (
-            f"You have taken {steps_since_write} steps without writing, deleting, moving, or creating anything.{_explored} "
-            "Either take a concrete action now (write/delete/move/mkdir) "
-            "or call report_completion if the task is complete or cannot be completed."
-        )
-
-    return None
-
-
 # ---------------------------------------------------------------------------
-# Helper functions extracted from run_loop()
+# Stall detection — extracted to agent/stall.py
 # ---------------------------------------------------------------------------
+
+from .stall import _check_stall, _handle_stall_retry as _handle_stall_retry_base
+
 
 def _handle_stall_retry(
     job: "NextStep",
@@ -981,24 +517,18 @@ def _handle_stall_retry(
     step_facts: "list[_StepFact]",
     stall_active: bool,
 ) -> "tuple":
-    """Check for stall and issue a one-shot retry LLM call if needed.
-    Returns (job, stall_active, retry_fired, in_tok, out_tok, elapsed_ms, ev_c, ev_ms).
-    retry_fired is True when a stall LLM call was made (even if it returned None).
-    Token/timing deltas reflect the retry call when it fired."""
-    _stall_hint = _check_stall(fingerprints, steps_since_write, error_counts, step_facts)
-    if _stall_hint and not stall_active:
-        print(f"{CLI_YELLOW}[stall] Detected: {_stall_hint[:120]}{CLI_CLR}")
-        # FIX-200: record stall event as step fact for compaction survival
-        step_facts.append(_StepFact(kind="stall", path="", summary=_stall_hint[:100]))
-        log.append({"role": "user", "content": f"[STALL HINT] {_stall_hint}"})
-        stall_active = True
-        _job2, _e2, _i2, _o2, _, _ev_c2, _ev_ms2 = _call_llm(log, model, max_tokens, cfg)
-        log.pop()
-        if _job2 is not None:
-            return _job2, stall_active, True, _i2, _o2, _e2, _ev_c2, _ev_ms2
-        # LLM retry fired but returned None — still count the call, keep original job
-        return job, stall_active, True, _i2, _o2, _e2, _ev_c2, _ev_ms2
-    return job, stall_active, False, 0, 0, 0, 0, 0
+    """Wrapper: injects _call_llm (defined in this module) into stall.py's handler."""
+    return _handle_stall_retry_base(
+        job, log, model, max_tokens, cfg,
+        fingerprints, steps_since_write, error_counts, step_facts,
+        stall_active,
+        call_llm_fn=_call_llm,  # injected — avoids circular import in stall.py
+    )
+
+
+# ---------------------------------------------------------------------------
+# Helper functions extracted from run_loop()
+# ---------------------------------------------------------------------------
 
 
 def _record_done_op(
@@ -1895,49 +1425,7 @@ def _post_dispatch(
         st.log.append({"role": "user", "content": _audit_hint})
 
 
-# ---------------------------------------------------------------------------
-# FIX-208: Write-scope code enforcement — programmatic guard for mutation paths
-# ---------------------------------------------------------------------------
-
-_SYSTEM_PATH_PREFIXES = ("/docs/",)
-_SYSTEM_PATHS_EXACT = frozenset({"/AGENTS.MD", "/AGENTS.md"})
-_OTP_PATH = "/docs/channels/otp.txt"
-
-
-def _check_write_scope(action, action_name: str, task_type: str) -> str | None:
-    """Return error message if mutation violates write-scope, else None.
-
-    Layer 1 (all types): deny system paths (docs/, AGENTS.MD).
-      Exception: inbox + Req_Delete + otp.txt (OTP elevation).
-    Layer 2 (email only): allow-list — only /outbox/ paths.
-    """
-    paths_to_check: list[str] = []
-    if hasattr(action, "path") and action.path:
-        paths_to_check.append(action.path)
-    if hasattr(action, "from_name") and action.from_name:
-        paths_to_check.append(action.from_name)
-    if hasattr(action, "to_name") and action.to_name:
-        paths_to_check.append(action.to_name)
-
-    for p in paths_to_check:
-        is_system = p in _SYSTEM_PATHS_EXACT or any(
-            p.startswith(pfx) for pfx in _SYSTEM_PATH_PREFIXES
-        )
-        if is_system:
-            if task_type == TASK_INBOX and action_name == "Req_Delete" and p == _OTP_PATH:
-                continue
-            return (
-                f"Blocked: {action_name} targets system path '{p}'. "
-                "System files (docs/, AGENTS.MD) are read-only. "
-                "Choose a different target path."
-            )
-        if task_type == TASK_EMAIL and not p.startswith("/outbox/"):
-            return (
-                f"Blocked: {action_name} targets '{p}' but email tasks may only "
-                "write to /outbox/. Use report_completion if no outbox write is needed."
-            )
-
-    return None
+# FIX-208/250: _check_write_scope imported from agent/security.py
 
 
 def _pre_dispatch(
@@ -2234,6 +1722,7 @@ def _run_step(
     st.step_count += 1
     step = f"step_{i + 1}"
     print(f"\n{CLI_BLUE}--- {step} ---{CLI_CLR} ", end="")
+    _tracer = get_task_tracer()
 
     # Compact log to prevent token overflow; pass accumulated step facts for digest-based compaction
     st.log = _compact_log(st.log, max_tool_pairs=5, preserve_prefix=st.preserve_prefix,
@@ -2242,6 +1731,10 @@ def _run_step(
     # --- LLM call ---
     job, elapsed_ms, in_tok, out_tok, _, ev_c, ev_ms = _call_llm(st.log, model, max_tokens, cfg)
     _st_accum(st, elapsed_ms, in_tok, out_tok, ev_c, ev_ms)
+    _tracer.emit("llm_response", st.step_count, {
+        "elapsed_ms": elapsed_ms, "in_tok": in_tok, "out_tok": out_tok,
+        "tool": job.function.__class__.__name__ if job else None,
+    })
 
     # JSON parse retry hint (for Ollama json_object mode)
     if job is None:  # FIX-207: retry hint for all models (was non-Claude only)
@@ -2297,6 +1790,11 @@ def _run_step(
         action_name = job.function.__class__.__name__
         action_args = job.function.model_dump_json()
         st.action_fingerprints[-1] = f"{action_name}:{action_args}"
+        _stall_fact = next((f for f in reversed(st.step_facts) if f.kind == "stall"), None)
+        _tracer.emit("stall_detected", st.step_count, {
+            "steps_since_write": st.steps_since_write,
+            "hint": _stall_fact.summary if _stall_fact else "",
+        })
 
     # Compact function call representation in history (strip None/False/0 defaults)
     st.log.append({
@@ -2447,6 +1945,11 @@ def _run_step(
         st.evaluator_call_count += 1
         st.evaluator_total_ms += _eval_ms
         st.llm_call_count += 1
+        _tracer.emit("evaluator_call", st.step_count, {
+            "approved": verdict.approved,
+            "issues": verdict.issues if verdict.issues else [],
+            "elapsed_ms": _eval_ms,
+        })
         if not verdict.approved:
             st.eval_rejections += 1
             _issues = "; ".join(verdict.issues) if verdict.issues else "unspecified"
@@ -2479,6 +1982,9 @@ def _run_step(
 
         # FIX-202: post-dispatch success handlers
         _post_dispatch(job, txt, task_type, vm, st)
+        _tracer.emit("dispatch_result", st.step_count, {
+            "tool": action_name, "result": txt[:300], "is_error": False,
+        })
 
         # Reset stall state on meaningful progress
         if isinstance(job.function, (Req_Write, Req_Delete, Req_Move, Req_MkDir)):
@@ -2492,6 +1998,9 @@ def _run_step(
     except ConnectError as exc:
         txt = f"ERROR {exc.code}: {exc.message}"
         print(f"{CLI_RED}ERR {exc.code}: {exc.message}{CLI_CLR}")
+        _tracer.emit("dispatch_result", st.step_count, {
+            "tool": action_name, "result": txt[:300], "is_error": True,
+        })
         # Record repeated errors for stall detection
         _err_path = getattr(job.function, "path", getattr(job.function, "from_name", "?"))
         st.error_counts[(action_name, _err_path, exc.code.name)] += 1
@@ -2521,6 +2030,9 @@ def _run_step(
         _exc_msg = str(exc)
         txt = f"ERROR: {_exc_msg}"
         print(f"{CLI_RED}[dispatch-err] {action_name} {_err_path}: {_exc_msg[:120]}{CLI_CLR}")
+        _tracer.emit("dispatch_result", st.step_count, {
+            "tool": action_name, "result": txt[:300], "is_error": True,
+        })
         st.error_counts[(action_name, _err_path, "EXCEPTION")] += 1
         st.stall_hint_active = False
         st.steps_since_write += 1
@@ -2591,9 +2103,20 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
     task_start = time.time()
     max_tokens = cfg.get("max_completion_tokens", 16384)
 
+    _tracer = get_task_tracer()
+    _tracer.emit("task_start", 0, {
+        "task_type": task_type, "model": model,
+        "task_text": _task_text[:200],
+    })
+
     # Pre-loop phase: injection detection + semantic routing
     if _run_pre_route(vm, _task_text, task_type, pre, model, st):
-        return _st_to_result(st)
+        result = _st_to_result(st)
+        _tracer.emit("task_end", st.step_count, {
+            "outcome": result.get("outcome", ""), "step_count": st.step_count,
+            "total_in_tok": st.total_in_tok, "total_out_tok": st.total_out_tok,
+        })
+        return result
 
     # Main loop — up to 30 steps
     for i in range(30):
@@ -2601,4 +2124,10 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
                      max_tokens, task_start, st):
             break
 
-    return _st_to_result(st)
+    result = _st_to_result(st)
+    _tracer.emit("task_end", st.step_count, {
+        "outcome": result.get("outcome", ""), "step_count": st.step_count,
+        "total_in_tok": st.total_in_tok, "total_out_tok": st.total_out_tok,
+        "elapsed_ms": int((time.time() - task_start) * 1000),
+    })
+    return result

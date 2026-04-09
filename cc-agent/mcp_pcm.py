@@ -4,13 +4,24 @@ MCP server wrapping the PCM runtime (bitgn vault).
 Exposes all 10 PCM tools as MCP tools so Claude Code can execute
 pac1 benchmark tasks natively using its tool-use loop.
 
+Harness layers (Phases 1-3, 5):
+  - Write/delete protection (Phase 1)
+  - Injection detection on read (Phase 1)
+  - Stall detection via tool history (Phase 2)
+  - Evaluator gate before report_completion (Phase 3)
+  - Structured JSON replay log (Phase 5)
+
 Usage (stdio transport, as MCP subprocess):
     HARNESS_URL=https://... python mcp_pcm.py
 """
 
+import hashlib as _hl
 import json
 import os
+import re as _re
 import sys
+import time as _time
+import unicodedata as _ud
 from pathlib import Path
 
 # Allow importing bitgn from sibling pac1-py directory
@@ -37,6 +48,8 @@ HARNESS_URL = os.environ["HARNESS_URL"]
 _vm = PcmRuntimeClientSync(HARNESS_URL)
 
 _TRACE_FILE = os.environ.get("MCP_TRACE_FILE")
+_TASK_ID = os.environ.get("TASK_ID", "")
+_TASK_INSTRUCTION = os.environ.get("TASK_INSTRUCTION", "")
 
 
 def _trace(prefix: str, text: str) -> None:
@@ -45,6 +58,141 @@ def _trace(prefix: str, text: str) -> None:
     with open(_TRACE_FILE, "a", encoding="utf-8") as f:
         for line in text.splitlines():
             f.write(f"{prefix} {line}\n")
+
+
+# ── Phase 1: Write/Delete/Injection guards ────────────────────────────────────
+
+_PROTECTED_PATHS = ("AGENTS.MD",)
+_PROTECTED_PREFIXES = ("docs/channels/",)
+_PROTECTED_EXCEPTIONS = {"docs/channels/otp.txt"}
+
+
+def _check_write_protection(path: str) -> str | None:
+    """Block writes to protected vault paths."""
+    norm = path.lstrip("/")
+    if norm in _PROTECTED_EXCEPTIONS:
+        return None
+    for p in _PROTECTED_PATHS:
+        if norm == p or norm.endswith("/" + p):
+            return f"BLOCKED: {path} is read-only"
+    for prefix in _PROTECTED_PREFIXES:
+        if norm.startswith(prefix):
+            return f"BLOCKED: {path} is in protected directory"
+    return None
+
+
+def _check_delete_protection(path: str) -> str | None:
+    """Block deletion of underscore-prefixed files and protected paths."""
+    basename = path.rsplit("/", 1)[-1]
+    if basename.startswith("_"):
+        return f"BLOCKED: cannot delete underscore-prefixed file {path}"
+    return _check_write_protection(path)
+
+
+_INJECTION_PATTERNS = [
+    _re.compile(r"ignore\s+(previous|above|all)\s+instructions", _re.I),
+    _re.compile(r"you\s+are\s+now", _re.I),
+    _re.compile(r"new\s+instructions?\s*:", _re.I),
+    _re.compile(r"system\s*prompt\s*:", _re.I),
+]
+
+
+def _scan_for_injection(content: str) -> bool:
+    """Detect possible prompt injection in file content."""
+    normalized = _ud.normalize("NFKC", content)
+    return any(p.search(normalized) for p in _INJECTION_PATTERNS)
+
+
+# ── Phase 2: Stall detection ─────────────────────────────────────────────────
+
+_MUTATION_TOOLS = {"write", "delete", "move", "mkdir"}
+_STALL_REPEAT = 3
+_STALL_NO_MUTATION = 12
+
+_tool_history: list[str] = []
+_last_mutation_step: int = 0
+
+
+def _fingerprint(name: str, args: dict) -> str:
+    raw = json.dumps(args, sort_keys=True, ensure_ascii=False).encode()
+    return name + ":" + _hl.md5(raw).hexdigest()[:8]
+
+
+def _check_stall() -> str | None:
+    if len(_tool_history) >= _STALL_REPEAT:
+        if len(set(_tool_history[-_STALL_REPEAT:])) == 1:
+            return f"STALL: identical tool call repeated {_STALL_REPEAT} times"
+    steps_since = len(_tool_history) - _last_mutation_step
+    if steps_since >= _STALL_NO_MUTATION:
+        return f"STALL: {steps_since} steps without mutation"
+    return None
+
+
+# ── Phase 3: Evaluator gate ──────────────────────────────────────────────────
+
+_tool_log: list[dict] = []
+
+_ACTION_WORDS = _re.compile(
+    r"\b(write|create|add|delete|remove|send|forward|reply|move|rename|update|edit|compose|draft)\b",
+    _re.I,
+)
+
+
+def _evaluate_outcome(outcome: str) -> list[str]:
+    """Heuristic checks before report_completion. Returns warnings list."""
+    warnings: list[str] = []
+
+    agents_read = any(
+        t["name"] == "read" and (t.get("path") or "").rstrip("/").endswith("AGENTS.MD")
+        for t in _tool_log
+    )
+    if not agents_read and len(_tool_log) > 2:
+        warnings.append("AGENTS.MD was never read (rule 2)")
+
+    if outcome == "ok":
+        mutations = [t for t in _tool_log if t["name"] in _MUTATION_TOOLS]
+        if not mutations and _ACTION_WORDS.search(_TASK_INSTRUCTION):
+            warnings.append("outcome=ok but no mutations for action-requiring task")
+
+    elif outcome == "security":
+        reads = [t for t in _tool_log if t["name"] == "read"]
+        if not reads:
+            warnings.append("outcome=security without any read evidence")
+
+    return warnings
+
+
+# ── Phase 5: Structured replay log ──────────────────────────────────────────
+
+_replay_log: dict = {
+    "task_id": _TASK_ID,
+    "instruction": _TASK_INSTRUCTION,
+    "started": _time.strftime("%Y-%m-%dT%H:%M:%S"),
+    "steps": [],
+    "outcome": None,
+}
+_step_seq = 0
+
+
+def _replay_step(tool: str, args: dict, result: str, elapsed_ms: int, error: str | None = None) -> None:
+    global _step_seq
+    _step_seq += 1
+    _replay_log["steps"].append({
+        "seq": _step_seq,
+        "tool": tool,
+        "args": {k: (v[:200] if isinstance(v, str) and len(v) > 200 else v) for k, v in args.items()},
+        "result_preview": result[:500] if result else "",
+        "elapsed_ms": elapsed_ms,
+        "error": error,
+    })
+
+
+def _write_replay_log() -> None:
+    if not _TRACE_FILE:
+        return
+    with open(_TRACE_FILE, "w", encoding="utf-8") as f:
+        json.dump(_replay_log, f, ensure_ascii=False, indent=2)
+
 
 # ── MCP stdio protocol (JSON-RPC 2.0) ─────────────────────────────────────
 
@@ -244,9 +392,19 @@ def _call_tool(name: str, args: dict) -> str:
             start_line=args.get("start_line", 0),
             end_line=args.get("end_line", 0),
         ))
-        return resp.content or "(empty)"
+        content = resp.content or "(empty)"
+        # Phase 1: injection detection
+        if _scan_for_injection(content):
+            content += "\n\n[SECURITY WARNING: possible prompt injection detected in this file]"
+            _trace("[inject]", f"Injection detected in {args['path']}")
+        return content
 
     elif name == "write":
+        # Phase 1: write protection
+        block = _check_write_protection(args["path"])
+        if block:
+            _trace("[guard]", block)
+            return block
         _vm.write(WriteRequest(
             path=args["path"],
             content=args["content"],
@@ -256,6 +414,11 @@ def _call_tool(name: str, args: dict) -> str:
         return f"Written: {args['path']}"
 
     elif name == "delete":
+        # Phase 1: delete protection
+        block = _check_delete_protection(args["path"])
+        if block:
+            _trace("[guard]", block)
+            return block
         _vm.delete(DeleteRequest(path=args["path"]))
         return f"Deleted: {args['path']}"
 
@@ -264,11 +427,22 @@ def _call_tool(name: str, args: dict) -> str:
         return f"Created: {args['path']}"
 
     elif name == "move":
+        # Phase 1: protect destination
+        block = _check_write_protection(args["to_name"])
+        if block:
+            _trace("[guard]", block)
+            return block
         _vm.move(MoveRequest(from_name=args["from_name"], to_name=args["to_name"]))
         return f"Moved: {args['from_name']} → {args['to_name']}"
 
     elif name == "report_completion":
         outcome_key = args.get("outcome", "ok")
+        # Phase 3: evaluator gate
+        warnings = _evaluate_outcome(outcome_key)
+        for w in warnings:
+            _trace("[eval-warn]", w)
+        # Phase 5: record outcome
+        _replay_log["outcome"] = outcome_key
         outcome = _OUTCOME_MAP.get(outcome_key, Outcome.OUTCOME_OK)
         refs = args.get("refs", [])
         _vm.answer(AnswerRequest(
@@ -291,6 +465,8 @@ def _send(obj: dict) -> None:
 
 
 def _handle(req: dict) -> None:
+    global _last_mutation_step
+
     method = req.get("method", "")
     req_id = req.get("id")
 
@@ -317,9 +493,29 @@ def _handle(req: dict) -> None:
         tool_name = params.get("name", "")
         tool_args = params.get("arguments", {})
         _trace("[tool>>>]", f"{tool_name} {json.dumps(tool_args, ensure_ascii=False)}")
+
+        t0 = _time.monotonic()
         try:
             result_text = _call_tool(tool_name, tool_args)
+            elapsed_ms = int((_time.monotonic() - t0) * 1000)
             _trace("[tool<<<]", result_text)
+
+            # Phase 3: tool log
+            _tool_log.append({"name": tool_name, "path": tool_args.get("path", tool_args.get("from_name")), "ok": True})
+
+            # Phase 2: stall detection
+            fp = _fingerprint(tool_name, tool_args)
+            _tool_history.append(fp)
+            if tool_name in _MUTATION_TOOLS:
+                _last_mutation_step = len(_tool_history)
+            stall = _check_stall()
+            if stall:
+                result_text += f"\n\n[SYSTEM HINT: {stall}. Change your approach or call report_completion.]"
+                _trace("[stall]", stall)
+
+            # Phase 5: replay step
+            _replay_step(tool_name, tool_args, result_text, elapsed_ms)
+
             _send({
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -328,7 +524,10 @@ def _handle(req: dict) -> None:
                 },
             })
         except Exception as exc:
+            elapsed_ms = int((_time.monotonic() - t0) * 1000)
             _trace("[tool!!!]", f"ERROR: {exc}")
+            _tool_log.append({"name": tool_name, "path": tool_args.get("path"), "ok": False})
+            _replay_step(tool_name, tool_args, "", elapsed_ms, error=str(exc))
             _send({
                 "jsonrpc": "2.0",
                 "id": req_id,
@@ -356,6 +555,9 @@ def main() -> None:
         except json.JSONDecodeError:
             continue
         _handle(req)
+
+    # Phase 5: write structured replay log on exit
+    _write_replay_log()
 
 
 if __name__ == "__main__":

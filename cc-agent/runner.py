@@ -10,7 +10,7 @@ Workflow per task:
 Usage:
     python runner.py [task_id ...]
 
-Env vars (from pac1-py/.env or shell):
+Env vars (from cc-agent/.env, .secrets, or shell):
     BITGN_HOST       default: https://api.bitgn.com
     BENCH_ID         default: bitgn/pac1-dev
     TASK_TIMEOUT_S   default: 300
@@ -21,6 +21,7 @@ Env vars (from pac1-py/.env or shell):
 
 import json
 import os
+import shlex
 import subprocess
 import sys
 import tempfile
@@ -35,9 +36,10 @@ _pac1 = Path(__file__).parent.parent / "pac1-py"
 if str(_pac1) not in sys.path:
     sys.path.insert(0, str(_pac1))
 
-# Load pac1-py/.env and .secrets into os.environ (real env vars take priority)
+# Load cc-agent/.env and .secrets into os.environ (real env vars take priority)
+_cc_agent = Path(__file__).parent
 _dotenv: dict[str, str] = {}
-for _p in (_pac1 / ".env", _pac1 / ".secrets"):
+for _p in (_cc_agent / ".env", _cc_agent / ".secrets"):
     if _p.exists():
         for _line in _p.read_text().splitlines():
             _s = _line.strip()
@@ -60,7 +62,7 @@ from bitgn.harness_pb2 import (
 )
 from connectrpc.errors import ConnectError
 
-from prompt import SYSTEM_PROMPT
+from prompt import get_prompt
 
 BITGN_URL = os.getenv("BITGN_HOST", "https://api.bitgn.com")
 BENCHMARK_ID = os.getenv("BENCH_ID", "bitgn/pac1-dev")
@@ -68,6 +70,7 @@ TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT_S", "300"))
 PARALLEL_TASKS = int(os.getenv("PARALLEL_TASKS", "1"))
 BITGN_API_KEY = os.getenv("BITGN_API_KEY", "")
 BITGN_RUN_NAME = os.getenv("BITGN_RUN_NAME", "")
+ICLAUDE_CMD = os.getenv("ICLAUDE_CMD", "iclaude")
 
 _MCP_SERVER = Path(__file__).parent / "mcp_pcm.py"
 _PAC1_DIR = Path(__file__).parent.parent / "pac1-py"
@@ -121,17 +124,15 @@ def _agent_response(lines: list[str]) -> list[str]:
     return lines  # no preamble found — return as-is
 
 
-def _build_mcp_config(harness_url: str, trace_file: Path) -> dict:
+def _build_mcp_config(harness_url: str, trace_file: Path, task_id: str, instruction: str) -> dict:
     """Build MCP server config for this trial."""
     env = {
         "HARNESS_URL": harness_url,
         "PYTHONPATH": str(_PAC1_DIR),
         "MCP_TRACE_FILE": str(trace_file),
+        "TASK_ID": task_id,
+        "TASK_INSTRUCTION": instruction,
     }
-    for key in ("ANTHROPIC_API_KEY", "OPENROUTER_API_KEY"):
-        val = os.getenv(key)
-        if val:
-            env[key] = val
 
     return {
         "mcpServers": {
@@ -159,7 +160,7 @@ def _execute_iclaude(
         print(f"{CLI_BLUE}{instruction}{CLI_CLR}\n{'-' * 80}")
 
     trace_file = run_dir / f"{task_id}.trace"
-    mcp_cfg = _build_mcp_config(harness_url, trace_file)
+    mcp_cfg = _build_mcp_config(harness_url, trace_file, task_id, instruction)
     with tempfile.NamedTemporaryFile(
         mode="w", suffix=".json", delete=False, prefix=f"mcp_{task_id}_"
     ) as f:
@@ -173,12 +174,12 @@ def _execute_iclaude(
     try:
         proc = subprocess.Popen(
             [
-                "iclaude",
+                *shlex.split(ICLAUDE_CMD),
                 "--no-save",
                 "--print",
                 "--strict-mcp-config",
                 "--mcp-config", cfg_path,
-                "--system-prompt", SYSTEM_PROMPT,
+                "--system-prompt", get_prompt(instruction),
                 instruction,
             ],
             stdout=subprocess.PIPE,

@@ -1,2 +1,4 @@
 __pycache__/
 **/cc-agent/logs
+.env
+.secrets

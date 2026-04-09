@@ -5,12 +5,23 @@
 ## Архитектура
 
 ```
+runner.py          # оркестратор: bitgn API → spawn iclaude → score
+mcp_pcm.py         # MCP сервер + harness: guards, stall detection, evaluator, replay log
+prompt.py          # адаптивный промпт: classify task → base prompt + addendum
+```
+
+```
 runner.py
   ├── bitgn API → get tasks → start_playground → harness_url
+  ├── classify_task(instruction) → адаптивный system prompt
   ├── пишет tmp MCP config (mcpServers.pcm → mcp_pcm.py + HARNESS_URL)
-  ├── запускает: claude --print --mcp-config cfg.json -p "<instruction>"
+  ├── запускает: iclaude --print --mcp-config cfg.json --system-prompt <prompt> <instruction>
   │     └── Claude Code использует MCP инструменты (tree/list/read/write/...)
   │           └── mcp_pcm.py проксирует вызовы в PCM runtime (harness_url)
+  │                 ├── write/delete guards (AGENTS.MD, _prefix, docs/channels/)
+  │                 ├── injection detection при read
+  │                 ├── stall detection (повтор 3x, 12 шагов без мутации)
+  │                 └── evaluator gate перед report_completion
   └── end_trial → score
 ```
 
@@ -18,36 +29,59 @@ runner.py
 
 `tree`, `find`, `search`, `list`, `read`, `write`, `delete`, `mkdir`, `move`, `report_completion`
 
-## Запуск
+## Быстрый старт
+
+### 1. Зависимости
 
 ```bash
-# Зависимости — из pac1-py (uv sync если не установлены)
 cd pac1-py && uv sync
-
-# Все задания
-uv run python ../cc-agent/runner.py
-
-# Конкретные задания
-uv run python ../cc-agent/runner.py t01 t03
 ```
 
-Переменные окружения те же, что у pac1-py (читаются из `pac1-py/.env` и `pac1-py/.secrets`):
-- `BENCHMARK_HOST` — API endpoint
-- `BENCHMARK_ID` — benchmark ID
-- `TASK_TIMEOUT_S` — таймаут на задание (default: 300s)
+### 2. Конфигурация
 
-## Как работает
+```bash
+# Скопировать шаблон
+cp .env.example .env
 
-1. `runner.py` подключается к `api.bitgn.com`, берёт список заданий
-2. На каждое задание:
-   - `start_playground` → получает `harness_url` и `instruction`
-   - Записывает temp JSON с MCP конфигом: `{"mcpServers": {"pcm": {..., "env": {"HARNESS_URL": "..."}}}}`
-   - Запускает `iclaude --no-save --print --mcp-config <cfg> -p "<instruction>"`
-   - Claude Code думает и вызывает MCP tools (tree/list/read/write/...)
-   - `mcp_pcm.py` (subprocess, stdio) транслирует вызовы в PCM API
-   - Когда задание выполнено, Claude вызывает `report_completion`
-   - `mcp_pcm.py` вызывает `vm.answer()` на сервере
-3. После завершения `claude`: `end_trial` → оценка
+# Создать файл секретов
+echo "BITGN_API_KEY=<ваш_ключ>" > .secrets
+```
+
+### 3. Запуск
+
+```bash
+# Из директории cc-agent:
+make run           # все задания
+make task TASKS="t01 t03"  # конкретные задания
+
+# Или напрямую через uv (из pac1-py):
+cd ../pac1-py && uv run python ../cc-agent/runner.py
+```
+
+## Конфигурация
+
+Переменные окружения читаются из `cc-agent/.env` и `cc-agent/.secrets` (shell env имеет приоритет):
+
+| Переменная | Default | Описание |
+|-----------|---------|----------|
+| `BITGN_HOST` | `https://api.bitgn.com` | API endpoint |
+| `BENCH_ID` | `bitgn/pac1-dev` | Benchmark ID |
+| `TASK_TIMEOUT_S` | `300` | Таймаут на задание (сек) |
+| `PARALLEL_TASKS` | `1` | Параллельные задания |
+| `ICLAUDE_CMD` | `iclaude` | Команда запуска Claude Code CLI (путь или `bash /path/to/iclaude.sh`) |
+| `BITGN_API_KEY` | — | API ключ (`.secrets`), включает run mode |
+| `BITGN_RUN_NAME` | — | Метка запуска на leaderboard |
+
+## Harness-слои (mcp_pcm.py)
+
+| Слой | Описание |
+|------|----------|
+| **Write guard** | Блокирует запись в AGENTS.MD, docs/channels/ (кроме otp.txt) |
+| **Delete guard** | Блокирует удаление `_`-префиксных файлов и защищённых путей |
+| **Injection scan** | NFKC-нормализация + regex-детекция инъекций при read |
+| **Stall detection** | Fingerprint повтора 3x, 12+ шагов без мутации → `[SYSTEM HINT]` |
+| **Evaluator gate** | Проверка outcome vs evidence перед report_completion (soft, trace only) |
+| **Replay log** | Структурированный JSON trace: steps[], args, elapsed_ms, outcome |
 
 ## Отличия от pac1-py
 
@@ -55,5 +89,6 @@ uv run python ../cc-agent/runner.py t01 t03
 |---|---|---|
 | Агент | Python + LLM-цикл (30 шагов) | Claude Code CLI |
 | Инструменты | PCM клиент напрямую | PCM через MCP |
-| Промпт | Сложный prompt.py (stall detection, evaluator) | Минимальный system prompt |
-| Логика | loop.py 2600+ строк | runner.py ~120 строк |
+| Промпт | Модульный prompt builder (8 типов) | Адаптивный: base + 4 addenda (regex classify) |
+| Harness | loop.py 2600+ строк | mcp_pcm.py ~530 строк (guards + stall + eval + replay) |
+| Конфигурация | pac1-py/.env + .secrets | Собственные cc-agent/.env + .secrets |

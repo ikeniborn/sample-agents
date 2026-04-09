@@ -22,3 +22,8 @@ testpaths = ["tests"]
 # connect-python instead of external buf.build SDK packages, mirroring
 # the sandbox-py approach for offline/authenticated-free operation.
 package = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.3",
+]

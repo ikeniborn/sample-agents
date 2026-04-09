@@ -22,9 +22,30 @@ _at.Le = lambda x: None
 _at.MaxLen = lambda x: None
 _at.MinLen = lambda x: None
 
-# Provide minimal Pydantic BaseModel so models.py can define its classes
+# Provide minimal Pydantic BaseModel so models.py can define its classes.
+# Supports keyword-arg construction and model_validate() needed by evaluator.py.
+import json as _json
+
+def _base_model_init(self, **kwargs):
+    for k, v in kwargs.items():
+        setattr(self, k, v)
+
+def _base_model_validate(cls, data: dict):
+    obj = cls.__new__(cls)
+    for k, v in data.items():
+        setattr(obj, k, v)
+    return obj
+
+def _base_model_validate_json(cls, s: str):
+    return cls.model_validate(_json.loads(s))
+
 _pydantic = sys.modules["pydantic"]
-_pydantic.BaseModel = type("BaseModel", (), {"__init_subclass__": classmethod(lambda cls, **kw: None)})
+_pydantic.BaseModel = type("BaseModel", (), {
+    "__init_subclass__": classmethod(lambda cls, **kw: None),
+    "__init__": _base_model_init,
+    "model_validate": classmethod(_base_model_validate),
+    "model_validate_json": classmethod(_base_model_validate_json),
+})
 _pydantic.Field = lambda *a, **kw: None
 _pydantic.field_validator = lambda *a, **kw: lambda fn: fn
 
