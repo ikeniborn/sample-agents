@@ -552,24 +552,31 @@ def _call_tool(name: str, args: dict) -> str:
 
         if _MCP_MODE == "draft":
             if outcome_key == "ok":
-                # Commit buffered vault mutations, then save draft
-                if _draft_buffer:
-                    _draft_replay_buffer()
-                    _emit_event("draft_writes_committed", {"count": len(_draft_buffer)})
+                # Stage vault ops for deferred commit — do NOT replay to vault yet.
+                # Runner will commit after verifier approval so retries start with clean vault.
+                _emit_event("draft_staged", {"count": len(_draft_buffer), "outcome": outcome_key})
             else:
-                # Non-ok outcome: discard buffer — no vault changes
+                # Non-ok outcome: discard buffer — no vault changes ever
                 if _draft_had_writes:
                     _emit_event("draft_writes_discarded", {
                         "count": len(_draft_buffer), "outcome": outcome_key,
                     })
+
+            vault_ops = list(_draft_buffer)
             _draft_buffer = []
             _draft_had_writes = False
 
-            draft = {"schema_version": 1, "outcome": outcome_key, "message": msg, "refs": refs}
+            draft = {
+                "schema_version": 1,
+                "outcome": outcome_key,
+                "message": msg,
+                "refs": refs,
+                "vault_ops": vault_ops if outcome_key == "ok" else [],
+            }
             if _DRAFT_FILE:
                 Path(_DRAFT_FILE).write_text(json.dumps(draft, ensure_ascii=False, indent=2))
             _emit_event("draft_saved", {"outcome": outcome_key, "message": _truncate(msg, 500), "refs": refs})
-            return "Draft saved. Your answer will be verified before submission."
+            return "Staged for verification. Vault unchanged until approved."
         else:
             # Full mode: submit answer
             outcome = _OUTCOME_MAP.get(outcome_key, Outcome.OUTCOME_OK)

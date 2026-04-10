@@ -72,7 +72,14 @@ from bitgn.harness_pb2 import (
     SubmitRunRequest,
 )
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
-from bitgn.vm.pcm_pb2 import AnswerRequest, Outcome
+from bitgn.vm.pcm_pb2 import (
+    AnswerRequest,
+    DeleteRequest,
+    MkDirRequest,
+    MoveRequest,
+    Outcome,
+    WriteRequest,
+)
 from connectrpc.errors import ConnectError
 
 from agents import (
@@ -324,6 +331,32 @@ def _submit_answer(harness_url: str, answer: dict) -> None:
     ))
 
 
+def _commit_vault_ops(harness_url: str, vault_ops: list[dict]) -> None:
+    """Replay staged vault operations to the real vault after verifier approval.
+
+    Called only when final outcome=ok (approve or correct verdict).
+    vault_ops come from the executor's draft; verifier never mutates the vault.
+    """
+    if not vault_ops:
+        return
+    vm = PcmRuntimeClientSync(harness_url)
+    for item in vault_ops:
+        op, args = item["op"], item["args"]
+        if op == "write":
+            vm.write(WriteRequest(
+                path=args["path"],
+                content=args["content"],
+                start_line=args.get("start_line", 0),
+                end_line=args.get("end_line", 0),
+            ))
+        elif op == "delete":
+            vm.delete(DeleteRequest(path=args["path"]))
+        elif op == "mkdir":
+            vm.mk_dir(MkDirRequest(path=args["path"]))
+        elif op == "move":
+            vm.move(MoveRequest(from_name=args["from_name"], to_name=args["to_name"]))
+
+
 # ── Multi-agent pipeline ────────────────────────────────────────────────────
 
 def _run_pipeline(
@@ -358,6 +391,28 @@ def _run_pipeline(
         output_format="json",
     )
     classification = parse_classifier_output(cls_lines)
+
+    # Retry classifier once on parse failure (e.g. transient ECONNREFUSED).
+    # Brief sleep before retry lets the proxy recover from burst concurrency.
+    # A second attempt is cheap relative to executor cost and avoids static-prompt fallback.
+    if not classification:
+        with _STDOUT_LOCK:
+            print(f"  {CLI_YELLOW}[classifier] parse_failed — retrying once{CLI_CLR}")
+        _append_jsonl(task_dir / "pipeline.events.jsonl", {
+            "type": "classifier_retry", "reason": "parse_failed", "exit_code": cls_exit,
+        })
+        time.sleep(5)
+        cls_lines, cls_exit = _spawn_iclaude(
+            mcp_cfg=classifier_cfg,
+            system_prompt=CLASSIFIER_PROMPT,
+            user_prompt=instruction,
+            model=CLAUDE_CLASSIFIER_MODEL,
+            timeout=CLASSIFIER_TIMEOUT,
+            echo=False,
+            bare=True,
+            output_format="json",
+        )
+        classification = parse_classifier_output(cls_lines)
 
     if classification:
         _write_json(task_dir / "classification.json", classification)
@@ -451,8 +506,36 @@ def _executor_verify_loop(
     )
     verdict = parse_verifier_output(ver_lines)
 
+    # Retry verifier once on parse failure (e.g. transient ECONNREFUSED).
+    if not verdict:
+        with _STDOUT_LOCK:
+            print(f"  {CLI_YELLOW}[verifier] parse_failed — retrying once{CLI_CLR}")
+        _append_jsonl(task_dir / "pipeline.events.jsonl", {
+            "type": "verifier_retry", "reason": "parse_failed",
+            "exit_code": ver_exit, "attempt": attempt,
+        })
+        time.sleep(5)
+        ver_lines, ver_exit = _spawn_iclaude(
+            mcp_cfg=verifier_cfg,
+            system_prompt=VERIFIER_PROMPT,
+            user_prompt=verifier_input,
+            model=verifier_model,
+            timeout=ver_t,
+            bare=True,
+            echo=False,
+            output_format="json",
+        )
+        verdict = parse_verifier_output(ver_lines)
+
     if verdict:
         _write_json(task_dir / f"verdict_{attempt}.json", verdict)
+        # Warn if verifier approved without reading any vault files (grounding empty)
+        if verdict.get("verdict") == "approve" and not verdict.get("grounding"):
+            _append_jsonl(task_dir / "pipeline.events.jsonl", {
+                "type": "verifier_no_grounding", "attempt": attempt,
+            })
+            with _STDOUT_LOCK:
+                print(f"  {CLI_YELLOW}[verifier] WARNING: approved with empty grounding{CLI_CLR}")
         with _STDOUT_LOCK:
             print(f"  {CLI_GREEN}[verifier] verdict={verdict.get('verdict', '?')}{CLI_CLR}")
     else:
@@ -485,6 +568,17 @@ def _executor_verify_loop(
     # ── Submit final answer ──
     final = apply_verdict(draft, verdict)
     _write_json(task_dir / "final_answer.json", final)
+
+    # Commit deferred vault ops only when final outcome=ok.
+    # vault_ops always originate from the executor draft; verifier never writes to vault.
+    # verdict=correct may patch message/refs — vault_ops from executor are still applied.
+    if final.get("outcome") == "ok":
+        vault_ops = draft.get("vault_ops", [])
+        if vault_ops:
+            _commit_vault_ops(harness_url, vault_ops)
+            with _STDOUT_LOCK:
+                print(f"  {CLI_GREEN}[vault] committed {len(vault_ops)} op(s){CLI_CLR}")
+
     _submit_answer(harness_url, final)
 
     with _STDOUT_LOCK:
