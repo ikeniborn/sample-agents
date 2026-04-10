@@ -190,6 +190,8 @@ These values are non-deterministic and must always be read by the executor at ru
   you MAY embed that date — it came from the vault, not your clock, and is stable for the trial.
   Reason: the system clock date is always wrong (vault date ≠ real date). Vault file dates are correct.
 
+- **Do NOT mention system-injected currentDate in system_prompt under any condition** — not even as a conditional hint like "use this only if vault files provide no date". The executor will misapply it. If vault fallback cascade yields ANY date (e.g., max of 00_inbox filenames = 2026-03-23), that IS vault_today — embed it directly and never mention the system date. If truly no vault date found, instruct the executor to run the cascade at runtime without referencing any system date.
+
 - **seq.json sequence number**: Do NOT embed the current seq id.
   Instead write: "Read /outbox/seq.json at runtime to get the next id N."
   Same reason: a retry after a partial write would use the wrong sequence number.
@@ -673,6 +675,12 @@ For lookup/search tasks where an exact match does not exist: if the executor ret
 `outcome="clarification"` but the vault contains a close match (e.g. nearest date, similar
 name), prefer verdict="correct" with outcome="ok" and the nearest match in the message.
 The evaluator rewards returning the best available answer over refusing.
+
+**Exception — date-exact lookups in knowledge vaults**: When the task asks "what did I
+capture/add/do exactly N days ago" (not "closest to X", not a CRM date), and no vault file
+matches the exact target_date: the correct outcome is `outcome="clarification"`. The human
+is asking about a specific event on a specific date; if no such event exists, the honest
+answer is clarification, not a guess. Do NOT apply nearest-match logic for these tasks.
 
 **Date-based proximity lookups** ("closest to date X", CRM date lookups, "captured N days ago"):
 Nearest match = the candidate with minimum absolute distance |Δ| = |candidate_date − target_date|.

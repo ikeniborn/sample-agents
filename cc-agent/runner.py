@@ -27,6 +27,7 @@ Env vars (from cc-agent/.env, .secrets, or shell):
     CLAUDE_VERIFIER_MODEL   default: auto (picks model different from executor)
     CLASSIFIER_TIMEOUT_S    default: 60  (hard cap for classifier subprocess)
     VERIFIER_TIMEOUT_S      default: 90  (hard cap for verifier subprocess; overrides dynamic budget cap)
+    USE_ROUTER              default: 0   (1/true = pass --router flag to every iclaude call)
 """
 
 import json
@@ -108,6 +109,7 @@ MULTI_AGENT = os.getenv("MULTI_AGENT", "1") != "0"
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "1"))
 CLASSIFIER_TIMEOUT = int(os.getenv("CLASSIFIER_TIMEOUT_S", "60"))
 VERIFIER_TIMEOUT = int(os.getenv("VERIFIER_TIMEOUT_S", "90"))
+USE_ROUTER = os.getenv("USE_ROUTER", "0") not in ("0", "", "false", "False")
 
 _MCP_SERVER = Path(__file__).parent / "mcp_pcm.py"
 _PAC1_DIR = Path(__file__).parent.parent / "pac1-py"
@@ -286,6 +288,8 @@ def _spawn_iclaude(
     ]
     if model:
         cmd.extend(["--model", model])
+    if USE_ROUTER:
+        cmd.append("--router")
     if output_format:
         cmd.extend(["--output-format", output_format])
     cmd.append(user_prompt)
