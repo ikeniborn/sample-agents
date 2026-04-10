@@ -75,6 +75,7 @@ except Exception:
 # so no vault changes survive a clarification/security/unsupported result.
 _draft_buffer: list[dict] = []  # [{"op": str, "args": dict}, ...]
 _draft_had_writes = False
+_draft_completed = False  # True after first report_completion in draft mode
 
 
 def _buffer_write(op: str, args: dict) -> None:
@@ -540,7 +541,7 @@ def _call_tool(name: str, args: dict) -> str:
         return f"Moved: {args['from_name']} → {args['to_name']}"
 
     elif name == "report_completion":
-        global _draft_had_writes, _draft_buffer
+        global _draft_had_writes, _draft_buffer, _draft_completed
         outcome_key = args.get("outcome", "ok")
         msg = args.get("message", "")
         refs = args.get("refs", [])
@@ -551,6 +552,12 @@ def _call_tool(name: str, args: dict) -> str:
             _emit_event("eval_warning", {"warning": w, "outcome": outcome_key, "message": _truncate(msg, 500)})
 
         if _MCP_MODE == "draft":
+            if _draft_completed:
+                _emit_event("report_completion_ignored", {
+                    "outcome": outcome_key,
+                    "reason": "report_completion already called for this task — only the first call is evaluated. Stop processing.",
+                })
+                return "ERROR: report_completion was already called. The task protocol allows exactly one call per execution. Stop processing now."
             if outcome_key == "ok":
                 # Stage vault ops for deferred commit — do NOT replay to vault yet.
                 # Runner will commit after verifier approval so retries start with clean vault.
@@ -565,6 +572,7 @@ def _call_tool(name: str, args: dict) -> str:
             vault_ops = list(_draft_buffer)
             _draft_buffer = []
             _draft_had_writes = False
+            _draft_completed = True
 
             draft = {
                 "schema_version": 1,

@@ -309,11 +309,23 @@ def _spawn_iclaude(
             cwd=cwd,
             env={**os.environ, "PYTHONPATH": str(_PAC1_DIR)},
         )
-        stdout_lines = _collect_stdout(proc.stdout, echo=echo)
-        proc.wait(timeout=timeout)
-        exit_code = proc.returncode
-    except subprocess.TimeoutExpired:
-        if proc is not None:
+        # Collect stdout in a background thread so the timeout below
+        # can kill the process while _collect_stdout is still blocking.
+        collected: list[list[str]] = []
+        t = threading.Thread(
+            target=lambda: collected.append(_collect_stdout(proc.stdout, echo=echo)),
+            daemon=True,
+        )
+        t.start()
+        t.join(timeout=timeout)
+        if proc.poll() is None:
+            # Process still running after timeout — kill it.
+            proc.kill()
+        t.join()  # drain remaining bytes after kill
+        stdout_lines = collected[0] if collected else []
+        exit_code = proc.wait()
+    except Exception:
+        if proc is not None and proc.poll() is None:
             proc.kill()
         exit_code = -1
     finally:
