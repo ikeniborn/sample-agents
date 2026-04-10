@@ -1,0 +1,215 @@
+---
+# cc-agent Architecture Overview
+# Generated: 2026-04-10
+# Project: cc-agent (PAC1 benchmark agent via Claude Code CLI + MCP)
+
+schema_version: 1
+project:
+  name: cc-agent
+  description: >
+    Replacement for pac1-py agent. Instead of a Python LLM loop, uses Claude Code CLI
+    directly via MCP (Model Context Protocol). Executes pac1 benchmark tasks using a
+    multi-agent pipeline: Classifier → Executor → Verifier.
+  language: Python
+  entry_points:
+    - runner.py
+  execution: "cd pac1-py && uv run python cc-agent/runner.py"
+
+architectural_pattern: multi-agent-pipeline
+detected_patterns:
+  - multi-agent-pipeline     # Classifier → Executor → Verifier
+  - layered                  # orchestration / agent-logic / mcp-harness / prompt
+  - event-driven             # JSONL trace log, evaluator gate on tool calls
+
+complexity: standard   # 4 core files, ~10 logical components
+
+---
+components:
+  - id: runner
+    name: Runner / Orchestrator
+    file: runner.py
+    type: orchestrator
+    layer: orchestration
+    description: >
+      Entry point. Reads env config, connects to BitGN harness API, dispatches tasks
+      to the multi-agent pipeline or legacy single-agent. Manages parallel execution
+      (ThreadPoolExecutor), scoring, and structured run-log output (JSONL + text).
+    public_functions:
+      - main()
+      - run_task(client, task_id, run_dir)
+      - run_trial(client, trial_id, task_filter, run_dir)
+      - _execute_task(client, task_id, trial_id, harness_url, instruction, run_dir)
+      - _run_pipeline(harness_url, task_id, instruction, task_dir)
+      - _executor_verify_loop(harness_url, task_id, instruction, task_dir, executor_prompt, attempt, time_remaining)
+      - _execute_single(harness_url, task_id, instruction, task_dir)
+      - _spawn_iclaude(mcp_cfg, system_prompt, user_prompt, model, timeout, echo, bare, output_format)
+      - _build_mcp_config(harness_url, trace_file, task_id, instruction, mode, extra_env)
+    dependencies:
+      - agents
+      - prompt
+      - mcp_pcm    # path to MCP server binary (subprocess)
+      - bitgn.harness_connect
+      - bitgn.vm.pcm_connect
+
+  - id: agents
+    name: Agents — Prompts, Parsers, Protocol
+    file: agents.py
+    type: module
+    layer: agent-logic
+    description: >
+      Defines the three agent roles and their inter-agent exchange protocol.
+      Contains CLASSIFIER_PROMPT, VERIFIER_PROMPT, JSON parsers for each role,
+      executor prompt builder, and verdict application logic.
+    public_functions:
+      - parse_classifier_output(lines)
+      - parse_verifier_output(lines)
+      - build_executor_prompt(classification)
+      - apply_verdict(draft, verdict)
+    internal_functions:
+      - _extract_json(lines)
+      - _find_json_object(text)
+      - _unwrap_cli_envelope(text)
+    dependencies:
+      - prompt    # imports SYSTEM_PROMPT as fallback
+
+  - id: mcp_pcm
+    name: MCP Server + Harness
+    file: mcp_pcm.py
+    type: mcp-server
+    layer: infrastructure
+    description: >
+      MCP stdio server that wraps the PCM (vault) runtime. Exposes vault tools
+      (tree, find, search, list, read, write, delete, mkdir, move, report_completion,
+      get_context) to Claude Code agents. Implements four harness layers:
+      write/delete guards, prompt injection detection, stall detection, evaluator gate.
+      Operates in one of three modes controlled by MCP_MODE env var.
+    mcp_modes:
+      full: all tools; report_completion calls vm.answer()
+      readonly: only read tools (tree/find/search/list/read/get_context)
+      draft: all tools; mutations buffered; committed only on outcome=ok
+    harness_layers:
+      - write_delete_protection   # guards protected paths and inbox/
+      - injection_detection       # scans read content for prompt injection patterns
+      - stall_detection           # detects repeated identical calls or mutation drought
+      - evaluator_gate            # heuristic checks before report_completion
+    dependencies:
+      - bitgn.vm.pcm_connect
+      - bitgn.vm.pcm_pb2
+
+  - id: prompt
+    name: Adaptive Prompt Generator
+    file: prompt.py
+    type: module
+    layer: agent-logic
+    description: >
+      Static base system prompt (SYSTEM_PROMPT) plus regex-based task classifier.
+      Appends task-specific addenda (delete / email / inbox / lookup rules) to the
+      base prompt based on instruction keywords. Used as fallback when Classifier
+      agent fails or in legacy single-agent mode.
+    public_functions:
+      - get_prompt(instruction)
+      - classify_task(instruction)
+    dependencies: []
+
+---
+data_flows:
+
+  - id: multi-agent-flow
+    name: Multi-Agent Pipeline (MULTI_AGENT=1)
+    steps:
+      - step: 1
+        actor: runner
+        action: "start_playground(task_id) or start_trial(trial_id) → harness_url, instruction, trial_id"
+      - step: 2
+        actor: runner
+        action: "Build MCP config (mode=readonly) → spawn iclaude as Classifier"
+      - step: 3
+        actor: agents (Classifier)
+        action: "Read vault via MCP tools → output classification JSON (task_type, system_prompt, key_rules, warnings)"
+      - step: 4
+        actor: runner
+        action: "parse_classifier_output() → build_executor_prompt() → Build MCP config (mode=draft)"
+      - step: 5
+        actor: agents (Executor)
+        action: "Perform task using tailored prompt + draft MCP → write vault files → report_completion → draft.json saved"
+      - step: 6
+        actor: runner
+        action: "Build MCP config (mode=readonly) → spawn iclaude as Verifier with draft + instruction"
+      - step: 7
+        actor: agents (Verifier)
+        action: "Read vault + draft → output verdict JSON (approve / correct / reject)"
+      - step: 8
+        actor: runner
+        action: "apply_verdict() → if reject and retries left → loop back to step 4"
+      - step: 9
+        actor: runner
+        action: "_submit_answer() → PcmRuntimeClientSync.answer() → end_trial() → score"
+
+  - id: single-agent-flow
+    name: Legacy Single-Agent (MULTI_AGENT=0)
+    steps:
+      - step: 1
+        actor: runner
+        action: "start_playground / start_trial → harness_url, instruction"
+      - step: 2
+        actor: runner
+        action: "get_prompt(instruction) → classify task by regex → system prompt with addendum"
+      - step: 3
+        actor: runner
+        action: "Build MCP config (mode=full) → spawn iclaude as single agent"
+      - step: 4
+        actor: agents (Executor)
+        action: "Perform task → report_completion() → vm.answer() directly"
+      - step: 5
+        actor: runner
+        action: "end_trial() → score"
+
+---
+external_dependencies:
+  - name: bitgn
+    package_path: "../pac1-py/bitgn"
+    description: "BitGN client library — HarnessServiceClientSync, PcmRuntimeClientSync, protobuf messages"
+  - name: iclaude
+    type: cli-subprocess
+    description: "Claude Code CLI (iclaude) — spawned as subprocess per agent invocation"
+  - name: connectrpc
+    description: "Connect-RPC transport for harness communication"
+  - name: uv
+    description: "Python package runner (cd pac1-py && uv run python ...)"
+
+---
+configuration:
+  env_files:
+    - cc-agent/.env
+    - cc-agent/.secrets
+  key_variables:
+    BITGN_HOST: "API endpoint (default: https://api.bitgn.com)"
+    BENCH_ID: "benchmark ID (default: bitgn/pac1-dev)"
+    TASK_TIMEOUT_S: "task timeout seconds (default: 300)"
+    PARALLEL_TASKS: "parallelism (default: 1)"
+    MULTI_AGENT: "1=multi-agent pipeline, 0=legacy single-agent"
+    MAX_RETRIES: "max executor retries on verifier reject (default: 1)"
+    CLAUDE_MODEL: "executor model"
+    CLAUDE_CLASSIFIER_MODEL: "classifier model (default: haiku)"
+    CLAUDE_VERIFIER_MODEL: "verifier model (default: auto, different from executor)"
+    CLASSIFIER_TIMEOUT_S: "hard cap for classifier subprocess (default: 60)"
+    VERIFIER_TIMEOUT_S: "hard cap for verifier subprocess (default: 90)"
+    BITGN_API_KEY: "enables run mode vs playground mode"
+    ICLAUDE_CMD: "iclaude CLI command (default: iclaude)"
+
+---
+log_artifacts:
+  location: "cc-agent/logs/<YYYYMMDD_HHMMSS>/<task_id>/"
+  files:
+    - "classifier.events.jsonl   — MCP tool calls made by Classifier"
+    - "classification.json       — Classifier output (task_type, system_prompt, key_rules)"
+    - "executor_N.events.jsonl   — MCP tool calls made by Executor (attempt N)"
+    - "draft_N.json              — Executor draft answer (attempt N)"
+    - "verifier_N.events.jsonl   — MCP tool calls made by Verifier (attempt N)"
+    - "verdict_N.json            — Verifier verdict"
+    - "final_answer.json         — Submitted answer after apply_verdict()"
+    - "pipeline.events.jsonl     — Runner-level pipeline events (fallbacks, errors)"
+    - "<task_id>.log             — Human-readable aggregated log"
+  run_level:
+    - "run.jsonl                 — Per-task and run-summary JSONL events"
+    - "summary.log               — Human-readable score summary"
