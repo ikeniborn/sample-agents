@@ -189,10 +189,11 @@ def _scan_for_injection(content: str) -> bool:
 
 _MUTATION_TOOLS = {"write", "delete", "move", "mkdir"}
 _STALL_REPEAT = 3
-_STALL_NO_MUTATION = 12  # only checked in full/draft modes
+_STALL_NO_MUTATION = int(os.environ.get("STALL_NO_MUTATION", "18"))  # only checked in full/draft modes
 
 _tool_history: list[str] = []
 _last_mutation_step: int = 0
+_unique_reads: set[str] = set()  # track unique file paths read
 
 
 def _fingerprint(name: str, args: dict) -> str:
@@ -207,7 +208,11 @@ def _check_stall() -> str | None:
     # Readonly agents never mutate by design — skip no-mutation stall check
     if _MCP_MODE != "readonly":
         steps_since = len(_tool_history) - _last_mutation_step
-        if steps_since >= _STALL_NO_MUTATION:
+        # Finance/relationship tasks legitimately read many files before writing.
+        # Only trigger stall if reads are NOT making progress (few unique paths).
+        unique_since_mutation = len(_unique_reads) - _last_mutation_step
+        effective_threshold = _STALL_NO_MUTATION + max(0, unique_since_mutation // 2)
+        if steps_since >= effective_threshold:
             return f"STALL: {steps_since} steps without mutation"
     return None
 
@@ -674,6 +679,8 @@ def _handle(req: dict) -> None:
             # Stall detection
             fp = _fingerprint(tool_name, tool_args)
             _tool_history.append(fp)
+            if tool_name == "read" and "path" in tool_args:
+                _unique_reads.add(tool_args["path"])
             if tool_name in _MUTATION_TOOLS:
                 _last_mutation_step = len(_tool_history)
             stall = _check_stall()
