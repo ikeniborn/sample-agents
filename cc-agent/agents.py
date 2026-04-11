@@ -706,16 +706,17 @@ For lookup/search tasks where an exact match does not exist: if the executor ret
 name), prefer verdict="correct" with outcome="ok" and the nearest match in the message.
 The evaluator rewards returning the best available answer over refusing.
 
-**EXCEPTION — exact-date lookups**: if the task uses phrasing that implies a specific
-exact date (e.g. "the article I captured N days ago", "the entry from N days ago",
-"exactly N days ago"), AND no exact-date match exists, then `outcome="clarification"` is
-**correct** — do NOT override it to "ok". The evaluator penalises "ok" with a "no match"
-message for these tasks. Also: if the executor returned `outcome="ok"` with a message
-containing "no exact match", "no article", "no file", or "not found" for an exact-date
-lookup → verdict="correct" with `outcome="clarification"` and the same nearest-match
-information in the message.
+**EXCEPTION — exact-date lookups**: if the task uses phrasing that explicitly demands an
+exact date (e.g. "exactly N days ago", "on that exact date"), AND no exact-date match
+exists, then `outcome="clarification"` is **correct** — do NOT override it to "ok".
+Also: if the executor returned `outcome="ok"` with a message containing "no exact match",
+"no article", "no file", or "not found" for an exact-date lookup → verdict="correct"
+with `outcome="clarification"` and the same nearest-match information in the message.
+Note: phrases like "N days ago", "captured N days ago", "the article from N days ago"
+are NOT exact-date — they are proximity lookups (see below).
 
-**Date-based proximity lookups** ("closest to date X", CRM date lookups, "captured N days ago"):
+**Date-based proximity lookups** ("closest to date X", CRM date lookups, "captured N days ago",
+"the article I captured N days ago", "N days ago"):
 Nearest match = the candidate with minimum absolute distance |Δ| = |candidate_date − target_date|.
 
 Mandatory CoT steps for any date-proximity comparison — you MUST show this reasoning:

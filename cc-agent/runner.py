@@ -100,7 +100,8 @@ BENCHMARK_ID = os.getenv("BENCH_ID", "bitgn/pac1-dev")
 TASK_TIMEOUT = int(os.getenv("TASK_TIMEOUT_S", "300"))
 PARALLEL_TASKS = int(os.getenv("PARALLEL_TASKS", "1"))
 BITGN_API_KEY = os.getenv("BITGN_API_KEY", "")
-BITGN_RUN_NAME = os.getenv("BITGN_RUN_NAME", "")
+_run_name_base = os.getenv("BITGN_RUN_NAME", "")
+BITGN_RUN_NAME = f"{_run_name_base}-{datetime.now().strftime('%Y%m%d-%H%M%S')}" if _run_name_base else ""
 ICLAUDE_CMD = os.getenv("ICLAUDE_CMD", "iclaude")
 CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "")
 CLAUDE_CLASSIFIER_MODEL = os.getenv("CLAUDE_CLASSIFIER_MODEL", "haiku")
@@ -336,15 +337,27 @@ def _spawn_iclaude(
 
 # ── Submit answer directly ──────────────────────────────────────────────────
 
-def _submit_answer(harness_url: str, answer: dict) -> None:
-    """Submit final answer directly via PcmRuntimeClient (bypassing MCP)."""
+def _submit_answer(harness_url: str, answer: dict) -> bool:
+    """Submit final answer directly via PcmRuntimeClient (bypassing MCP).
+
+    Returns True on success, False if the harness already has an answer
+    (e.g. auto-evaluated by the server before our submission).
+    """
     vm = PcmRuntimeClientSync(harness_url)
     outcome = _OUTCOME_MAP.get(answer.get("outcome", "ok"), Outcome.OUTCOME_OK)
-    vm.answer(AnswerRequest(
-        message=answer.get("message", ""),
-        outcome=outcome,
-        refs=answer.get("refs", []),
-    ))
+    try:
+        vm.answer(AnswerRequest(
+            message=answer.get("message", ""),
+            outcome=outcome,
+            refs=answer.get("refs", []),
+        ))
+        return True
+    except ConnectError as exc:
+        if "already provided" in str(exc).lower():
+            with _STDOUT_LOCK:
+                print(f"  {CLI_YELLOW}[submit] WARNING: harness already has an answer — ours was not applied{CLI_CLR}")
+            return False
+        raise
 
 
 def _commit_vault_ops(harness_url: str, vault_ops: list[dict]) -> None:
@@ -497,6 +510,29 @@ def _executor_verify_loop(
             "type": "executor_no_draft", "attempt": attempt,
         })
 
+    # ── Time check: skip verifier if budget is too tight ──
+    # The harness may auto-submit a default answer on inactivity timeout.
+    # If we don't have enough time for a full verifier pass, submit the
+    # executor draft directly to avoid losing the answer.
+    elapsed = time.monotonic() - attempt_start
+    remaining_after_exec = time_remaining - elapsed
+    if remaining_after_exec < 45:
+        with _STDOUT_LOCK:
+            print(f"  {CLI_YELLOW}[pipeline] {remaining_after_exec:.0f}s left — skipping verifier, submitting draft{CLI_CLR}")
+        _write_json(task_dir / "final_answer.json", draft)
+        _append_jsonl(task_dir / "pipeline.events.jsonl", {
+            "type": "verifier_skipped", "reason": "time_budget",
+            "remaining_s": round(remaining_after_exec, 1), "attempt": attempt,
+        })
+        if draft.get("outcome") == "ok":
+            vault_ops = draft.get("vault_ops", [])
+            if vault_ops:
+                _commit_vault_ops(harness_url, vault_ops)
+        _submit_answer(harness_url, draft)
+        with _STDOUT_LOCK:
+            print(f"  {CLI_GREEN}[submitted] outcome={draft.get('outcome', '?')} (no verifier){CLI_CLR}")
+        return
+
     with _STDOUT_LOCK:
         print(f"  {CLI_YELLOW}[verifier] model={verifier_model} timeout={ver_t}s{CLI_CLR}")
 
@@ -595,10 +631,16 @@ def _executor_verify_loop(
             with _STDOUT_LOCK:
                 print(f"  {CLI_GREEN}[vault] committed {len(vault_ops)} op(s){CLI_CLR}")
 
-    _submit_answer(harness_url, final)
+    submitted = _submit_answer(harness_url, final)
 
-    with _STDOUT_LOCK:
-        print(f"  {CLI_GREEN}[submitted] outcome={final.get('outcome', '?')}{CLI_CLR}")
+    if submitted:
+        with _STDOUT_LOCK:
+            print(f"  {CLI_GREEN}[submitted] outcome={final.get('outcome', '?')}{CLI_CLR}")
+    else:
+        _append_jsonl(task_dir / "pipeline.events.jsonl", {
+            "type": "submit_already_provided",
+            "intended_outcome": final.get("outcome", "?"),
+        })
 
 
 # ── Legacy single-agent execution ───────────────────────────────────────────
