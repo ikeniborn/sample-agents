@@ -25,14 +25,15 @@ Env vars (from cc-agent/.env, .secrets, or shell):
     CLAUDE_MODEL            executor model (default: CLI default)
     CLAUDE_CLASSIFIER_MODEL default: haiku
     CLAUDE_VERIFIER_MODEL   default: auto (picks model different from executor)
-    CLASSIFIER_TIMEOUT_S    default: 60  (hard cap for classifier subprocess)
-    VERIFIER_TIMEOUT_S      default: 90  (hard cap for verifier subprocess; overrides dynamic budget cap)
+    CLASSIFIER_TIMEOUT_S    default: 120  (hard cap for classifier subprocess)
+    VERIFIER_TIMEOUT_S      default: 180  (hard cap for verifier subprocess; overrides dynamic budget cap)
     USE_ROUTER              default: 0   (1/true = pass --router flag to every iclaude call)
 """
 
 import json
 import os
 import re as _re
+import signal
 import shlex
 import subprocess
 import sys
@@ -108,8 +109,8 @@ CLAUDE_CLASSIFIER_MODEL = os.getenv("CLAUDE_CLASSIFIER_MODEL", "haiku")
 CLAUDE_VERIFIER_MODEL = os.getenv("CLAUDE_VERIFIER_MODEL", "")
 MULTI_AGENT = os.getenv("MULTI_AGENT", "1") != "0"
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "1"))
-CLASSIFIER_TIMEOUT = int(os.getenv("CLASSIFIER_TIMEOUT_S", "60"))
-VERIFIER_TIMEOUT = int(os.getenv("VERIFIER_TIMEOUT_S", "90"))
+CLASSIFIER_TIMEOUT = int(os.getenv("CLASSIFIER_TIMEOUT_S", "120"))
+VERIFIER_TIMEOUT = int(os.getenv("VERIFIER_TIMEOUT_S", "180"))
 USE_ROUTER = os.getenv("USE_ROUTER", "0") not in ("0", "", "false", "False")
 
 _MCP_SERVER = Path(__file__).parent / "mcp_pcm.py"
@@ -207,14 +208,39 @@ def _models_info() -> dict:
 
 
 def _time_budget(remaining: float, attempt: int, max_attempts: int) -> tuple[int, int]:
-    """Return (executor_timeout, verifier_timeout) for this attempt."""
+    """Return (executor_timeout, verifier_timeout) for this attempt.
+
+    Verifier timeout is computed dynamically after executor finishes via
+    _verifier_budget(), so the value returned here is only a planning estimate
+    used for logging.  The executor gets the lion's share of the attempt budget.
+    """
     remaining_attempts = max_attempts - attempt + 1
     if remaining_attempts <= 0:
         return int(remaining * 0.8), int(remaining * 0.2)
     per_attempt = remaining / remaining_attempts
-    verifier_t = min(VERIFIER_TIMEOUT, per_attempt * 0.25)
+    # Reserve ~40% for verifier (estimate); actual verifier timeout is dynamic.
+    verifier_t = min(VERIFIER_TIMEOUT, per_attempt * 0.4)
     executor_t = per_attempt - verifier_t
     return max(int(executor_t), 10), max(int(verifier_t), 10)
+
+
+def _verifier_budget(time_remaining: float, elapsed_in_attempt: float,
+                     attempt: int, max_attempts: int) -> int:
+    """Compute actual verifier timeout from real remaining time after executor.
+
+    Gives the verifier as much time as possible while reserving budget for
+    potential retry attempts.
+    """
+    remaining = time_remaining - elapsed_in_attempt
+    future_attempts = max_attempts - attempt  # attempts AFTER this one
+    if future_attempts > 0:
+        # Reserve budget for future executor+verifier attempts
+        reserve = remaining * 0.35
+    else:
+        # Last attempt — give almost everything to verifier
+        reserve = 15  # small buffer for submit overhead
+    ver_t = min(VERIFIER_TIMEOUT, remaining - reserve)
+    return max(int(ver_t), 10)
 
 
 # ── MCP config builder ──────────────────────────────────────────────────────
@@ -309,6 +335,7 @@ def _spawn_iclaude(
             text=True,
             cwd=cwd,
             env={**os.environ, "PYTHONPATH": str(_PAC1_DIR)},
+            start_new_session=True,  # isolate process group for clean kill
         )
         # Collect stdout in a background thread so the timeout below
         # can kill the process while _collect_stdout is still blocking.
@@ -320,14 +347,32 @@ def _spawn_iclaude(
         t.start()
         t.join(timeout=timeout)
         if proc.poll() is None:
-            # Process still running after timeout — kill it.
-            proc.kill()
-        t.join()  # drain remaining bytes after kill
+            # Process still running after timeout — graceful then hard kill.
+            # SIGTERM lets iclaude flush output; SIGKILL after grace period
+            # ensures the entire process group is reaped.
+            try:
+                os.killpg(proc.pid, signal.SIGTERM)
+            except OSError:
+                proc.terminate()
+            # Give processes a few seconds to flush and exit
+            t.join(timeout=5)
+            if proc.poll() is None:
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except OSError:
+                    proc.kill()
+                t.join(timeout=5)
+        else:
+            # Process finished normally — wait for output drain
+            t.join(timeout=30)
         stdout_lines = collected[0] if collected else []
         exit_code = proc.wait()
     except Exception:
         if proc is not None and proc.poll() is None:
-            proc.kill()
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except OSError:
+                proc.kill()
         exit_code = -1
     finally:
         Path(cfg_path).unlink(missing_ok=True)
@@ -533,6 +578,10 @@ def _executor_verify_loop(
             print(f"  {CLI_GREEN}[submitted] outcome={draft.get('outcome', '?')} (no verifier){CLI_CLR}")
         return
 
+    # Compute actual verifier timeout from real remaining time after executor.
+    ver_t = _verifier_budget(time_remaining, time.monotonic() - attempt_start,
+                             attempt, MAX_RETRIES + 1)
+
     with _STDOUT_LOCK:
         print(f"  {CLI_YELLOW}[verifier] model={verifier_model} timeout={ver_t}s{CLI_CLR}")
 
@@ -567,12 +616,15 @@ def _executor_verify_loop(
             "exit_code": ver_exit, "attempt": attempt,
         })
         time.sleep(5)
+        # Recompute budget for retry with remaining time
+        ver_t_retry = _verifier_budget(time_remaining, time.monotonic() - attempt_start,
+                                       attempt, MAX_RETRIES + 1)
         ver_lines, ver_exit = _spawn_iclaude(
             mcp_cfg=verifier_cfg,
             system_prompt=VERIFIER_PROMPT,
             user_prompt=verifier_input,
             model=verifier_model,
-            timeout=ver_t,
+            timeout=ver_t_retry,
             bare=True,
             echo=False,
             output_format="json",
