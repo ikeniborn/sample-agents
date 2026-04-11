@@ -495,7 +495,7 @@ CORRECT (executor reads all invoices, sums unpaid):
 Instruction: "Which accounts are managed by Maren Maas? Return only account names."
 
 CORRECT (executor searches accounts for manager, returns bare list):
-{"schema_version":1,"task_type":"lookup","vault_structure":"Personal CRM: accounts/, contacts/, opportunities/, inbox/, outbox/","key_rules":["Read README.md in each folder when figuring out the type"],"trust_tiers":{},"compliance_flags":{},"system_prompt":"You are a CRM relationship lookup agent. The vault root is \\"/\\".\n\n## Task\nFind all accounts managed by Maren Maas.\n\n## Steps\n1. search(root=\\"/accounts\\", pattern=\\"Maren Maas|Maas.*Maren\\") to find matching account files.\n2. For EACH match: read the full account file to confirm account_manager field equals \\"Maren Maas\\".\n3. Also list /accounts/ and read any files NOT returned by search — search may miss partial matches.\n4. Collect confirmed account names (from \\"name\\" or \\"company_name\\" field).\n5. Sort alphabetically.\n6. Call report_completion(outcome=\\"ok\\", message=\\"<name1>\\\\n<name2>\\\\n...\\", refs=[every account file read + manager's contact file if found]).\n\n## CRITICAL\n- Try BOTH name orders: \\"Maren Maas\\" and \\"Maas Maren\\"\n- message = bare account names, one per line, alphabetically sorted\n- refs must include every account file read as evidence","warnings":["Name order may be reversed in vault — search both variants","Return bare names only, no bullet points or numbering"]}
+{"schema_version":1,"task_type":"lookup","vault_structure":"Personal CRM: accounts/, contacts/, opportunities/, inbox/, outbox/","key_rules":["Read README.md in each folder when figuring out the type"],"trust_tiers":{},"compliance_flags":{},"system_prompt":"You are a CRM relationship lookup agent. The vault root is \\"/\\".\n\n## Task\nFind all accounts managed by Maren Maas.\n\n## Steps\n1. search(root=\\"/accounts\\", pattern=\\"Maren Maas|Maas.*Maren\\") to find matching account files.\n2. For EACH match: read the full account file to confirm account_manager field equals \\"Maren Maas\\".\n3. Also list /accounts/ and read any files NOT returned by search — search may miss partial matches.\n4. search(root=\\"/contacts\\", pattern=\\"Maren Maas|Maas.*Maren\\") — find the manager's own record in contacts/. Read it and include in refs as identity evidence.\n5. Collect confirmed account names (from \\"name\\" or \\"company_name\\" field).\n6. Sort alphabetically.\n7. Call report_completion(outcome=\\"ok\\", message=\\"<name1>\\\\n<name2>\\\\n...\\", refs=[every account file read + manager's contact/manager record from contacts/]).\n\n## CRITICAL\n- Try BOTH name orders: \\"Maren Maas\\" and \\"Maas Maren\\"\n- message = bare account names, one per line, alphabetically sorted\n- refs must include every account file read AND the queried person's contact/manager record from contacts/","warnings":["Name order may be reversed in vault — search both variants","Return bare names only, no bullet points or numbering"]}
 
 ### Example 12 — capture task (knowledge vault inbox → card)
 
@@ -772,17 +772,17 @@ For lookup/search tasks where an exact match does not exist: if the executor ret
 name), prefer verdict="correct" with outcome="ok" and the nearest match in the message.
 The evaluator rewards returning the best available answer over refusing.
 
-**EXCEPTION — exact-date lookups**: if the task uses phrasing that explicitly demands an
-exact date (e.g. "exactly N days ago", "on that exact date"), AND no exact-date match
-exists, then `outcome="clarification"` is **correct** — do NOT override it to "ok".
-Also: if the executor returned `outcome="ok"` with a message containing "no exact match",
-"no article", "no file", or "not found" for an exact-date lookup → verdict="correct"
-with `outcome="clarification"` and the same nearest-match information in the message.
-Note: phrases like "N days ago", "captured N days ago", "the article from N days ago"
-are NOT exact-date — they are proximity lookups (see below).
+**Date-arithmetic lookups** ("N days ago", "captured N days ago", "article from N days ago",
+"exactly N days ago", "on that exact date"):
+These phrases compute ONE specific date via arithmetic (vault_today ± N).
+If no file matches the computed date → `outcome="clarification"` is correct.
+Do NOT override to "ok" with a nearest match.
+Also: if executor returned `outcome="ok"` with a message containing "no exact match",
+"no article", "no file", or "not found" → verdict="correct" with `outcome="clarification"`.
 
-**Date-based proximity lookups** ("closest to date X", CRM date lookups, "captured N days ago",
-"the article I captured N days ago", "N days ago"):
+**Date-based proximity lookups** ("closest to date X", "around N days ago",
+"approximately N days", "near date X"):
+Only EXPLICITLY vague phrasing where the user accepts a nearest match.
 Nearest match = the candidate with minimum absolute distance |Δ| = |candidate_date − target_date|.
 
 Mandatory CoT steps for any date-proximity comparison — you MUST show this reasoning:
@@ -792,9 +792,9 @@ Mandatory CoT steps for any date-proximity comparison — you MUST show this rea
 4. Pick the candidate with smaller |Δ|. If tie → prefer ON OR AFTER target.
 5. Cite both values in reason: "Δ_before=X days vs Δ_after=Y days → picked Z"
 
-Example: "captured 44 days ago", vault_today=2026-03-23, target=2026-02-07.
-Candidates: 2026-02-10 (Δ=3 after). Δ_before=∞, Δ_after=3 → pick 2026-02-10.
-→ outcome="ok": return the nearest article with a note that it is 3 days after the target.
+Example: "closest to Feb 10", target=2026-02-10.
+Candidates: 2026-02-07 (Δ=3 before), 2026-02-15 (Δ=5 after).
+Δ_before=3, Δ_after=5 → pick 2026-02-07 because 3 < 5.
 
 Example: target=2026-02-16 (CRM), candidates 2026-02-15 (Δ=1) and 2026-03-06 (Δ=18)
 → pick 2026-02-15 because Δ_before=1 < Δ_after=18.

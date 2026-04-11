@@ -20,6 +20,7 @@ Usage (stdio transport, as MCP subprocess):
     HARNESS_URL=https://... MCP_MODE=full python mcp_pcm.py
 """
 
+import datetime as _dt
 import hashlib as _hl
 import json
 import os
@@ -68,6 +69,12 @@ try:
     _vault_context: str = _vm.context(ContextRequest()).content or ""
 except Exception:
     _vault_context = ""
+
+# When harness returns no context (common for knowledge vaults), inject today's
+# date as vault_today fallback.  The evaluator uses the same runtime date, so
+# this keeps agent date arithmetic aligned with scoring.
+if not _vault_context:
+    _vault_context = f"vault_today: {_dt.date.today().isoformat()}"
 
 # ── Draft mode write buffer ───────────────────────────────────────────────────
 # In draft mode all vault mutations are buffered and only committed when
