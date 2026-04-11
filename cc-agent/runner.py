@@ -25,6 +25,9 @@ Env vars (from cc-agent/.env, .secrets, or shell):
     CLAUDE_MODEL            executor model (default: CLI default)
     CLAUDE_CLASSIFIER_MODEL default: haiku
     CLAUDE_VERIFIER_MODEL   default: auto (picks model different from executor)
+    CLAUDE_EFFORT           executor thinking effort (low/medium/high/max, default: empty = CLI default)
+    CLAUDE_CLASSIFIER_EFFORT classifier thinking effort (default: empty)
+    CLAUDE_VERIFIER_EFFORT  verifier thinking effort (default: empty)
     CLASSIFIER_TIMEOUT_S    default: 120  (hard cap for classifier subprocess)
     VERIFIER_TIMEOUT_S      default: 180  (hard cap for verifier subprocess; overrides dynamic budget cap)
     USE_ROUTER              default: 0   (1/true = pass --router flag to every iclaude call)
@@ -104,14 +107,19 @@ BITGN_API_KEY = os.getenv("BITGN_API_KEY", "")
 _run_name_base = os.getenv("BITGN_RUN_NAME", "")
 BITGN_RUN_NAME = f"{_run_name_base}-{datetime.now().strftime('%Y%m%d-%H%M%S')}" if _run_name_base else ""
 ICLAUDE_CMD = os.getenv("ICLAUDE_CMD", "iclaude")
-CLAUDE_MODEL = os.getenv("CLAUDE_MODEL", "")
-CLAUDE_CLASSIFIER_MODEL = os.getenv("CLAUDE_CLASSIFIER_MODEL", "haiku")
-CLAUDE_VERIFIER_MODEL = os.getenv("CLAUDE_VERIFIER_MODEL", "")
+USE_ROUTER = os.getenv("USE_ROUTER", "0") not in ("0", "", "false", "False")
+
+# When router is active, model selection is handled by the router — ignore env vars
+CLAUDE_MODEL = "" if USE_ROUTER else os.getenv("CLAUDE_MODEL", "")
+CLAUDE_CLASSIFIER_MODEL = "" if USE_ROUTER else os.getenv("CLAUDE_CLASSIFIER_MODEL", "haiku")
+CLAUDE_VERIFIER_MODEL = "" if USE_ROUTER else os.getenv("CLAUDE_VERIFIER_MODEL", "")
+CLAUDE_EFFORT = os.getenv("CLAUDE_EFFORT", "")
+CLAUDE_CLASSIFIER_EFFORT = os.getenv("CLAUDE_CLASSIFIER_EFFORT", "")
+CLAUDE_VERIFIER_EFFORT = os.getenv("CLAUDE_VERIFIER_EFFORT", "")
 MULTI_AGENT = os.getenv("MULTI_AGENT", "1") != "0"
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "1"))
 CLASSIFIER_TIMEOUT = int(os.getenv("CLASSIFIER_TIMEOUT_S", "120"))
 VERIFIER_TIMEOUT = int(os.getenv("VERIFIER_TIMEOUT_S", "180"))
-USE_ROUTER = os.getenv("USE_ROUTER", "0") not in ("0", "", "false", "False")
 
 _MCP_SERVER = Path(__file__).parent / "mcp_pcm.py"
 _PAC1_DIR = Path(__file__).parent.parent / "pac1-py"
@@ -195,15 +203,27 @@ def _pick_verifier_model() -> str:
     return "opus"
 
 
-_RESOLVED_VERIFIER_MODEL = CLAUDE_VERIFIER_MODEL or _pick_verifier_model()
+_RESOLVED_VERIFIER_MODEL = "" if USE_ROUTER else (CLAUDE_VERIFIER_MODEL or _pick_verifier_model())
 
 
 def _models_info() -> dict:
     """Return models config dict for logging."""
+    if USE_ROUTER:
+        return {
+            "executor": "router",
+            "classifier": "router" if MULTI_AGENT else None,
+            "verifier": "router" if MULTI_AGENT else None,
+            "effort_executor": CLAUDE_EFFORT or None,
+            "effort_classifier": CLAUDE_CLASSIFIER_EFFORT or None,
+            "effort_verifier": CLAUDE_VERIFIER_EFFORT or None,
+        }
     return {
         "executor": CLAUDE_MODEL or "default",
         "classifier": CLAUDE_CLASSIFIER_MODEL if MULTI_AGENT else None,
         "verifier": _RESOLVED_VERIFIER_MODEL if MULTI_AGENT else None,
+        "effort_executor": CLAUDE_EFFORT or None,
+        "effort_classifier": CLAUDE_CLASSIFIER_EFFORT or None,
+        "effort_verifier": CLAUDE_VERIFIER_EFFORT or None,
     }
 
 
@@ -288,6 +308,7 @@ def _spawn_iclaude(
     echo: bool = True,
     bare: bool = False,
     output_format: str = "",
+    effort: str = "",
 ) -> tuple[list[str], int]:
     """Spawn iclaude subprocess. Returns (stdout_lines, exit_code).
 
@@ -317,6 +338,8 @@ def _spawn_iclaude(
         cmd.extend(["--model", model])
     if USE_ROUTER:
         cmd.append("--router")
+    if effort:
+        cmd.extend(["--effort", effort])
     if output_format:
         cmd.extend(["--output-format", output_format])
     cmd.append(user_prompt)
@@ -378,6 +401,22 @@ def _spawn_iclaude(
         Path(cfg_path).unlink(missing_ok=True)
 
     return stdout_lines, exit_code
+
+
+def _extract_model_from_output(lines: list[str]) -> str:
+    """Extract the actual model name from iclaude JSON envelope (modelUsage key)."""
+    for line in reversed(lines):
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            obj = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        usage = obj.get("modelUsage")
+        if isinstance(usage, dict) and usage:
+            return ", ".join(usage.keys())
+    return ""
 
 
 # ── Submit answer directly ──────────────────────────────────────────────────
@@ -451,8 +490,9 @@ def _run_pipeline(
         harness_url, classifier_trace, task_id, instruction, mode="readonly",
     )
 
+    cls_model_label = "router" if USE_ROUTER else (CLAUDE_CLASSIFIER_MODEL or "default")
     with _STDOUT_LOCK:
-        print(f"  {CLI_YELLOW}[classifier] model={CLAUDE_CLASSIFIER_MODEL}{CLI_CLR}")
+        print(f"  {CLI_YELLOW}[classifier] model={cls_model_label}{CLI_CLR}")
 
     cls_lines, cls_exit = _spawn_iclaude(
         mcp_cfg=classifier_cfg,
@@ -463,7 +503,12 @@ def _run_pipeline(
         echo=False,
         bare=True,
         output_format="json",
+        effort=CLAUDE_CLASSIFIER_EFFORT,
     )
+    cls_actual = _extract_model_from_output(cls_lines)
+    if cls_actual:
+        with _STDOUT_LOCK:
+            print(f"  {CLI_YELLOW}[classifier] actual_model={cls_actual}{CLI_CLR}")
     classification = parse_classifier_output(cls_lines)
 
     # Retry classifier once on parse failure (e.g. transient ECONNREFUSED).
@@ -485,6 +530,7 @@ def _run_pipeline(
             echo=False,
             bare=True,
             output_format="json",
+            effort=CLAUDE_CLASSIFIER_EFFORT,
         )
         classification = parse_classifier_output(cls_lines)
 
@@ -528,8 +574,9 @@ def _executor_verify_loop(
 
     verifier_model = _RESOLVED_VERIFIER_MODEL
 
+    exec_model_label = "router" if USE_ROUTER else (CLAUDE_MODEL or "default")
     with _STDOUT_LOCK:
-        print(f"  {CLI_YELLOW}[executor] attempt={attempt} model={CLAUDE_MODEL or 'default'} timeout={exec_t}s{CLI_CLR}")
+        print(f"  {CLI_YELLOW}[executor] attempt={attempt} model={exec_model_label} timeout={exec_t}s{CLI_CLR}")
 
     # ── Executor ──
     draft_file = task_dir / f"draft_{attempt}.json"
@@ -539,14 +586,20 @@ def _executor_verify_loop(
         mode="draft",
         extra_env={"DRAFT_FILE": str(draft_file)},
     )
-    _spawn_iclaude(
+    exec_lines, _ = _spawn_iclaude(
         mcp_cfg=executor_cfg,
         system_prompt=executor_prompt,
         user_prompt=instruction,
         model=CLAUDE_MODEL,
         timeout=exec_t,
         bare=True,
+        output_format="json",
+        effort=CLAUDE_EFFORT,
     )
+    exec_actual = _extract_model_from_output(exec_lines)
+    if exec_actual:
+        with _STDOUT_LOCK:
+            print(f"  {CLI_YELLOW}[executor] actual_model={exec_actual}{CLI_CLR}")
 
     draft = _read_json(draft_file)
     if not draft:
@@ -582,8 +635,9 @@ def _executor_verify_loop(
     ver_t = _verifier_budget(time_remaining, time.monotonic() - attempt_start,
                              attempt, MAX_RETRIES + 1)
 
+    ver_model_label = "router" if USE_ROUTER else (verifier_model or "default")
     with _STDOUT_LOCK:
-        print(f"  {CLI_YELLOW}[verifier] model={verifier_model} timeout={ver_t}s{CLI_CLR}")
+        print(f"  {CLI_YELLOW}[verifier] model={ver_model_label} timeout={ver_t}s{CLI_CLR}")
 
     # ── Verifier ──
     ver_trace = task_dir / f"verifier_{attempt}.events.jsonl"
@@ -604,7 +658,12 @@ def _executor_verify_loop(
         bare=True,
         echo=False,
         output_format="json",
+        effort=CLAUDE_VERIFIER_EFFORT,
     )
+    ver_actual = _extract_model_from_output(ver_lines)
+    if ver_actual:
+        with _STDOUT_LOCK:
+            print(f"  {CLI_YELLOW}[verifier] actual_model={ver_actual}{CLI_CLR}")
     verdict = parse_verifier_output(ver_lines)
 
     # Retry verifier once on parse failure (e.g. transient ECONNREFUSED).
@@ -628,6 +687,7 @@ def _executor_verify_loop(
             bare=True,
             echo=False,
             output_format="json",
+            effort=CLAUDE_VERIFIER_EFFORT,
         )
         verdict = parse_verifier_output(ver_lines)
 
@@ -714,6 +774,7 @@ def _execute_single(
         model=CLAUDE_MODEL,
         timeout=TASK_TIMEOUT,
         bare=True,
+        effort=CLAUDE_EFFORT,
     )
 
 
@@ -836,7 +897,8 @@ def main() -> None:
     mode_label = "multi-agent" if MULTI_AGENT else "single"
     print(f"Benchmark: {bench.benchmark_id} — {len(bench.tasks)} tasks  (parallel={PARALLEL_TASKS}, mode={mode_label})")
     if MULTI_AGENT:
-        print(f"Models: classifier={CLAUDE_CLASSIFIER_MODEL}  executor={CLAUDE_MODEL or 'default'}  verifier={_RESOLVED_VERIFIER_MODEL}  retries={MAX_RETRIES}")
+        mi = _models_info()
+        print(f"Models: classifier={mi['classifier']}  executor={mi['executor']}  verifier={mi['verifier']}  retries={MAX_RETRIES}")
         print(f"Timeouts: task={TASK_TIMEOUT}s  classifier={CLASSIFIER_TIMEOUT}s  verifier={VERIFIER_TIMEOUT}s")
     print(f"{CLI_GREEN}{bench.description}{CLI_CLR}\n")
 

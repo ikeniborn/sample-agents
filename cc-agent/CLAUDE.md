@@ -23,6 +23,7 @@ Env-файлы: `cc-agent/.env`, `cc-agent/.secrets`
 | `MULTI_AGENT` | — | `1` = Classifier→Executor→Verifier, `0` = single-agent |
 | `MAX_RETRIES` | `1` | повторов executor при reject |
 | `CLAUDE_MODEL` / `CLAUDE_CLASSIFIER_MODEL` / `CLAUDE_VERIFIER_MODEL` | — | модели per-role |
+| `CLAUDE_EFFORT` / `CLAUDE_CLASSIFIER_EFFORT` / `CLAUDE_VERIFIER_EFFORT` | — | thinking effort per-role (low/medium/high/max) |
 | `BITGN_API_KEY` | `.secrets` | включает run mode |
 
 ## Architecture
@@ -58,3 +59,4 @@ MCP_MODE per роль: `full` (read+write), `readonly` (tree/find/search/list/re
 - **Не хардкодить** — промт-патчи (`"не делай X"`) запрещены, так как они маскируют системный баг вместо устранения причины.
   - Плохо: добавить ограничение в промт, потому что агент делает X на конкретном кейсе.
   - Хорошо: найти причину в логике классификации, парсинге или архитектуре пайплайна — и исправить там.
+- При проектированни и реактировании протов использвоать навык @skill:promt-verifier
