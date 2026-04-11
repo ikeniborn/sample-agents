@@ -95,7 +95,7 @@ from agents import (
     parse_classifier_output,
     parse_verifier_output,
 )
-from prompt import get_prompt
+from prompt import classify_task, get_prompt
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -120,6 +120,9 @@ MULTI_AGENT = os.getenv("MULTI_AGENT", "1") != "0"
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "1"))
 CLASSIFIER_TIMEOUT = int(os.getenv("CLASSIFIER_TIMEOUT_S", "120"))
 VERIFIER_TIMEOUT = int(os.getenv("VERIFIER_TIMEOUT_S", "180"))
+FAST_PATH_TYPES = set(
+    t.strip() for t in os.getenv("FAST_PATH_TYPES", "lookup,finance").split(",") if t.strip()
+)
 
 _MCP_SERVER = Path(__file__).parent / "mcp_pcm.py"
 _PAC1_DIR = Path(__file__).parent.parent / "pac1-py"
@@ -484,10 +487,28 @@ def _run_pipeline(
     with _STDOUT_LOCK:
         print(f"  {CLI_YELLOW}[pipeline] classifier → executor → verifier{CLI_CLR}")
 
+    # ── Fast-path: skip classifier for simple task types ──
+    if FAST_PATH_TYPES:
+        task_type = classify_task(instruction)
+        if task_type in FAST_PATH_TYPES:
+            with _STDOUT_LOCK:
+                print(f"  {CLI_GREEN}[pipeline] fast-path: type={task_type}, skipping classifier{CLI_CLR}")
+            _append_jsonl(task_dir / "pipeline.events.jsonl", {
+                "type": "classifier_fast_path", "task_type": task_type,
+            })
+            executor_prompt = get_prompt(instruction)
+            time_remaining = TASK_TIMEOUT - (time.monotonic() - pipeline_start)
+            return _executor_verify_loop(
+                harness_url, task_id, instruction, task_dir,
+                executor_prompt, attempt=1, time_remaining=time_remaining,
+            )
+
     # ── Phase 1: Classifier ──
+    vault_reads_file = task_dir / "vault_reads.json"
     classifier_trace = task_dir / "classifier.events.jsonl"
     classifier_cfg = _build_mcp_config(
         harness_url, classifier_trace, task_id, instruction, mode="readonly",
+        extra_env={"VAULT_READS_FILE": str(vault_reads_file)},
     )
 
     cls_model_label = "router" if USE_ROUTER else (CLAUDE_CLASSIFIER_MODEL or "default")
@@ -581,10 +602,25 @@ def _executor_verify_loop(
     # ── Executor ──
     draft_file = task_dir / f"draft_{attempt}.json"
     exec_trace = task_dir / f"executor_{attempt}.events.jsonl"
+    exec_extra_env: dict[str, str] = {"DRAFT_FILE": str(draft_file)}
+    # Pass classifier's vault reads cache to executor to avoid redundant RPCs
+    vault_reads_file = task_dir / "vault_reads.json"
+    if vault_reads_file.exists():
+        exec_extra_env["VAULT_READS_FILE"] = str(vault_reads_file)
+    # Pass vault_today from classifier if available
+    vault_today_file = task_dir / "classification.json"
+    if vault_today_file.exists():
+        try:
+            cls_data = json.loads(vault_today_file.read_text(encoding="utf-8"))
+            vt = cls_data.get("vault_today", "")
+            if vt:
+                exec_extra_env["VAULT_TODAY"] = vt
+        except (json.JSONDecodeError, OSError):
+            pass
     executor_cfg = _build_mcp_config(
         harness_url, exec_trace, task_id, instruction,
         mode="draft",
-        extra_env={"DRAFT_FILE": str(draft_file)},
+        extra_env=exec_extra_env,
     )
     exec_lines, _ = _spawn_iclaude(
         mcp_cfg=executor_cfg,
@@ -602,10 +638,13 @@ def _executor_verify_loop(
             print(f"  {CLI_YELLOW}[executor] actual_model={exec_actual}{CLI_CLR}")
 
     draft = _read_json(draft_file)
+    exec_elapsed = time.monotonic() - attempt_start
+    executor_timed_out = not draft and exec_elapsed >= exec_t * 0.9
     if not draft:
         draft = {"schema_version": 1, "outcome": "clarification", "message": "Executor did not produce a result", "refs": []}
         _append_jsonl(task_dir / "pipeline.events.jsonl", {
-            "type": "executor_no_draft", "attempt": attempt,
+            "type": "executor_timeout" if executor_timed_out else "executor_no_draft",
+            "attempt": attempt, "exec_elapsed_s": round(exec_elapsed, 1),
         })
 
     # ── Time check: skip verifier if budget is too tight ──
@@ -641,8 +680,12 @@ def _executor_verify_loop(
 
     # ── Verifier ──
     ver_trace = task_dir / f"verifier_{attempt}.events.jsonl"
+    ver_extra_env: dict[str, str] = {}
+    if exec_extra_env.get("VAULT_TODAY"):
+        ver_extra_env["VAULT_TODAY"] = exec_extra_env["VAULT_TODAY"]
     verifier_cfg = _build_mcp_config(
         harness_url, ver_trace, task_id, instruction, mode="readonly",
+        extra_env=ver_extra_env or None,
     )
     verifier_input = json.dumps({
         "instruction": instruction,
@@ -715,7 +758,17 @@ def _executor_verify_loop(
             and attempt <= MAX_RETRIES):
         elapsed = time.monotonic() - attempt_start
         new_remaining = time_remaining - elapsed
-        if new_remaining > 30:  # enough time for another attempt
+        # Skip futile retry: if executor timed out, retrying with similar or less
+        # time budget will produce the same timeout. Require 1.5x the executor
+        # budget to give the retry a realistic chance.
+        if executor_timed_out and new_remaining < exec_t * 1.5:
+            with _STDOUT_LOCK:
+                print(f"  {CLI_YELLOW}[retry] skipping — executor timed out and {new_remaining:.0f}s < {exec_t * 1.5:.0f}s needed{CLI_CLR}")
+            _append_jsonl(task_dir / "pipeline.events.jsonl", {
+                "type": "retry_skipped_timeout", "attempt": attempt,
+                "remaining_s": round(new_remaining, 1),
+            })
+        elif new_remaining > 30:  # enough time for another attempt
             with _STDOUT_LOCK:
                 print(f"  {CLI_YELLOW}[retry] attempt {attempt + 1}, reason: {verdict.get('reason', '?')[:80]}{CLI_CLR}")
             feedback_prompt = (

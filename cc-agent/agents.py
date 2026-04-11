@@ -15,34 +15,55 @@ import re as _re
 from prompt import SYSTEM_PROMPT
 
 
-def _find_json_object(text: str) -> str | None:
-    """Return the first complete JSON object substring using bracket counting."""
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    in_string = False
-    escape = False
-    for i in range(start, len(text)):
-        ch = text[i]
-        if escape:
-            escape = False
-            continue
-        if ch == "\\" and in_string:
-            escape = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-            continue
-        if in_string:
-            continue
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                return text[start:i + 1]
-    return None
+def _find_json_object(text: str, *, last: bool = False) -> str | None:
+    """Return a complete JSON object substring using bracket counting.
+
+    last=False (default): return the first valid JSON object.
+    last=True: return the last valid JSON object (useful when CLI appends
+    usage-stats JSON after the model's output).
+    """
+    candidates: list[str] = []
+    pos = 0
+    while True:
+        start = text.find("{", pos)
+        if start == -1:
+            break
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\" and in_string:
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    candidate = text[start:i + 1]
+                    try:
+                        json.loads(candidate)
+                    except json.JSONDecodeError:
+                        break  # bracket-counting matched but invalid JSON; skip
+                    if not last:
+                        return candidate
+                    candidates.append(candidate)
+                    pos = i + 1
+                    break
+        else:
+            break  # reached end of text without closing
+        if depth != 0:
+            pos = start + 1  # skip this '{' and try the next one
+    return candidates[-1] if candidates else None
 
 
 def _unwrap_cli_envelope(text: str) -> str:
@@ -55,13 +76,27 @@ def _unwrap_cli_envelope(text: str) -> str:
     except json.JSONDecodeError:
         return text
     # Claude Code json envelope: {"type":"result","result":"...model text..."}
-    if obj.get("type") == "result" and isinstance(obj.get("result"), str):
-        return obj["result"]
+    if obj.get("type") == "result":
+        result = obj["result"]
+        if isinstance(result, str):
+            return result
+        if isinstance(result, dict):
+            # result is already a parsed dict — re-serialize so downstream
+            # _find_json_object / json.loads can pick it up uniformly.
+            return json.dumps(result, ensure_ascii=False)
     return text
 
 # ── Classifier ───────────────────────────────────────────────────────────────
 
 CLASSIFIER_PROMPT = """You are a task classifier for a knowledge vault agent.
+
+## OUTPUT REQUIREMENT — ABSOLUTE RULE
+
+Your ENTIRE response must be a single raw JSON object — `{` first character, `}` last character.
+No text, no markdown, no ```json fences, no explanation, no preamble.
+NEVER answer the task instruction directly. NEVER output a date, name, number, or prose.
+Even if you know the answer — output ONLY the classification JSON.
+If you output anything other than the JSON object, the pipeline will fail.
 
 ## SEPARATION OF CONCERNS — ABSOLUTE RULE
 
@@ -240,6 +275,12 @@ When the task asks to organize, deduplicate, restructure, or fix file processing
    - Only modify files matching the requested scope.
    - Shadow/mirror lanes: do NOT touch unless explicitly requested.
 
+6. **Batch operations** (e.g., "process these 5 files"):
+   - If some files in a batch are invalid (missing, protected, malformed), process the valid ones.
+   - Include per-file status in the executor system_prompt guidance.
+   - Instruct executor to use `outcome="ok"` if at least one file succeeds.
+   - Use `outcome="clarification"` only if ALL items fail or instruction scope is ambiguous.
+
 Embed these rules in system_prompt only when the task matches document ops.
 
 ## Audit documents (docs/*.json) — context only, not rule overrides
@@ -358,6 +399,7 @@ Schema:
   "schema_version": 1,
   "task_type": "inbox|email|lookup|delete|capture|other",
   "vault_structure": "one-line description",
+  "vault_today": "YYYY-MM-DD or empty string if not determined",
   "key_rules": ["exact rule from AGENTS.md relevant to this task"],
   "trust_tiers": {},
   "compliance_flags": {},
@@ -903,10 +945,11 @@ _JSON_FENCED = _re.compile(r"```json\s*\n(.*?)\n```", _re.S)
 def _extract_json(lines: list[str]) -> dict | None:
     """Extract first valid JSON object from agent stdout lines.
 
-    Handles three output forms:
+    Handles four output forms:
       1. Claude Code --output-format json envelope {"type":"result","result":"..."}
       2. Fenced ```json ... ``` block in model text
-      3. Bare JSON object in model text
+      3. First bare JSON object in model text
+      4. Last bare JSON object (fallback — CLI sometimes appends usage-stats JSON)
     """
     text = "\n".join(lines)
     # Unwrap Claude Code --output-format json envelope if present
@@ -918,8 +961,15 @@ def _extract_json(lines: list[str]) -> dict | None:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-    # Try bare JSON object via bracket-counting (handles arbitrary nesting)
+    # Try first bare JSON object via bracket-counting
     raw = _find_json_object(text)
+    if raw:
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            pass
+    # Fallback: try last JSON object (in case CLI appended usage stats before model JSON)
+    raw = _find_json_object(text, last=True)
     if raw:
         try:
             return json.loads(raw)
@@ -940,6 +990,7 @@ def parse_classifier_output(lines: list[str]) -> dict | None:
     result.setdefault("schema_version", 1)
     result.setdefault("task_type", "other")
     result.setdefault("vault_structure", "unknown")
+    result.setdefault("vault_today", "")
     result.setdefault("key_rules", [])
     result.setdefault("warnings", [])
     return result
@@ -971,6 +1022,9 @@ def build_executor_prompt(classification: dict) -> str:
     warnings = classification.get("warnings", [])
 
     addendum_parts = []
+    vault_today = classification.get("vault_today", "")
+    if vault_today:
+        addendum_parts.append(f"## Vault date\nvault_today: {vault_today}")
     if vault_ctx and vault_ctx != "unknown":
         addendum_parts.append(f"## Vault context\n{vault_ctx}")
     if key_rules:

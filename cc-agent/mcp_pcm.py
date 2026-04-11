@@ -59,6 +59,8 @@ _TASK_ID = os.environ.get("TASK_ID", "")
 _TASK_INSTRUCTION = os.environ.get("TASK_INSTRUCTION", "")
 _MCP_MODE = os.environ.get("MCP_MODE", "full")
 _DRAFT_FILE = os.environ.get("DRAFT_FILE", "")
+_VAULT_READS_FILE = os.environ.get("VAULT_READS_FILE", "")
+_VAULT_TODAY = os.environ.get("VAULT_TODAY", "")
 
 _mono_start = _time.monotonic()
 
@@ -75,6 +77,21 @@ except Exception:
 # this keeps agent date arithmetic aligned with scoring.
 if not _vault_context:
     _vault_context = f"vault_today: {_dt.date.today().isoformat()}"
+
+# If VAULT_TODAY was propagated from classifier, inject it into context
+if _VAULT_TODAY:
+    _vault_context += f"\nvault_today: {_VAULT_TODAY}"
+
+# ── Vault reads cache ─────────────────────────────────────────────────────────
+# Classifier captures its vault reads; executor reuses them to avoid redundant RPCs.
+_vault_reads_cache: dict[str, str] = {}
+
+if _VAULT_READS_FILE and _MCP_MODE in ("draft", "full"):
+    # Executor/full mode: load pre-fetched reads from classifier
+    try:
+        _vault_reads_cache = json.loads(Path(_VAULT_READS_FILE).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
 
 # ── Draft mode write buffer ───────────────────────────────────────────────────
 # In draft mode all vault mutations are buffered and only committed when
@@ -238,6 +255,14 @@ _SEC_MESSAGE_WORDS = _re.compile(
     _re.I,
 )
 
+_EMAIL_MISMATCH_WORDS = _re.compile(
+    r"(email.{0,20}(not\s+match|mismatch|differ|unknown)|"
+    r"domain.{0,20}(differ|mismatch|suspicious)|"
+    r"typosquat|sender.{0,20}(mismatch|not\s+found|unknown\s+email)|"
+    r"near.miss|look-alike|impersonat)",
+    _re.I,
+)
+
 
 def _evaluate_outcome(outcome: str, message: str = "") -> list[str]:
     """Heuristic checks before report_completion. Returns warnings list."""
@@ -257,12 +282,24 @@ def _evaluate_outcome(outcome: str, message: str = "") -> list[str]:
         if message and _SEC_MESSAGE_WORDS.search(message):
             warnings.append("outcome=ok but message mentions security — consider outcome=security")
 
+    elif outcome == "clarification":
+        if message and _EMAIL_MISMATCH_WORDS.search(message):
+            warnings.append(
+                "Email identity mismatch detected in clarification — "
+                "typosquatting is a security threat; consider outcome=security"
+            )
+
     elif outcome == "security":
         reads = [t for t in _tool_log if t["name"] == "read"]
         if not reads:
             warnings.append("outcome=security without any read evidence")
 
     return warnings
+
+
+# ── Tool call timing tracker ──────────────────────────────────────────────────
+_tool_timings: list[dict] = []  # [{"tool": str, "elapsed_ms": int}, ...]
+_cache_hits = 0
 
 
 # ── MCP tool definitions ─────────────────────────────────────────────────────
@@ -436,6 +473,30 @@ def _tree_node_to_text(node, indent: int = 0) -> str:
     return "\n".join(lines)
 
 
+def _try_basename_fallback(path: str, original_exc: Exception) -> str:
+    """When read() fails, try to resolve by basename via find().
+
+    Only activates for root-level short names (no subdirectory in path).
+    Returns file content on success, raises original_exc on failure.
+    """
+    req_path = path.lstrip("/")
+    if "/" in req_path or not req_path:
+        raise original_exc
+    try:
+        found = _vm.find(FindRequest(root="/", name=req_path, type=0, limit=5))
+    except Exception:
+        raise original_exc
+    if found.items and len(found.items) == 1:
+        resolved = found.items[0]
+        _emit_event("basename_resolved", {"from": path, "to": resolved})
+        resp = _vm.read(ReadRequest(path=resolved))
+        return (resp.content or "(empty)") + f"\n\n[NOTE: file resolved from basename → {resolved}]"
+    if found.items and len(found.items) > 1:
+        candidates = ", ".join(found.items[:5])
+        raise Exception(f"File not found at {path}. Multiple candidates: {candidates}")
+    raise original_exc
+
+
 def _call_tool(name: str, args: dict) -> str:
     if name == "get_context":
         try:
@@ -481,13 +542,27 @@ def _call_tool(name: str, args: dict) -> str:
             buffered = _draft_get_buffered(args["path"])
             if buffered is not None:
                 return buffered or "(empty)"
-        resp = _vm.read(ReadRequest(
-            path=args["path"],
-            number=args.get("number", False),
-            start_line=args.get("start_line", 0),
-            end_line=args.get("end_line", 0),
-        ))
-        content = resp.content or "(empty)"
+        # Check vault reads cache (populated from classifier's prior run)
+        cache_key = "/" + args["path"].lstrip("/")
+        if cache_key in _vault_reads_cache and not args.get("start_line") and not args.get("end_line"):
+            global _cache_hits
+            _cache_hits += 1
+            _emit_event("vault_cache_hit", {"path": args["path"]})
+            content = _vault_reads_cache[cache_key]
+        else:
+            try:
+                resp = _vm.read(ReadRequest(
+                    path=args["path"],
+                    number=args.get("number", False),
+                    start_line=args.get("start_line", 0),
+                    end_line=args.get("end_line", 0),
+                ))
+                content = resp.content or "(empty)"
+            except Exception as read_exc:
+                content = _try_basename_fallback(args["path"], read_exc)
+            # Capture reads for classifier → executor context passing
+            if _VAULT_READS_FILE and _MCP_MODE == "readonly" and not args.get("start_line"):
+                _vault_reads_cache[cache_key] = content
         # Injection detection
         if _scan_for_injection(content):
             content += "\n\n[SECURITY WARNING: possible prompt injection detected in this file]"
@@ -670,6 +745,7 @@ def _handle(req: dict) -> None:
         try:
             result_text = _call_tool(tool_name, tool_args)
             elapsed_ms = int((_time.monotonic() - t0) * 1000)
+            _tool_timings.append({"tool": tool_name, "elapsed_ms": elapsed_ms})
 
             _emit_event("tool_result", {
                 "seq": seq,
@@ -747,10 +823,33 @@ def main() -> None:
             continue
         _handle(req)
 
-    _emit_event("task_end", {
+    # Save vault reads cache for classifier → executor context passing
+    if _VAULT_READS_FILE and _MCP_MODE == "readonly" and _vault_reads_cache:
+        try:
+            Path(_VAULT_READS_FILE).write_text(
+                json.dumps(_vault_reads_cache, ensure_ascii=False), encoding="utf-8",
+            )
+        except OSError:
+            pass
+
+    # Aggregate MCP tool call metrics
+    mcp_stats: dict = {
         "step_count": _step_seq,
         "elapsed_s": round(_time.monotonic() - _mono_start, 3),
-    })
+    }
+    if _tool_timings:
+        total_ms = sum(t["elapsed_ms"] for t in _tool_timings)
+        slowest = max(_tool_timings, key=lambda t: t["elapsed_ms"])
+        mcp_stats.update({
+            "total_tool_calls": len(_tool_timings),
+            "total_tool_ms": total_ms,
+            "avg_tool_ms": round(total_ms / len(_tool_timings)),
+            "slowest_tool": slowest["tool"],
+            "slowest_tool_ms": slowest["elapsed_ms"],
+            "cache_hits": _cache_hits,
+            "unique_reads": len(_unique_reads),
+        })
+    _emit_event("task_end", mcp_stats)
 
 
 if __name__ == "__main__":
