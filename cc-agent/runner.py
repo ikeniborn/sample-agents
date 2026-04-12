@@ -496,7 +496,7 @@ def _run_pipeline(
             _append_jsonl(task_dir / "pipeline.events.jsonl", {
                 "type": "classifier_fast_path", "task_type": task_type,
             })
-            executor_prompt = get_prompt(instruction)
+            executor_prompt = get_prompt(instruction, task_type=task_type)
             time_remaining = TASK_TIMEOUT - (time.monotonic() - pipeline_start)
             return _executor_verify_loop(
                 harness_url, task_id, instruction, task_dir,
@@ -555,9 +555,11 @@ def _run_pipeline(
         )
         classification = parse_classifier_output(cls_lines)
 
+    vault_today = ""
     if classification:
         _write_json(task_dir / "classification.json", classification)
         executor_prompt = build_executor_prompt(classification)
+        vault_today = classification.get("vault_today", "") or ""
         with _STDOUT_LOCK:
             print(f"  {CLI_GREEN}[classifier] type={classification.get('task_type', '?')}{CLI_CLR}")
     else:
@@ -577,6 +579,7 @@ def _run_pipeline(
     _executor_verify_loop(
         harness_url, task_id, instruction, task_dir,
         executor_prompt, attempt=1, time_remaining=time_remaining,
+        vault_reads_file=vault_reads_file, vault_today=vault_today,
     )
 
 
@@ -588,6 +591,8 @@ def _executor_verify_loop(
     executor_prompt: str,
     attempt: int,
     time_remaining: float,
+    vault_reads_file: Path | None = None,
+    vault_today: str = "",
 ) -> None:
     """Run executor + verifier with retry on reject."""
     exec_t, ver_t = _time_budget(time_remaining, attempt, MAX_RETRIES + 1)
@@ -603,20 +608,10 @@ def _executor_verify_loop(
     draft_file = task_dir / f"draft_{attempt}.json"
     exec_trace = task_dir / f"executor_{attempt}.events.jsonl"
     exec_extra_env: dict[str, str] = {"DRAFT_FILE": str(draft_file)}
-    # Pass classifier's vault reads cache to executor to avoid redundant RPCs
-    vault_reads_file = task_dir / "vault_reads.json"
-    if vault_reads_file.exists():
+    if vault_reads_file is not None:
         exec_extra_env["VAULT_READS_FILE"] = str(vault_reads_file)
-    # Pass vault_today from classifier if available
-    vault_today_file = task_dir / "classification.json"
-    if vault_today_file.exists():
-        try:
-            cls_data = json.loads(vault_today_file.read_text(encoding="utf-8"))
-            vt = cls_data.get("vault_today", "")
-            if vt:
-                exec_extra_env["VAULT_TODAY"] = vt
-        except (json.JSONDecodeError, OSError):
-            pass
+    if vault_today:
+        exec_extra_env["VAULT_TODAY"] = vault_today
     executor_cfg = _build_mcp_config(
         harness_url, exec_trace, task_id, instruction,
         mode="draft",
@@ -680,12 +675,10 @@ def _executor_verify_loop(
 
     # ── Verifier ──
     ver_trace = task_dir / f"verifier_{attempt}.events.jsonl"
-    ver_extra_env: dict[str, str] = {}
-    if exec_extra_env.get("VAULT_TODAY"):
-        ver_extra_env["VAULT_TODAY"] = exec_extra_env["VAULT_TODAY"]
+    ver_extra_env = {"VAULT_TODAY": vault_today} if vault_today else None
     verifier_cfg = _build_mcp_config(
         harness_url, ver_trace, task_id, instruction, mode="readonly",
-        extra_env=ver_extra_env or None,
+        extra_env=ver_extra_env,
     )
     verifier_input = json.dumps({
         "instruction": instruction,
@@ -780,6 +773,7 @@ def _executor_verify_loop(
             return _executor_verify_loop(
                 harness_url, task_id, instruction, task_dir,
                 feedback_prompt, attempt + 1, new_remaining,
+                vault_reads_file=vault_reads_file, vault_today=vault_today,
             )
 
     # ── Submit final answer ──

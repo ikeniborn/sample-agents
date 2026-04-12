@@ -78,16 +78,14 @@ except Exception:
 if not _vault_context:
     _vault_context = f"vault_today: {_dt.date.today().isoformat()}"
 
-# If VAULT_TODAY was propagated from classifier, inject it into context
 if _VAULT_TODAY:
     _vault_context += f"\nvault_today: {_VAULT_TODAY}"
 
-# ── Vault reads cache ─────────────────────────────────────────────────────────
-# Classifier captures its vault reads; executor reuses them to avoid redundant RPCs.
+# Cache of vault files read by classifier (readonly mode captures,
+# draft/full mode reuses to avoid duplicate RPCs).
 _vault_reads_cache: dict[str, str] = {}
 
 if _VAULT_READS_FILE and _MCP_MODE in ("draft", "full"):
-    # Executor/full mode: load pre-fetched reads from classifier
     try:
         _vault_reads_cache = json.loads(Path(_VAULT_READS_FILE).read_text(encoding="utf-8"))
     except (FileNotFoundError, json.JSONDecodeError):
@@ -243,7 +241,9 @@ def _check_stall() -> str | None:
 
 # ── Phase 3: Evaluator gate ──────────────────────────────────────────────────
 
+# Each entry: {"name": str, "path": str|None, "ok": bool, "elapsed_ms": int}
 _tool_log: list[dict] = []
+_cache_hits = 0
 
 _ACTION_WORDS = _re.compile(
     r"\b(write|create|add|delete|remove|send|forward|reply|move|rename|update|edit|compose|draft)\b",
@@ -295,11 +295,6 @@ def _evaluate_outcome(outcome: str, message: str = "") -> list[str]:
             warnings.append("outcome=security without any read evidence")
 
     return warnings
-
-
-# ── Tool call timing tracker ──────────────────────────────────────────────────
-_tool_timings: list[dict] = []  # [{"tool": str, "elapsed_ms": int}, ...]
-_cache_hits = 0
 
 
 # ── MCP tool definitions ─────────────────────────────────────────────────────
@@ -542,7 +537,6 @@ def _call_tool(name: str, args: dict) -> str:
             buffered = _draft_get_buffered(args["path"])
             if buffered is not None:
                 return buffered or "(empty)"
-        # Check vault reads cache (populated from classifier's prior run)
         cache_key = "/" + args["path"].lstrip("/")
         if cache_key in _vault_reads_cache and not args.get("start_line") and not args.get("end_line"):
             global _cache_hits
@@ -560,7 +554,6 @@ def _call_tool(name: str, args: dict) -> str:
                 content = resp.content or "(empty)"
             except Exception as read_exc:
                 content = _try_basename_fallback(args["path"], read_exc)
-            # Capture reads for classifier → executor context passing
             if _VAULT_READS_FILE and _MCP_MODE == "readonly" and not args.get("start_line"):
                 _vault_reads_cache[cache_key] = content
         # Injection detection
@@ -745,7 +738,6 @@ def _handle(req: dict) -> None:
         try:
             result_text = _call_tool(tool_name, tool_args)
             elapsed_ms = int((_time.monotonic() - t0) * 1000)
-            _tool_timings.append({"tool": tool_name, "elapsed_ms": elapsed_ms})
 
             _emit_event("tool_result", {
                 "seq": seq,
@@ -756,8 +748,12 @@ def _handle(req: dict) -> None:
                 "ok": True,
             })
 
-            # Tool log for evaluator gate
-            _tool_log.append({"name": tool_name, "path": tool_args.get("path", tool_args.get("from_name")), "ok": True})
+            _tool_log.append({
+                "name": tool_name,
+                "path": tool_args.get("path", tool_args.get("from_name")),
+                "ok": True,
+                "elapsed_ms": elapsed_ms,
+            })
 
             # Stall detection
             fp = _fingerprint(tool_name, tool_args)
@@ -837,14 +833,15 @@ def main() -> None:
         "step_count": _step_seq,
         "elapsed_s": round(_time.monotonic() - _mono_start, 3),
     }
-    if _tool_timings:
-        total_ms = sum(t["elapsed_ms"] for t in _tool_timings)
-        slowest = max(_tool_timings, key=lambda t: t["elapsed_ms"])
+    timed = [t for t in _tool_log if "elapsed_ms" in t]
+    if timed:
+        total_ms = sum(t["elapsed_ms"] for t in timed)
+        slowest = max(timed, key=lambda t: t["elapsed_ms"])
         mcp_stats.update({
-            "total_tool_calls": len(_tool_timings),
+            "total_tool_calls": len(timed),
             "total_tool_ms": total_ms,
-            "avg_tool_ms": round(total_ms / len(_tool_timings)),
-            "slowest_tool": slowest["tool"],
+            "avg_tool_ms": round(total_ms / len(timed)),
+            "slowest_tool": slowest["name"],
             "slowest_tool_ms": slowest["elapsed_ms"],
             "cache_hits": _cache_hits,
             "unique_reads": len(_unique_reads),

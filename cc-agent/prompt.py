@@ -186,8 +186,13 @@ def classify_task(instruction: str) -> str:
     return "default"
 
 
-def get_prompt(instruction: str) -> str:
-    """Return system prompt with task-specific addendum."""
-    task_type = classify_task(instruction)
+def get_prompt(instruction: str, task_type: str | None = None) -> str:
+    """Return system prompt with task-specific addendum.
+
+    Accepts an optional pre-computed task_type to avoid double classification
+    when the caller has already classified the instruction.
+    """
+    if task_type is None:
+        task_type = classify_task(instruction)
     addendum = _ADDENDA.get(task_type, "")
     return SYSTEM_PROMPT + addendum

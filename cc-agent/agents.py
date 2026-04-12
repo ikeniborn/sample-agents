@@ -15,22 +15,17 @@ import re as _re
 from prompt import SYSTEM_PROMPT
 
 
-def _find_json_object(text: str, *, last: bool = False) -> str | None:
-    """Return a complete JSON object substring using bracket counting.
-
-    last=False (default): return the first valid JSON object.
-    last=True: return the last valid JSON object (useful when CLI appends
-    usage-stats JSON after the model's output).
-    """
-    candidates: list[str] = []
+def _iter_json_objects(text: str):
+    """Yield every complete, parseable top-level JSON object in text."""
     pos = 0
     while True:
         start = text.find("{", pos)
         if start == -1:
-            break
+            return
         depth = 0
         in_string = False
         escape = False
+        closed_at = -1
         for i in range(start, len(text)):
             ch = text[i]
             if escape:
@@ -49,41 +44,31 @@ def _find_json_object(text: str, *, last: bool = False) -> str | None:
             elif ch == "}":
                 depth -= 1
                 if depth == 0:
-                    candidate = text[start:i + 1]
-                    try:
-                        json.loads(candidate)
-                    except json.JSONDecodeError:
-                        break  # bracket-counting matched but invalid JSON; skip
-                    if not last:
-                        return candidate
-                    candidates.append(candidate)
-                    pos = i + 1
+                    closed_at = i
                     break
-        else:
-            break  # reached end of text without closing
-        if depth != 0:
-            pos = start + 1  # skip this '{' and try the next one
-    return candidates[-1] if candidates else None
+        if closed_at == -1:
+            return
+        candidate = text[start:closed_at + 1]
+        try:
+            obj = json.loads(candidate)
+        except json.JSONDecodeError:
+            pos = start + 1
+            continue
+        yield obj, candidate
+        pos = closed_at + 1
 
 
 def _unwrap_cli_envelope(text: str) -> str:
     """If text is a Claude Code --output-format json envelope, extract the model result."""
-    raw = _find_json_object(text)
-    if not raw:
-        return text
-    try:
-        obj = json.loads(raw)
-    except json.JSONDecodeError:
-        return text
-    # Claude Code json envelope: {"type":"result","result":"...model text..."}
-    if obj.get("type") == "result":
-        result = obj["result"]
+    for obj, _raw in _iter_json_objects(text):
+        if not isinstance(obj, dict) or obj.get("type") != "result":
+            return text
+        result = obj.get("result")
         if isinstance(result, str):
             return result
         if isinstance(result, dict):
-            # result is already a parsed dict — re-serialize so downstream
-            # _find_json_object / json.loads can pick it up uniformly.
             return json.dumps(result, ensure_ascii=False)
+        return text
     return text
 
 # ── Classifier ───────────────────────────────────────────────────────────────
@@ -943,39 +928,27 @@ _JSON_FENCED = _re.compile(r"```json\s*\n(.*?)\n```", _re.S)
 
 
 def _extract_json(lines: list[str]) -> dict | None:
-    """Extract first valid JSON object from agent stdout lines.
+    """Extract agent JSON output from stdout lines.
 
-    Handles four output forms:
-      1. Claude Code --output-format json envelope {"type":"result","result":"..."}
-      2. Fenced ```json ... ``` block in model text
-      3. First bare JSON object in model text
-      4. Last bare JSON object (fallback — CLI sometimes appends usage-stats JSON)
+    Tries: (1) Claude Code --output-format json envelope, (2) fenced ```json block,
+    (3) first bare JSON object, (4) last bare JSON object (fallback for CLI that
+    appends usage-stats after the model's JSON).
     """
-    text = "\n".join(lines)
-    # Unwrap Claude Code --output-format json envelope if present
-    text = _unwrap_cli_envelope(text)
-    # Try fenced ```json ... ``` first
+    text = _unwrap_cli_envelope("\n".join(lines))
     m = _JSON_FENCED.search(text)
     if m:
         try:
             return json.loads(m.group(1))
         except json.JSONDecodeError:
             pass
-    # Try first bare JSON object via bracket-counting
-    raw = _find_json_object(text)
-    if raw:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
-    # Fallback: try last JSON object (in case CLI appended usage stats before model JSON)
-    raw = _find_json_object(text, last=True)
-    if raw:
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            pass
-    return None
+    first_obj: dict | None = None
+    last_obj: dict | None = None
+    for obj, _raw in _iter_json_objects(text):
+        if isinstance(obj, dict):
+            if first_obj is None:
+                first_obj = obj
+            last_obj = obj
+    return first_obj if first_obj is not None else last_obj
 
 
 # ── Parsers ──────────────────────────────────────────────────────────────────
