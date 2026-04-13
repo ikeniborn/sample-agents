@@ -77,7 +77,19 @@ _BUILDER_SYSTEM = (
     "## Exact Match\n"
     "For tasks with 'exactly N days' or specific date lookups:\n"
     "- If no file matches the exact target date → `OUTCOME_NONE_CLARIFICATION`\n"
-    "- Do NOT report `OUTCOME_OK` with 'nearest matches' or 'no exact match found'"
+    "- Do NOT report `OUTCOME_OK` with 'nearest matches' or 'no exact match found'\n"
+    "\n"
+    "## Relationship Queries\n"
+    "For 'who manages X', 'contacts of X', 'accounts by manager':\n"
+    "- First bullet: traverse contact→account→manager chain\n"
+    "- Use code_eval for reverse lookups (all contacts of account)\n"
+    "- Manager names = mgr_XXX in contacts/ — always search contacts/ first\n"
+    "\n"
+    "## Finance Aggregation\n"
+    "For 'total', 'sum', 'revenue', 'overdue', 'how much':\n"
+    "- Always suggest code_eval with ALL files from list()\n"
+    "- Never suggest one-by-one reads for aggregation tasks\n"
+    "- Filter by status/date inside code_eval, not manually"
 )
 
 

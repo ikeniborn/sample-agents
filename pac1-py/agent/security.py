@@ -65,6 +65,8 @@ _INBOX_INJECTION_PATTERNS = [
     re.compile(r"(override|escalat|jailbreak|bypass|system\s*override|forget\s*(your|the)\s*rules)", re.IGNORECASE),
     re.compile(r"(you\s+are\s+now|as\s+admin|special\s+authority)", re.IGNORECASE),
     re.compile(r"if\s+(char|otp|the\s+first)", re.IGNORECASE),
+    # FIX-281: credential harvesting / exfiltration attempts
+    re.compile(r"(collect|gather|send|transfer|exfiltrat)\s+.{0,40}(credential|password|secret|access.{0,10}(note|key|token))", re.IGNORECASE),
 ]
 _INBOX_ACTION_RE = re.compile(r"\b(please\s+do|follow\s+this|run|execute)\b", re.IGNORECASE)
 

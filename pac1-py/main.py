@@ -115,7 +115,8 @@ from agent.classifier import ModelRouter
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/pac1-dev"
 BITGN_API_KEY = os.getenv("BITGN_API_KEY") or ""
-BITGN_RUN_NAME = os.getenv("BITGN_RUN_NAME") or ""
+_base_run_name = os.getenv("BITGN_RUN_NAME") or ""
+BITGN_RUN_NAME = f"{_base_run_name}-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}" if _base_run_name else ""
 PARALLEL_TASKS = max(1, int(os.getenv("PARALLEL_TASKS", "1")))
 
 _MODELS_JSON = Path(__file__).parent / "models.json"

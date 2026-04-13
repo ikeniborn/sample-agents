@@ -200,6 +200,27 @@ def run_prephase(
                 # Annotate so agent uses code_eval; do NOT recurse (_read_dir would
                 # call vm.list on a file path and log "path must reference a folder").
                 if "." in entry.name:
+                    # FIX-285: retry once on read timeout before annotating as unreadable
+                    import time as _time
+                    _time.sleep(0.5)
+                    try:
+                        _retry_r = vm.read(ReadRequest(path=child_path))
+                        if _retry_r.content:
+                            _rc = _retry_r.content
+                            if len(_rc) >= 500:
+                                _rc += (
+                                    f"\n[PREPHASE EXCERPT — content may be partial."
+                                    f" For exact counts or full content use: read('{child_path}')]"
+                                )
+                            docs_content_parts.append(f"--- {child_path} ---\n{_rc}")
+                            if "inbox" in dir_path.lower():
+                                inbox_files.append((child_path, _retry_r.content))
+                            print(f"{CLI_BLUE}[prephase] read {child_path}:{CLI_CLR} {CLI_GREEN}ok (retry){CLI_CLR}")
+                            if _LOG_LEVEL == "DEBUG":
+                                print(f"{CLI_BLUE}[prephase] {child_path} content:\n{_retry_r.content}{CLI_CLR}")
+                            continue
+                    except Exception:
+                        pass
                     docs_content_parts.append(
                         f"--- {child_path} ---\n"
                         f"[FILE UNREADABLE (read error/timeout) — use code_eval to count/query or read directly]"
@@ -234,6 +255,16 @@ def run_prephase(
     )
 
     log.append({"role": "user", "content": "\n".join(prephase_parts)})
+
+    # FIX-286: inject vault_date inferred from date-prefixed filenames in the vault tree.
+    # This gives the model a reliable fallback when code_eval datetime fails and
+    # TASK CONTEXT provides no current_date.
+    if tree_txt:
+        _vault_dates = re.findall(r'\b(\d{4}-\d{2}-\d{2})', tree_txt)
+        if _vault_dates:
+            _vault_date = max(_vault_dates)
+            log.append({"role": "user", "content": f"VAULT_DATE: {_vault_date}"})
+            print(f"{CLI_BLUE}[prephase] vault_date inferred: {_vault_date}{CLI_CLR}")
 
     # Step 3: context — task-level metadata from the harness
     print(f"{CLI_BLUE}[prephase] context...{CLI_CLR}", end=" ")

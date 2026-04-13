@@ -161,9 +161,12 @@ def _extract_fact(action_name: str, action, result_txt: str) -> "_StepFact | Non
         return _StepFact("mkdir", path, summary, error=_err_detail)
 
     # FIX-276: code_eval — track paths for auto-grounding
+    # FIX-278: preserve task + result in summary (was 80 chars — too short, lost after compaction)
     if action_name == "Req_CodeEval":
         paths = getattr(action, "paths", []) or []
-        summary = f"code_eval: {result_txt[:80]}"
+        task_desc = getattr(action, "task", "")[:80]
+        result_short = result_txt[:150]
+        summary = f"code_eval({task_desc}): {result_short}"
         return _StepFact("code_eval", ",".join(paths), summary)
 
     return None
@@ -172,7 +175,9 @@ def _extract_fact(action_name: str, action, result_txt: str) -> "_StepFact | Non
 def build_digest(facts: "list[_StepFact]") -> str:
     """Build compact state digest from accumulated step facts."""
     sections: dict[str, list[str]] = {
-        "LISTED": [], "READ": [], "FOUND": [], "DONE": [],
+        "LISTED": [], "READ": [], "FOUND": [],
+        "CODE_EVAL": [],  # FIX-278: code_eval results survive compaction
+        "DONE": [],
         "ERRORS": [],   # FIX-199: preserve error details through compaction
         "STALLS": [],   # FIX-200: preserve stall events through compaction
     }
@@ -183,6 +188,8 @@ def build_digest(facts: "list[_StepFact]") -> str:
             sections["READ"].append(f"  {f.path}: {f.summary}")
         elif f.kind == "search":
             sections["FOUND"].append(f"  {f.summary}")
+        elif f.kind == "code_eval":  # FIX-278: dedicated section
+            sections["CODE_EVAL"].append(f"  {f.summary}")
         elif f.kind in ("write", "delete", "move", "mkdir"):
             sections["DONE"].append(f"  {f.summary}")
         elif f.kind == "stall":  # FIX-200

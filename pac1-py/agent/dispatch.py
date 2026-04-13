@@ -55,9 +55,11 @@ _SAFE_BUILTINS = {
     )
     for k in (
         "len", "sorted", "reversed", "max", "min", "sum", "abs", "round",
+        "any", "all",  # FIX-278: required by coder-generated code (NameError on minimax)
         "filter", "map", "zip", "enumerate", "range",
         "list", "dict", "set", "tuple", "str", "int", "float", "bool",
         "isinstance", "hasattr", "print", "repr", "type",
+        "True", "False", "None",  # FIX-278: Python constants needed in sandbox globals
     )
     if (
         __builtins__[k]
@@ -65,6 +67,8 @@ _SAFE_BUILTINS = {
         else getattr(__builtins__, k, None)
     ) is not None
 }
+# FIX-278: True/False/None are not in __builtins__ dict — inject as Python constants
+_SAFE_BUILTINS.update({"True": True, "False": False, "None": None})
 
 
 def _execute_code_safe(code: str, context_vars: dict, timeout_s: int = 5) -> str:
@@ -82,8 +86,20 @@ def _execute_code_safe(code: str, context_vars: dict, timeout_s: int = 5) -> str
     import math as _math
     import sys as _sys
 
+    # FIX-278: strftime needs `time` module internally; provide restricted __import__
+    import time as _time
+    _ALLOWED_IMPORTS = {"datetime": _dt, "json": _json, "re": _re, "math": _math, "time": _time}
+
+    def _safe_import(name, *_args, **_kwargs):
+        if name in _ALLOWED_IMPORTS:
+            return _ALLOWED_IMPORTS[name]
+        raise ImportError(f"module '{name}' is not available in sandbox")
+
+    safe_builtins = dict(_SAFE_BUILTINS)
+    safe_builtins["__import__"] = _safe_import
+
     safe_globals: dict = {
-        "__builtins__": _SAFE_BUILTINS,
+        "__builtins__": safe_builtins,
         "datetime": _dt,
         "json": _json,
         "re": _re,
@@ -150,6 +166,9 @@ def _call_coder_model(task: str, context_vars: dict, coder_model: str, coder_cfg
         "— no markdown fences, no explanation.\n"
         "Sandbox rules:\n"
         "- Modules available: datetime, json, re, math — use directly, NO import statements\n"
+        "- Builtins available: len, sorted, reversed, max, min, sum, abs, round, any, all, "
+        "filter, map, zip, enumerate, range, list, dict, set, tuple, str, int, float, bool, "
+        "isinstance, hasattr, print, repr, type, True, False, None\n"
         "- context_vars are injected as GLOBAL VARIABLES — reference them by their exact name\n"
         "- FORBIDDEN: eval(), exec(), globals(), locals(), open(), __import__, any import statement\n"
         "- To process multiple variables, put their names in a list literal — do NOT use eval:\n"

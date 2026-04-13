@@ -73,6 +73,11 @@ _COUNT_QUERY_RE = re.compile(
     re.IGNORECASE,
 )
 
+_FINANCE_RE = re.compile(
+    r"\b(invoice|revenue|spend|overdue|payment|bill|amount|balance)\b",
+    re.IGNORECASE,
+)
+
 
 @dataclass
 class _Rule:
@@ -122,6 +127,13 @@ _RULE_MATRIX: list[_Rule] = [
         must_not=[_BULK_RE, _INBOX_RE, _EMAIL_RE, _WRITE_VERBS_RE],
         result=TASK_LOOKUP,
         label="count-query",
+    ),
+    # Rule 4c: finance-specific keywords with no write intent → lookup
+    _Rule(
+        must=[_FINANCE_RE],
+        must_not=[_BULK_RE, _INBOX_RE, _EMAIL_RE, _WRITE_VERBS_RE],
+        result=TASK_LOOKUP,
+        label="finance-query",
     ),
     # Rule 5: think-words AND write-verbs simultaneously → distill
     _Rule(
