@@ -20,7 +20,6 @@ Usage (stdio transport, as MCP subprocess):
     HARNESS_URL=https://... MCP_MODE=full python mcp_pcm.py
 """
 
-import datetime as _dt
 import hashlib as _hl
 import json
 import os
@@ -61,6 +60,7 @@ _MCP_MODE = os.environ.get("MCP_MODE", "full")
 _DRAFT_FILE = os.environ.get("DRAFT_FILE", "")
 _VAULT_READS_FILE = os.environ.get("VAULT_READS_FILE", "")
 _VAULT_TODAY = os.environ.get("VAULT_TODAY", "")
+_VAULT_NOW = os.environ.get("VAULT_NOW", "")
 
 _mono_start = _time.monotonic()
 
@@ -72,14 +72,16 @@ try:
 except Exception:
     _vault_context = ""
 
-# When harness returns no context (common for knowledge vaults), inject today's
-# date as vault_today fallback.  The evaluator uses the same runtime date, so
-# this keeps agent date arithmetic aligned with scoring.
-if not _vault_context:
-    _vault_context = f"vault_today: {_dt.date.today().isoformat()}"
-
+# Vault clock injection — runner.py probes the vault before launching this MCP
+# server and passes the resolved values via VAULT_TODAY / VAULT_NOW env vars.
+# We NEVER fall back to system clock here: the system clock is wrong for
+# benchmark trials whose vault dates are randomized per task.  When neither the
+# harness context() nor the runner resolver found a date, leave the field empty
+# and let the agent run its own runtime cascade.
 if _VAULT_TODAY:
-    _vault_context += f"\nvault_today: {_VAULT_TODAY}"
+    _vault_context += ("\n" if _vault_context else "") + f"vault_today: {_VAULT_TODAY}"
+if _VAULT_NOW:
+    _vault_context += ("\n" if _vault_context else "") + f"vault_now: {_VAULT_NOW}"
 
 # Cache of vault files read by classifier (readonly mode captures,
 # draft/full mode reuses to avoid duplicate RPCs).
@@ -156,6 +158,64 @@ def _emit_event(event_type: str, data: dict) -> None:
 
 def _truncate(s: str, limit: int) -> str:
     return s[:limit] if len(s) > limit else s
+
+
+# ── Vault path normalization for report_completion ────────────────────────────
+#
+# The vault protocol treats paths as vault-relative (e.g. `50_finance/...`),
+# but LLM executors frequently mint leading-slash variants (e.g. `/50_finance/...`)
+# because the search/read MCP tools accept both forms. The evaluator grading
+# the task answer does not — a grounding ref with an extra `/` scores as
+# incorrect. Normalize here rather than patching every prompt: one convention,
+# one place, no per-task hardcode.
+
+# Top-level vault directories / sentinel files. Anchored to start-of-string
+# (after the leading slash). Used to recognise whether a multi-line
+# `message` field is a list of vault paths vs. prose or numbers.
+_VAULT_PATH_PREFIX_RE = _re.compile(
+    r"^/(?:\d{2}_[a-z_]+|accounts|contacts|opportunities|reminders|inbox|outbox"
+    r"|my-invoices|docs|AGENTS\.md|CLAUDE\.md|README\.md)(?:/|$)",
+    _re.IGNORECASE,
+)
+
+
+def _normalize_vault_path(p):
+    """Strip a leading '/' from vault-relative paths.
+
+    Protocol requires vault-relative form. MCP tools accept both forms for
+    convenience; the evaluator does not. Non-string inputs pass through
+    unchanged so this is safe to apply blindly over mixed `refs` arrays.
+    """
+    if not isinstance(p, str):
+        return p
+    return p[1:] if p.startswith("/") else p
+
+
+def _normalize_path_message(msg: str) -> str:
+    """If `msg` looks like a list of vault paths, normalize each line.
+
+    Detection heuristic: every non-empty line must match a top-level vault
+    prefix (`_VAULT_PATH_PREFIX_RE`). A single-line date, count, name, or
+    free-form prose is left untouched — we only want to rewrite message
+    bodies that are semantically a path list (delete/move reports).
+
+    This is path-protocol normalization, not content rewriting: we only
+    ever strip a leading '/' from a line that is already a vault path.
+    """
+    if not msg:
+        return msg
+    # Fast path: single-line message with no leading slash is never a path list.
+    if "\n" not in msg and not msg.startswith("/"):
+        return msg
+    lines = msg.split("\n")
+    non_empty = [ln for ln in lines if ln.strip()]
+    if not non_empty:
+        return msg
+    if not all(_VAULT_PATH_PREFIX_RE.match(ln) for ln in non_empty):
+        return msg
+    return "\n".join(
+        (ln[1:] if ln.startswith("/") else ln) for ln in lines
+    )
 
 
 # ── Phase 1: Write/Delete/Injection guards ────────────────────────────────────
@@ -627,8 +687,18 @@ def _call_tool(name: str, args: dict) -> str:
     elif name == "report_completion":
         global _draft_had_writes, _draft_buffer, _draft_completed
         outcome_key = args.get("outcome", "ok")
-        msg = args.get("message", "")
-        refs = args.get("refs", [])
+        raw_msg = args.get("message", "")
+        raw_refs = args.get("refs", [])
+        # Normalize leading-slash vault paths — one convention at the
+        # protocol boundary, not per-task prompt patches. refs are always
+        # paths; message is only rewritten when it semantically IS a path list.
+        msg = _normalize_path_message(raw_msg) if isinstance(raw_msg, str) else raw_msg
+        refs = [_normalize_vault_path(r) for r in raw_refs] if isinstance(raw_refs, list) else raw_refs
+        if msg != raw_msg or refs != raw_refs:
+            _emit_event("path_normalized", {
+                "msg_changed": msg != raw_msg,
+                "refs_changed": refs != raw_refs,
+            })
 
         # Evaluator gate
         warnings = _evaluate_outcome(outcome_key, msg)

@@ -79,10 +79,13 @@ from bitgn.harness_pb2 import (
 from bitgn.vm.pcm_connect import PcmRuntimeClientSync
 from bitgn.vm.pcm_pb2 import (
     AnswerRequest,
+    ContextRequest,
     DeleteRequest,
+    ListRequest,
     MkDirRequest,
     MoveRequest,
     Outcome,
+    ReadRequest,
     WriteRequest,
 )
 from connectrpc.errors import ConnectError
@@ -95,7 +98,7 @@ from agents import (
     parse_classifier_output,
     parse_verifier_output,
 )
-from prompt import classify_task, get_prompt
+from prompt import classify_task, detect_batch_size, get_prompt
 
 # ── Configuration ────────────────────────────────────────────────────────────
 
@@ -124,6 +127,50 @@ FAST_PATH_TYPES = set(
     t.strip() for t in os.getenv("FAST_PATH_TYPES", "lookup,finance").split(",") if t.strip()
 )
 
+
+def _parse_kv_env(name: str, default: dict[str, float]) -> dict[str, float]:
+    """Parse `key:value,key:value` env var into a dict[str, float]."""
+    raw = os.getenv(name, "")
+    if not raw:
+        return dict(default)
+    out = dict(default)
+    for chunk in raw.split(","):
+        chunk = chunk.strip()
+        if not chunk or ":" not in chunk:
+            continue
+        k, _, v = chunk.partition(":")
+        try:
+            out[k.strip()] = float(v.strip())
+        except ValueError:
+            continue
+    return out
+
+
+# Per-task-type budget multipliers — applied on top of TASK_TIMEOUT to give
+# document/batch operations enough time to write all their files.
+TASK_TIMEOUT_MULTIPLIERS = _parse_kv_env(
+    "TASK_TIMEOUT_MULTIPLIERS", {"document": 1.5}
+)
+TASK_TIMEOUT_BATCH_THRESHOLD = int(os.getenv("TASK_TIMEOUT_BATCH_THRESHOLD", "3"))
+TASK_TIMEOUT_BATCH_BONUS = float(os.getenv("TASK_TIMEOUT_BATCH_BONUS", "0.15"))
+TASK_TIMEOUT_MAX_MULTIPLIER = float(os.getenv("TASK_TIMEOUT_MAX_MULTIPLIER", "2.5"))
+
+
+def _budget_for(instruction: str) -> tuple[int, float, str, int]:
+    """Compute the time budget for a task from its characteristics.
+
+    Returns (budget_seconds, multiplier, task_type, batch_size).
+    Logic, not hardcode: scales TASK_TIMEOUT by per-type multiplier and
+    bonus per extra item beyond the batch threshold.  Caps at MAX_MULTIPLIER.
+    """
+    task_type = classify_task(instruction)
+    base_mult = TASK_TIMEOUT_MULTIPLIERS.get(task_type, 1.0)
+    batch_size = detect_batch_size(instruction)
+    extra_items = max(0, batch_size - TASK_TIMEOUT_BATCH_THRESHOLD)
+    batch_mult = 1.0 + (extra_items * TASK_TIMEOUT_BATCH_BONUS)
+    multiplier = min(base_mult * batch_mult, TASK_TIMEOUT_MAX_MULTIPLIER)
+    return int(TASK_TIMEOUT * multiplier), multiplier, task_type, batch_size
+
 _MCP_SERVER = Path(__file__).parent / "mcp_pcm.py"
 _PAC1_DIR = Path(__file__).parent.parent / "pac1-py"
 
@@ -144,6 +191,41 @@ _OUTCOME_MAP = {
     "clarification": Outcome.OUTCOME_NONE_CLARIFICATION,
     "unsupported": Outcome.OUTCOME_NONE_UNSUPPORTED,
 }
+
+# Outbox-detection regex — diagnostic only, used to attach extra event-log
+# entries to tasks that write to /60_outbox/, /outbox/, or that involve
+# sending/forwarding/replying. No behaviour change.
+_OUTBOX_RE = _re.compile(
+    r"\b(outbox|send|forward|reply|email|compose|draft\s+(a|an)\s+(message|email))\b",
+    _re.I,
+)
+
+
+def _draft_outbox_summary(draft: dict | None) -> dict:
+    """Extract outbox-relevant fields from a draft for diagnostic logging."""
+    if not isinstance(draft, dict):
+        return {"present": False}
+    refs = draft.get("refs") or []
+    vault_ops = draft.get("vault_ops") or []
+    outbox_refs = [r for r in refs if isinstance(r, str) and "outbox" in r.lower()]
+    outbox_writes = [
+        {
+            "path": op.get("args", {}).get("path", ""),
+            "size": len((op.get("args", {}) or {}).get("content", "") or ""),
+        }
+        for op in vault_ops
+        if isinstance(op, dict)
+        and op.get("op") == "write"
+        and "outbox" in (op.get("args", {}) or {}).get("path", "").lower()
+    ]
+    return {
+        "outcome": draft.get("outcome", ""),
+        "message_len": len(draft.get("message", "") or ""),
+        "refs_total": len(refs),
+        "outbox_refs": outbox_refs,
+        "vault_ops_total": len(vault_ops),
+        "outbox_writes": outbox_writes,
+    }
 
 
 # ── Utilities ────────────────────────────────────────────────────────────────
@@ -266,6 +348,134 @@ def _verifier_budget(time_remaining: float, elapsed_in_attempt: float,
     return max(int(ver_t), 10)
 
 
+# ── Vault clock resolver (no LLM, direct MCP) ───────────────────────────────
+
+# Frontmatter timestamp regex — pulls any RFC3339-ish or YYYY-MM-DD value from
+# common timestamp keys without assuming a specific schema.
+_FM_TS_KEYS = (
+    "received_at", "sent_at", "timestamp", "date", "due_on",
+    "created_at", "captured_at", "current_date", "today",
+)
+_FM_TS_RE = _re.compile(
+    r"^\s*-?\s*(" + "|".join(_FM_TS_KEYS) + r")\s*:\s*[\"']?"
+    r"(\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?(?:Z|[+-]\d{2}:?\d{2})?)?)"
+    r"[\"']?\s*$",
+    _re.M | _re.I,
+)
+_FILENAME_DATE_RE = _re.compile(r"(\d{4})[-_](\d{2})[-_](\d{2})")
+
+# Probe locations covering knowledge-vault, CRM, and finance lanes.
+# Logic, not hardcode: probing is unconditional and happens for every task —
+# missing directories simply produce empty results.  No task IDs anywhere.
+_VAULT_PROBE_DIRS: tuple[tuple[str, int], ...] = (
+    ("/00_inbox/",          6),  # knowledge vault inbox (primary)
+    ("/20_work/reminders/", 3),  # CRM-style reminders inside work lane
+    ("/reminders/",         3),  # legacy CRM reminders
+    ("/50_finance/invoices/", 4),# finance lane
+    ("/inbox/",             4),  # legacy inbox
+)
+# Wall-clock cap for the entire probe.  Past this we return whatever we found
+# so the probe never starves the executor.  This is a safety belt against
+# slow harnesses or cold caches; the early-return on ctx_today is the primary
+# optimization.
+_VAULT_PROBE_BUDGET_S = float(os.getenv("VAULT_PROBE_BUDGET_S", "8"))
+
+
+def _resolve_vault_clock(harness_url: str) -> tuple[str, str, str]:
+    """Resolve (vault_today, vault_now, source) by direct MCP probes — no LLM call.
+
+    Returns a tuple where ``source`` is one of:
+      * ``"context"`` — harness ``get_context()`` published an authoritative
+        ``vault_today`` (and possibly ``vault_now``). Safe to inject as env var.
+      * ``"probe"``   — values were inferred from filesystem timestamps
+        (``max(received_at)``, ``max(invoice filename date)``…). This is a
+        BEST-EFFORT guess: it returns *a* date present in the vault but not
+        necessarily the *current* vault time. Callers MUST treat probe results
+        as DIAGNOSTIC ONLY — do not inject as authoritative env var, otherwise
+        the executor will build wrong arithmetic on top of a stale snapshot.
+      * ``""``        — nothing found.
+
+    Strategy:
+      1. get_context() — harness may publish vault_today/vault_now directly.
+      2. If absent: probe known directories, scan frontmatter / filename
+         dates, return max timestamp found.
+      3. NEVER fall back to system clock.
+
+    The function is bounded to ~30 small RPCs total and never raises.
+    """
+    try:
+        vm = PcmRuntimeClientSync(harness_url)
+    except Exception:
+        return "", "", ""
+
+    ctx_today = ""
+    ctx_now = ""
+    try:
+        ctx = vm.context(ContextRequest()).content or ""
+        m = _re.search(r"vault_today\s*[:=]\s*([0-9]{4}-[0-9]{2}-[0-9]{2})", ctx)
+        if m:
+            ctx_today = m.group(1)
+        m = _re.search(
+            r"vault_now\s*[:=]\s*([0-9]{4}-[0-9]{2}-[0-9]{2}[T ][0-9:]+(?:Z|[+-][0-9:]+)?)",
+            ctx,
+        )
+        if m:
+            ctx_now = m.group(1).strip()
+    except Exception:
+        pass
+
+    # Early return if context() already published vault_today.  vault_now is
+    # nice-to-have but not required: skipping the file probe here saves ~30
+    # MCP RPCs (≈30-60s wall-clock) on every task, freeing the executor budget.
+    if ctx_today:
+        return ctx_today, ctx_now, "context"
+
+    found_timestamps: list[str] = []  # full RFC3339-ish strings
+    found_dates: list[str] = []       # YYYY-MM-DD only
+
+    probe_deadline = time.monotonic() + _VAULT_PROBE_BUDGET_S
+    for dir_path, max_files in _VAULT_PROBE_DIRS:
+        if time.monotonic() >= probe_deadline:
+            break
+        try:
+            entries = vm.list(ListRequest(name=dir_path)).entries
+        except Exception:
+            continue
+        files = [e.name for e in entries if not e.is_dir][:max_files]
+        for fname in files:
+            if time.monotonic() >= probe_deadline:
+                break
+            fm = _FILENAME_DATE_RE.search(fname)
+            if fm:
+                found_dates.append(f"{fm.group(1)}-{fm.group(2)}-{fm.group(3)}")
+            full_path = dir_path + fname
+            try:
+                content = vm.read(
+                    ReadRequest(path=full_path, start_line=1, end_line=60)
+                ).content or ""
+            except Exception:
+                continue
+            for tm in _FM_TS_RE.finditer(content):
+                value = tm.group(2)
+                if "T" in value or " " in value:
+                    found_timestamps.append(value)
+                else:
+                    found_dates.append(value)
+
+    vault_now = ctx_now
+    if not vault_now and found_timestamps:
+        vault_now = max(found_timestamps)
+    vault_today = ctx_today
+    if not vault_today:
+        if vault_now:
+            vault_today = vault_now[:10]
+        elif found_dates:
+            vault_today = max(found_dates)
+
+    source = "probe" if (vault_today or vault_now) else ""
+    return vault_today, vault_now, source
+
+
 # ── MCP config builder ──────────────────────────────────────────────────────
 
 def _build_mcp_config(
@@ -312,8 +522,17 @@ def _spawn_iclaude(
     bare: bool = False,
     output_format: str = "",
     effort: str = "",
-) -> tuple[list[str], int]:
-    """Spawn iclaude subprocess. Returns (stdout_lines, exit_code).
+) -> tuple[list[str], int, str]:
+    """Spawn iclaude subprocess. Returns (stdout_lines, exit_code, fail_reason).
+
+    fail_reason:
+      - "ok"      — process finished on its own (regardless of exit_code).
+      - "timeout" — we killed the process because it exceeded `timeout`.
+      - "error"   — exception during spawn/collect (OS-level failure).
+
+    Distinguishing timeout from other failures lets callers decide whether
+    retrying with the same budget is sensible (it almost never is for
+    timeout-killed processes — they'll hit the same wall again).
 
     bare=True: runs from /tmp to prevent CLAUDE.md auto-discovery from
     the project directory — Claude walks up from cwd to find CLAUDE.md files.
@@ -352,6 +571,7 @@ def _spawn_iclaude(
 
     exit_code = -1
     stdout_lines: list[str] = []
+    fail_reason = "ok"
     proc = None
     try:
         proc = subprocess.Popen(
@@ -373,9 +593,12 @@ def _spawn_iclaude(
         t.start()
         t.join(timeout=timeout)
         if proc.poll() is None:
-            # Process still running after timeout — graceful then hard kill.
-            # SIGTERM lets iclaude flush output; SIGKILL after grace period
-            # ensures the entire process group is reaped.
+            # Process still running after timeout — we killed it, record reason
+            # BEFORE sending SIGTERM so callers can distinguish this from a
+            # self-terminating non-zero exit.
+            fail_reason = "timeout"
+            # Graceful then hard kill. SIGTERM lets iclaude flush output;
+            # SIGKILL after grace period ensures the entire process group is reaped.
             try:
                 os.killpg(proc.pid, signal.SIGTERM)
             except OSError:
@@ -394,6 +617,7 @@ def _spawn_iclaude(
         stdout_lines = collected[0] if collected else []
         exit_code = proc.wait()
     except Exception:
+        fail_reason = "error"
         if proc is not None and proc.poll() is None:
             try:
                 os.killpg(proc.pid, signal.SIGKILL)
@@ -403,7 +627,7 @@ def _spawn_iclaude(
     finally:
         Path(cfg_path).unlink(missing_ok=True)
 
-    return stdout_lines, exit_code
+    return stdout_lines, exit_code, fail_reason
 
 
 def _extract_model_from_output(lines: list[str]) -> str:
@@ -484,8 +708,59 @@ def _run_pipeline(
     """Run Classifier → Executor → Verifier pipeline."""
     pipeline_start = time.monotonic()
 
+    # ── Diagnostic flag for outbox-related failures (no behaviour change) ──
+    is_outbox_task = bool(_OUTBOX_RE.search(instruction))
+    if is_outbox_task:
+        _append_jsonl(task_dir / "pipeline.events.jsonl", {
+            "type": "outbox_diagnostic", "phase": "task_started",
+            "instruction_preview": instruction[:200],
+        })
+
+    # ── Per-task time budget (logic-driven, no task-id hardcode) ──
+    task_budget, task_mult, det_type, batch_n = _budget_for(instruction)
+    if task_mult != 1.0:
+        _append_jsonl(task_dir / "pipeline.events.jsonl", {
+            "type": "budget_scaled", "task_type": det_type, "batch_size": batch_n,
+            "multiplier": round(task_mult, 2), "budget_s": task_budget,
+        })
+        with _STDOUT_LOCK:
+            print(f"  {CLI_YELLOW}[pipeline] budget x{task_mult:.2f} ({det_type}, batch={batch_n}) → {task_budget}s{CLI_CLR}")
+
     with _STDOUT_LOCK:
         print(f"  {CLI_YELLOW}[pipeline] classifier → executor → verifier{CLI_CLR}")
+
+    # ── Resolve vault clock ONCE for all paths (logic, not hardcode) ──
+    # This runs before fast-path classification so simple lookups also receive
+    # the correct vault_today / vault_now when the harness publishes one.
+    #
+    # Two sources are distinguished:
+    #   - "context": authoritative value from harness get_context() — safe to
+    #                inject into the executor environment.
+    #   - "probe":   inferred from filesystem timestamps (max(received_at),
+    #                latest invoice filename, …). DIAGNOSTIC ONLY: returning
+    #                *a* date present in the vault is not the same as returning
+    #                *the* vault-now, and injecting a stale snapshot caused
+    #                regressions in finance / NORA arithmetic tasks. Probe
+    #                results are logged for visibility but NOT injected — the
+    #                executor falls back to its runtime-cascade prompt.
+    resolved_today, resolved_now, resolved_source = _resolve_vault_clock(harness_url)
+    _append_jsonl(task_dir / "pipeline.events.jsonl", {
+        "type": "vault_clock_resolved",
+        "vault_today": resolved_today,
+        "vault_now": resolved_now,
+        "source": resolved_source,
+    })
+    inject_today = resolved_today if resolved_source == "context" else ""
+    inject_now = resolved_now if resolved_source == "context" else ""
+    if resolved_source == "context":
+        with _STDOUT_LOCK:
+            print(f"  {CLI_GREEN}[pipeline] vault_clock today={resolved_today or '?'} now={resolved_now or '?'} (context){CLI_CLR}")
+    elif resolved_source == "probe":
+        with _STDOUT_LOCK:
+            print(f"  {CLI_YELLOW}[pipeline] vault_clock probe={resolved_today or '?'} (diagnostic only — not injected){CLI_CLR}")
+    else:
+        with _STDOUT_LOCK:
+            print(f"  {CLI_YELLOW}[pipeline] vault_clock unresolved — agent must read vault at runtime{CLI_CLR}")
 
     # ── Fast-path: skip classifier for simple task types ──
     if FAST_PATH_TYPES:
@@ -497,25 +772,32 @@ def _run_pipeline(
                 "type": "classifier_fast_path", "task_type": task_type,
             })
             executor_prompt = get_prompt(instruction, task_type=task_type)
-            time_remaining = TASK_TIMEOUT - (time.monotonic() - pipeline_start)
+            time_remaining = task_budget - (time.monotonic() - pipeline_start)
             return _executor_verify_loop(
                 harness_url, task_id, instruction, task_dir,
                 executor_prompt, attempt=1, time_remaining=time_remaining,
+                vault_today=inject_today, vault_now=inject_now,
             )
 
     # ── Phase 1: Classifier ──
     vault_reads_file = task_dir / "vault_reads.json"
     classifier_trace = task_dir / "classifier.events.jsonl"
+    cls_extra_env: dict[str, str] = {"VAULT_READS_FILE": str(vault_reads_file)}
+    if inject_today:
+        cls_extra_env["VAULT_TODAY"] = inject_today
+    if inject_now:
+        cls_extra_env["VAULT_NOW"] = inject_now
     classifier_cfg = _build_mcp_config(
         harness_url, classifier_trace, task_id, instruction, mode="readonly",
-        extra_env={"VAULT_READS_FILE": str(vault_reads_file)},
+        extra_env=cls_extra_env,
     )
 
     cls_model_label = "router" if USE_ROUTER else (CLAUDE_CLASSIFIER_MODEL or "default")
     with _STDOUT_LOCK:
         print(f"  {CLI_YELLOW}[classifier] model={cls_model_label}{CLI_CLR}")
 
-    cls_lines, cls_exit = _spawn_iclaude(
+    cls_start = time.monotonic()
+    cls_lines, cls_exit, cls_reason = _spawn_iclaude(
         mcp_cfg=classifier_cfg,
         system_prompt=CLASSIFIER_PROMPT,
         user_prompt=instruction,
@@ -526,34 +808,77 @@ def _run_pipeline(
         output_format="json",
         effort=CLAUDE_CLASSIFIER_EFFORT,
     )
+    cls_elapsed = time.monotonic() - cls_start
     cls_actual = _extract_model_from_output(cls_lines)
     if cls_actual:
         with _STDOUT_LOCK:
             print(f"  {CLI_YELLOW}[classifier] actual_model={cls_actual}{CLI_CLR}")
     classification = parse_classifier_output(cls_lines)
 
-    # Retry classifier once on parse failure (e.g. transient ECONNREFUSED).
-    # Brief sleep before retry lets the proxy recover from burst concurrency.
-    # A second attempt is cheap relative to executor cost and avoids static-prompt fallback.
+    # Retry policy for classifier:
+    #   - parse_failed (non-timeout): short sleep + identical retry.
+    #     Transient proxy errors / burst contention; second attempt is cheap.
+    #   - timeout: retrying with the SAME budget will hit the same wall, so
+    #     escalate the timeout to 1.5x — but only if the remaining task budget
+    #     can afford it. Otherwise skip retry and fall through to static prompt.
     if not classification:
-        with _STDOUT_LOCK:
-            print(f"  {CLI_YELLOW}[classifier] parse_failed — retrying once{CLI_CLR}")
-        _append_jsonl(task_dir / "pipeline.events.jsonl", {
-            "type": "classifier_retry", "reason": "parse_failed", "exit_code": cls_exit,
-        })
-        time.sleep(5)
-        cls_lines, cls_exit = _spawn_iclaude(
-            mcp_cfg=classifier_cfg,
-            system_prompt=CLASSIFIER_PROMPT,
-            user_prompt=instruction,
-            model=CLAUDE_CLASSIFIER_MODEL,
-            timeout=CLASSIFIER_TIMEOUT,
-            echo=False,
-            bare=True,
-            output_format="json",
-            effort=CLAUDE_CLASSIFIER_EFFORT,
-        )
-        classification = parse_classifier_output(cls_lines)
+        remaining_task = task_budget - (time.monotonic() - pipeline_start)
+        retry_ok = False
+        retry_timeout = CLASSIFIER_TIMEOUT
+        retry_reason = "parse_failed"
+        if cls_reason == "timeout":
+            # Escalated retry: 1.5x budget, capped by 40% of remaining task time.
+            # Only retry if the new budget is meaningfully larger than the old one.
+            escalated = min(
+                int(CLASSIFIER_TIMEOUT * 1.5),
+                max(int(remaining_task * 0.4), 30),
+            )
+            if escalated > CLASSIFIER_TIMEOUT + 10:
+                retry_ok = True
+                retry_timeout = escalated
+                retry_reason = "timeout_escalated"
+            else:
+                _append_jsonl(task_dir / "pipeline.events.jsonl", {
+                    "type": "classifier_retry_skipped", "reason": "timeout_no_budget",
+                    "exit_code": cls_exit, "first_elapsed_s": round(cls_elapsed, 1),
+                    "remaining_s": round(remaining_task, 1),
+                })
+        else:
+            # Parse-failure path: only retry if we still have room; otherwise
+            # the executor stage will starve.
+            if remaining_task > CLASSIFIER_TIMEOUT + 15:
+                retry_ok = True
+            else:
+                _append_jsonl(task_dir / "pipeline.events.jsonl", {
+                    "type": "classifier_retry_skipped", "reason": "parse_failed_no_budget",
+                    "exit_code": cls_exit, "first_elapsed_s": round(cls_elapsed, 1),
+                    "remaining_s": round(remaining_task, 1),
+                })
+        if retry_ok:
+            with _STDOUT_LOCK:
+                print(f"  {CLI_YELLOW}[classifier] {retry_reason} — retrying (timeout={retry_timeout}s){CLI_CLR}")
+            _append_jsonl(task_dir / "pipeline.events.jsonl", {
+                "type": "classifier_retry", "reason": retry_reason,
+                "exit_code": cls_exit, "first_elapsed_s": round(cls_elapsed, 1),
+                "new_timeout_s": retry_timeout,
+            })
+            # Sleep only on transient parse errors, not timeouts
+            if retry_reason == "parse_failed":
+                time.sleep(5)
+            cls_retry_start = time.monotonic()
+            cls_lines, cls_exit, cls_reason = _spawn_iclaude(
+                mcp_cfg=classifier_cfg,
+                system_prompt=CLASSIFIER_PROMPT,
+                user_prompt=instruction,
+                model=CLAUDE_CLASSIFIER_MODEL,
+                timeout=retry_timeout,
+                echo=False,
+                bare=True,
+                output_format="json",
+                effort=CLAUDE_CLASSIFIER_EFFORT,
+            )
+            cls_elapsed = time.monotonic() - cls_retry_start
+            classification = parse_classifier_output(cls_lines)
 
     vault_today = ""
     if classification:
@@ -568,18 +893,36 @@ def _run_pipeline(
         raw_out = "\n".join(cls_lines)
         (task_dir / "classifier_raw.txt").write_text(raw_out, encoding="utf-8")
         _append_jsonl(task_dir / "pipeline.events.jsonl", {
-            "type": "classifier_fallback", "reason": "parse_failed", "exit_code": cls_exit,
+            "type": "classifier_fallback",
+            # Reflect real cause — parse_failed was misleading when the process
+            # was SIGTERM'd by our own timeout.
+            "reason": cls_reason if cls_reason != "ok" else "parse_failed",
+            "fail_reason": cls_reason,
+            "exit_code": cls_exit,
+            "elapsed_s": round(cls_elapsed, 1),
             "raw_lines": len(cls_lines),
         })
         with _STDOUT_LOCK:
             print(f"  {CLI_RED}[classifier] fallback to static prompt{CLI_CLR}")
 
+    # Authoritative vault_today selection for the executor stage.
+    # Order:
+    #   1. Runner resolver context value (high-confidence, harness-published).
+    #   2. Classifier-derived vault_today (logical cascade in CLASSIFIER_PROMPT).
+    #   3. Probe result is INTENTIONALLY excluded from injection — see comment
+    #      at _resolve_vault_clock; using a stale snapshot polluted finance
+    #      and start-date arithmetic. The classifier already runs its own
+    #      cascade and is a better source than a mechanical max(timestamps).
+    final_today = inject_today or vault_today
+    final_now = inject_now  # only the runner resolver provides RFC3339 now
+
     # ── Phase 2+3: Executor → Verifier loop ──
-    time_remaining = TASK_TIMEOUT - (time.monotonic() - pipeline_start)
+    time_remaining = task_budget - (time.monotonic() - pipeline_start)
     _executor_verify_loop(
         harness_url, task_id, instruction, task_dir,
         executor_prompt, attempt=1, time_remaining=time_remaining,
-        vault_reads_file=vault_reads_file, vault_today=vault_today,
+        vault_reads_file=vault_reads_file, vault_today=final_today,
+        vault_now=final_now,
     )
 
 
@@ -593,6 +936,7 @@ def _executor_verify_loop(
     time_remaining: float,
     vault_reads_file: Path | None = None,
     vault_today: str = "",
+    vault_now: str = "",
 ) -> None:
     """Run executor + verifier with retry on reject."""
     exec_t, ver_t = _time_budget(time_remaining, attempt, MAX_RETRIES + 1)
@@ -612,12 +956,14 @@ def _executor_verify_loop(
         exec_extra_env["VAULT_READS_FILE"] = str(vault_reads_file)
     if vault_today:
         exec_extra_env["VAULT_TODAY"] = vault_today
+    if vault_now:
+        exec_extra_env["VAULT_NOW"] = vault_now
     executor_cfg = _build_mcp_config(
         harness_url, exec_trace, task_id, instruction,
         mode="draft",
         extra_env=exec_extra_env,
     )
-    exec_lines, _ = _spawn_iclaude(
+    exec_lines, _, _ = _spawn_iclaude(
         mcp_cfg=executor_cfg,
         system_prompt=executor_prompt,
         user_prompt=instruction,
@@ -656,6 +1002,11 @@ def _executor_verify_loop(
             "type": "verifier_skipped", "reason": "time_budget",
             "remaining_s": round(remaining_after_exec, 1), "attempt": attempt,
         })
+        if _OUTBOX_RE.search(instruction):
+            _append_jsonl(task_dir / "pipeline.events.jsonl", {
+                "type": "outbox_diagnostic", "phase": "submit_no_verifier",
+                "draft": _draft_outbox_summary(draft),
+            })
         if draft.get("outcome") == "ok":
             vault_ops = draft.get("vault_ops", [])
             if vault_ops:
@@ -675,17 +1026,22 @@ def _executor_verify_loop(
 
     # ── Verifier ──
     ver_trace = task_dir / f"verifier_{attempt}.events.jsonl"
-    ver_extra_env = {"VAULT_TODAY": vault_today} if vault_today else None
+    ver_extra_env: dict[str, str] = {}
+    if vault_today:
+        ver_extra_env["VAULT_TODAY"] = vault_today
+    if vault_now:
+        ver_extra_env["VAULT_NOW"] = vault_now
     verifier_cfg = _build_mcp_config(
         harness_url, ver_trace, task_id, instruction, mode="readonly",
-        extra_env=ver_extra_env,
+        extra_env=ver_extra_env or None,
     )
     verifier_input = json.dumps({
         "instruction": instruction,
         "draft_answer": draft,
     }, ensure_ascii=False)
 
-    ver_lines, ver_exit = _spawn_iclaude(
+    ver_start = time.monotonic()
+    ver_lines, ver_exit, ver_reason = _spawn_iclaude(
         mcp_cfg=verifier_cfg,
         system_prompt=VERIFIER_PROMPT,
         user_prompt=verifier_input,
@@ -696,36 +1052,76 @@ def _executor_verify_loop(
         output_format="json",
         effort=CLAUDE_VERIFIER_EFFORT,
     )
+    ver_elapsed = time.monotonic() - ver_start
     ver_actual = _extract_model_from_output(ver_lines)
     if ver_actual:
         with _STDOUT_LOCK:
             print(f"  {CLI_YELLOW}[verifier] actual_model={ver_actual}{CLI_CLR}")
     verdict = parse_verifier_output(ver_lines)
 
-    # Retry verifier once on parse failure (e.g. transient ECONNREFUSED).
+    # Retry policy for verifier (mirrors classifier policy):
+    #   - parse_failed (non-timeout): sleep + identical retry with recomputed budget.
+    #   - timeout: retry only if we can afford a larger budget.
     if not verdict:
-        with _STDOUT_LOCK:
-            print(f"  {CLI_YELLOW}[verifier] parse_failed — retrying once{CLI_CLR}")
-        _append_jsonl(task_dir / "pipeline.events.jsonl", {
-            "type": "verifier_retry", "reason": "parse_failed",
-            "exit_code": ver_exit, "attempt": attempt,
-        })
-        time.sleep(5)
-        # Recompute budget for retry with remaining time
-        ver_t_retry = _verifier_budget(time_remaining, time.monotonic() - attempt_start,
-                                       attempt, MAX_RETRIES + 1)
-        ver_lines, ver_exit = _spawn_iclaude(
-            mcp_cfg=verifier_cfg,
-            system_prompt=VERIFIER_PROMPT,
-            user_prompt=verifier_input,
-            model=verifier_model,
-            timeout=ver_t_retry,
-            bare=True,
-            echo=False,
-            output_format="json",
-            effort=CLAUDE_VERIFIER_EFFORT,
-        )
-        verdict = parse_verifier_output(ver_lines)
+        remaining_after_ver = time_remaining - (time.monotonic() - attempt_start)
+        retry_ver_ok = False
+        retry_ver_timeout = ver_t
+        retry_ver_reason = "parse_failed"
+        if ver_reason == "timeout":
+            escalated = min(
+                int(ver_t * 1.5),
+                max(int(remaining_after_ver * 0.6), 30),
+            )
+            if escalated > ver_t + 10 and remaining_after_ver > ver_t + 15:
+                retry_ver_ok = True
+                retry_ver_timeout = escalated
+                retry_ver_reason = "timeout_escalated"
+            else:
+                _append_jsonl(task_dir / "pipeline.events.jsonl", {
+                    "type": "verifier_retry_skipped", "reason": "timeout_no_budget",
+                    "exit_code": ver_exit, "first_elapsed_s": round(ver_elapsed, 1),
+                    "remaining_s": round(remaining_after_ver, 1), "attempt": attempt,
+                })
+        else:
+            # Recompute standard retry budget; only retry if it fits.
+            standard_retry = _verifier_budget(
+                time_remaining, time.monotonic() - attempt_start,
+                attempt, MAX_RETRIES + 1,
+            )
+            if standard_retry > 30 and remaining_after_ver > standard_retry + 10:
+                retry_ver_ok = True
+                retry_ver_timeout = standard_retry
+            else:
+                _append_jsonl(task_dir / "pipeline.events.jsonl", {
+                    "type": "verifier_retry_skipped", "reason": "parse_failed_no_budget",
+                    "exit_code": ver_exit, "first_elapsed_s": round(ver_elapsed, 1),
+                    "remaining_s": round(remaining_after_ver, 1), "attempt": attempt,
+                })
+        if retry_ver_ok:
+            with _STDOUT_LOCK:
+                print(f"  {CLI_YELLOW}[verifier] {retry_ver_reason} — retrying (timeout={retry_ver_timeout}s){CLI_CLR}")
+            _append_jsonl(task_dir / "pipeline.events.jsonl", {
+                "type": "verifier_retry", "reason": retry_ver_reason,
+                "exit_code": ver_exit, "attempt": attempt,
+                "first_elapsed_s": round(ver_elapsed, 1),
+                "new_timeout_s": retry_ver_timeout,
+            })
+            if retry_ver_reason == "parse_failed":
+                time.sleep(5)
+            ver_retry_start = time.monotonic()
+            ver_lines, ver_exit, ver_reason = _spawn_iclaude(
+                mcp_cfg=verifier_cfg,
+                system_prompt=VERIFIER_PROMPT,
+                user_prompt=verifier_input,
+                model=verifier_model,
+                timeout=retry_ver_timeout,
+                bare=True,
+                echo=False,
+                output_format="json",
+                effort=CLAUDE_VERIFIER_EFFORT,
+            )
+            ver_elapsed = time.monotonic() - ver_retry_start
+            verdict = parse_verifier_output(ver_lines)
 
     if verdict:
         _write_json(task_dir / f"verdict_{attempt}.json", verdict)
@@ -739,12 +1135,20 @@ def _executor_verify_loop(
         with _STDOUT_LOCK:
             print(f"  {CLI_GREEN}[verifier] verdict={verdict.get('verdict', '?')}{CLI_CLR}")
     else:
+        # Verdict unavailable — draft will be submitted as-is via apply_verdict.
+        # Record the real failure category so post-mortem analysis can
+        # distinguish SIGTERM from genuine parse errors.
         _append_jsonl(task_dir / "pipeline.events.jsonl", {
-            "type": "verifier_fallback", "reason": "parse_failed",
-            "exit_code": ver_exit, "attempt": attempt,
+            "type": "verifier_fallback",
+            "reason": ver_reason if ver_reason != "ok" else "parse_failed",
+            "fail_reason": ver_reason,
+            "exit_code": ver_exit,
+            "elapsed_s": round(ver_elapsed, 1),
+            "attempt": attempt,
+            "draft_outcome": draft.get("outcome", "?"),
         })
         with _STDOUT_LOCK:
-            print(f"  {CLI_RED}[verifier] fallback — submitting draft as-is{CLI_CLR}")
+            print(f"  {CLI_RED}[verifier] fallback — submitting draft as-is ({ver_reason}){CLI_CLR}")
 
     # ── Retry on reject ──
     if (verdict and verdict.get("verdict") == "reject"
@@ -774,11 +1178,21 @@ def _executor_verify_loop(
                 harness_url, task_id, instruction, task_dir,
                 feedback_prompt, attempt + 1, new_remaining,
                 vault_reads_file=vault_reads_file, vault_today=vault_today,
+                vault_now=vault_now,
             )
 
     # ── Submit final answer ──
     final = apply_verdict(draft, verdict)
     _write_json(task_dir / "final_answer.json", final)
+
+    if _OUTBOX_RE.search(instruction):
+        _append_jsonl(task_dir / "pipeline.events.jsonl", {
+            "type": "outbox_diagnostic", "phase": "submit_final",
+            "draft": _draft_outbox_summary(draft),
+            "final": _draft_outbox_summary(final),
+            "verdict": (verdict or {}).get("verdict", "none"),
+            "verdict_outcome": (verdict or {}).get("outcome", ""),
+        })
 
     # Commit deferred vault ops only when final outcome=ok.
     # vault_ops always originate from the executor draft; verifier never writes to vault.
@@ -814,6 +1228,7 @@ def _execute_single(
     trace_file = task_dir / "executor.events.jsonl"
     mcp_cfg = _build_mcp_config(harness_url, trace_file, task_id, instruction, mode="full")
 
+    # fail_reason is discarded here: the single-agent path has no retry layer.
     _spawn_iclaude(
         mcp_cfg=mcp_cfg,
         system_prompt=get_prompt(instruction),

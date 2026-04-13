@@ -155,30 +155,44 @@ If the instruction is complete and unambiguous → continue to step 1.
 
 ## Vault date discovery (classifier must do this for date/reschedule/lookup tasks)
 
-Run the following steps to find vault_today before generating the system_prompt.
-The date you find here is what you use to write a correct system_prompt.
+Run the cascade below to find vault_today AND vault_now (full RFC3339 timestamp).
+The values you find here are what you embed in the system_prompt.
 
-A. Call `get_context()` — may return vault_today directly.
-B. Check explicit date files (do ALL steps in order):
-   - Read `/CLAUDE.md` — PRIMARY source for knowledge vaults. Scan for `current_date:`, `today:`, `YYYY-MM-DD`.
-   - Read `/README.md` — same scan.
-   - If vault has `90_memory/`: Read `/90_memory/soul.md` — scan for "Current date:".
-   - If vault has `90_memory/agent_changelog.md`: read it — dated entries may reveal vault_today.
-C. For CRM vault (has `accounts/`):
-   - Benchmark rule: CRM reminders are always 8 days overdue at task time.
-     `vault_today = original_rem.due_on + 8`
-   - For RESCHEDULE tasks: `new_date = original_rem.due_on + (N_days + 8)`. No need to compute vault_today.
-   - For DATE-ARITHMETIC tasks: `vault_today = original_rem.due_on + 8`, then `answer = vault_today + N`.
-   - Read `/reminders/rem_001.json` to get original due_on.
-D. For knowledge vault (has `00_inbox/`):
-   - Read `/CLAUDE.md` FIRST — vault_today is often stored here.
-   - If not found: read `/90_memory/soul.md` and `/90_memory/agent_changelog.md`.
-   - If not found: `list("/00_inbox/")` → extract max YYYY-MM-DD from filenames → fallback estimate.
-   - Also `search(root="/", pattern="current_date:|today:|vault_today")` across all files.
+**Authoritative source first**: the MCP `instructions` block already contains
+`vault_today: YYYY-MM-DD` and possibly `vault_now: <RFC3339>` injected by the
+runner — these come from a direct probe of the vault contents, NOT from your
+system clock. If they are present, use them as-is and skip the rest of this
+cascade. Echo `vault_today` into the classification JSON output.
 
-If you found vault_today or the offset rule from vault docs: embed in the system_prompt (from vault, not clock).
-If vault_today is NOT found: instruct the executor to look it up at runtime using the same steps.
-NEVER use your system clock as vault_today — NEVER.
+A. Read MCP instructions block — if `vault_today`/`vault_now` is present, USE IT.
+B. Call `get_context()` — harness may also publish vault_today directly.
+C. Knowledge vault primary source (highest freshness — prefer this):
+   `list("/00_inbox/")` → for the first ~10 files, `read` each and scan
+   frontmatter for `received_at:`, `sent_at:`, `timestamp:`, `date:`.
+   `vault_now` = max RFC3339 value found across those files.
+   `vault_today` = `vault_now[:10]`.
+   Filename dates (`2026-03-23__topic.md`) are also valid evidence.
+D. CRM vault (has `accounts/` and `reminders/` but no `00_inbox/`):
+   Benchmark rule: CRM reminders are always 8 days overdue at task time.
+   `read /reminders/rem_001.json` → `vault_today = due_on + 8 days`.
+   For RESCHEDULE: `new_date = original_rem.due_on + (N_days + 8)`.
+   For DATE-ARITHMETIC: `answer = vault_today + N`.
+E. Finance lane fallback: `list /50_finance/invoices/` → max date from filenames.
+F. Legacy doc fallback (rare in pac1-prod): read `/CLAUDE.md`, `/README.md`,
+   `/90_memory/soul.md`, `/90_memory/agent_changelog.md` and scan for
+   `current_date:`, `today:`, or any `YYYY-MM-DD`.
+G. As last resort: `search(root="/", pattern="current_date:|today:|vault_today")`.
+
+If vault_today is found anywhere → embed it directly in the system_prompt.
+If vault_today is NOT found by ANY step → leave `"vault_today": ""` in the
+classification JSON, add a warning `"vault_clock_unknown"`, and instruct the
+executor to run the same cascade at runtime.
+
+**ABSOLUTE PROHIBITION**: NEVER fabricate vault_today from your system clock.
+NEVER write a date matching the current real-world day (the harness's
+`currentDate` injection) into vault_today. If the cascade is empty, the field
+is empty — do not paper over it. The runner has already probed the vault
+filesystem for you; if it didn't find a date, neither will guessing.
 3. For email/inbox tasks: read relevant account/contact files AND `list`/`read` `/docs/channels/` for channel-specific rules.
 
 ### INBOX EMAIL MATCH
@@ -226,6 +240,25 @@ These values are non-deterministic and must always be read by the executor at ru
 - **seq.json sequence number**: Do NOT embed the current seq id.
   Instead write: "Read /outbox/seq.json at runtime to get the next id N."
   Same reason: a retry after a partial write would use the wrong sequence number.
+
+- **Pre-resolved file lists in delete / cleanup tasks** (CRITICAL):
+  Do NOT write things like
+    "Files to delete (confirmed by search): /50_finance/x.md, /50_finance/y.md"
+  or any pre-computed bullet list of paths into the executor system_prompt.
+  Reason: `search()` returns filtered snippets, not authoritative listings, and
+  conditions can drift between the classifier and executor passes. A list you
+  baked in may include false positives, miss new files, or point at moved files.
+  Instead, provide CRITERIA and let the executor resolve paths at runtime:
+    "Find files in /50_finance/ where body contains 'X'. For EACH candidate:
+    `read` the file, verify the EXACT phrase appears as a contiguous
+    substring (not just individual words), then `delete`."
+  The executor MUST run `find` / `search` / `read` at runtime before every
+  `delete` and confirm the criterion against fresh content. The same rule
+  applies to "Files to move", "Files to update", "Items to process" lists.
+  For literal-phrase criteria (`containing "…"`), the executor guidance in
+  the system_prompt MUST state explicitly: "search hits are candidates, not
+  proof — verify the full phrase byte-for-byte via `read` before any delete."
+  This prevents over-delete when a search token is shared with unrelated files.
 
 Any value that can change between agent invocations MUST be read by the executor,
 never pre-loaded by the classifier.
@@ -953,6 +986,64 @@ def _extract_json(lines: list[str]) -> dict | None:
 
 # ── Parsers ──────────────────────────────────────────────────────────────────
 
+_HARDCODED_LIST_PATTERNS = (
+    _re.compile(r"files\s+to\s+delete\s*\(.*?\)\s*:", _re.I),
+    _re.compile(r"files\s+to\s+delete\s*:", _re.I),
+    _re.compile(r"confirmed\s+by\s+search\s*:", _re.I),
+    _re.compile(r"pre[- ]?resolved\s+(file\s+)?paths?\s*:", _re.I),
+)
+
+
+def _strip_hardcoded_lists(system_prompt: str) -> tuple[str, bool]:
+    """Detect classifier-baked path lists for delete/cleanup tasks.
+
+    Returns (rewritten_prompt, was_modified).  When a banned heading is found,
+    we replace it (and the bullet block that follows) with a runtime-resolution
+    instruction so the executor never trusts a stale path list.
+
+    Logic, not hardcode: this is a parse-time safety net for the
+    "Never embed runtime values" rule in CLASSIFIER_PROMPT.
+    """
+    modified = False
+    text = system_prompt
+    for pat in _HARDCODED_LIST_PATTERNS:
+        m = pat.search(text)
+        if not m:
+            continue
+        # Find the end of the bullet block: skip the trailing newline of the
+        # heading line, then consume contiguous bullet/numbered lines, then
+        # stop on the first blank or non-bullet line.
+        start = m.start()
+        end = m.end()
+        lines = text[end:].splitlines(keepends=True)
+        consumed = 0
+        seen_bullet = False
+        for line in lines:
+            stripped = line.strip()
+            if not stripped:
+                # Allow ONE blank line right after the heading (before bullets);
+                # otherwise a blank terminates the block.
+                if seen_bullet:
+                    break
+                consumed += len(line)
+                continue
+            if stripped[0] in "-*" or (
+                len(stripped) >= 2 and stripped[0].isdigit() and stripped[1] in ".)"
+            ):
+                seen_bullet = True
+                consumed += len(line)
+                continue
+            break
+        replacement = (
+            "Resolve targets at runtime — the classifier MUST NOT pre-bake "
+            "paths. Run `find`/`search`, `read` each candidate, verify the "
+            "criterion against fresh content, then act on it.\n"
+        )
+        text = text[:start] + replacement + text[end + consumed:]
+        modified = True
+    return text, modified
+
+
 def parse_classifier_output(lines: list[str]) -> dict | None:
     """Parse classifier agent stdout → classification dict or None."""
     result = _extract_json(lines)
@@ -966,6 +1057,21 @@ def parse_classifier_output(lines: list[str]) -> dict | None:
     result.setdefault("vault_today", "")
     result.setdefault("key_rules", [])
     result.setdefault("warnings", [])
+
+    # Safety net: if the classifier baked a path list into system_prompt
+    # despite the prompt rule, rewrite it and emit a warning.
+    sp = result.get("system_prompt", "")
+    if isinstance(sp, str):
+        new_sp, modified = _strip_hardcoded_lists(sp)
+        if modified:
+            result["system_prompt"] = new_sp
+            warnings = result.get("warnings") or []
+            if isinstance(warnings, list):
+                warnings.append(
+                    "classifier_hardcoded_paths_stripped: pre-baked file list "
+                    "was rewritten to runtime resolution criteria"
+                )
+                result["warnings"] = warnings
     return result
 
 
