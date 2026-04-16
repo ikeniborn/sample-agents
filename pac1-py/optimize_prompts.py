@@ -1,6 +1,6 @@
 """DSPy COPRO optimizer for prompt_builder and evaluator (Variant 4).
 
-Loads real examples from logs/dspy_examples.jsonl (accumulated by main.py runs).
+Loads real examples from data/dspy_examples.jsonl (accumulated by main.py runs).
 If fewer than 30 real examples are available, supplements with cold-start synthetic
 examples from data/dspy_synthetic.jsonl.
 
@@ -87,12 +87,13 @@ def _get_optimizer_model() -> tuple[str, dict]:
     all_cfgs = {k: _resolve(v) for k, v in models_raw.items() if not k.startswith("_")}
 
     model = (
-        os.environ.get("MODEL_CLASSIFIER")
+        os.environ.get("MODEL_OPTIMIZER")
+        or os.environ.get("MODEL_CLASSIFIER")
         or os.environ.get("MODEL_DEFAULT")
         or next(iter(all_cfgs), None)
     )
     if not model:
-        raise RuntimeError("No model configured. Set MODEL_DEFAULT in .env")
+        raise RuntimeError("No model configured. Set MODEL_DEFAULT or MODEL_OPTIMIZER in .env")
     cfg = all_cfgs.get(model, {})
     return model, cfg
 

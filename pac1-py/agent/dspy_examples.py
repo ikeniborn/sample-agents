@@ -1,7 +1,7 @@
 """Example collector for DSPy COPRO/MIPRO optimization (Variant 4).
 
 Records (task_text, task_type, addendum, score) tuples from real benchmark
-runs to logs/dspy_examples.jsonl. When ≥ THRESHOLD real examples accumulate,
+runs to data/dspy_examples.jsonl. When ≥ THRESHOLD real examples accumulate,
 prints a hint to run optimize_prompts.py.
 
 Synthetic cold-start examples live in data/dspy_synthetic.jsonl and are used
@@ -12,7 +12,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-_EXAMPLES_PATH = Path("logs/dspy_examples.jsonl")
+_EXAMPLES_PATH = Path(__file__).parent.parent / "data" / "dspy_examples.jsonl"
 _SYNTHETIC_PATH = Path(__file__).parent.parent / "data" / "dspy_synthetic.jsonl"
 _THRESHOLD = 30
 
@@ -32,7 +32,7 @@ def record_example(
     Creates logs/ directory if absent. Prints a hint to run the optimizer
     when the count first reaches THRESHOLD.
     """
-    _EXAMPLES_PATH.parent.mkdir(exist_ok=True)
+    _EXAMPLES_PATH.parent.mkdir(parents=True, exist_ok=True)
     entry = {
         "task_text": task_text,
         "task_type": task_type,
