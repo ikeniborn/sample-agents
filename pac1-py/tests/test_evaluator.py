@@ -1,12 +1,13 @@
-"""Tests for evaluator/critic (FIX-218).
+"""Tests for evaluator/critic (FIX-218, Variant 2 — DSPy ChainOfThought).
 
 Tests cover:
-  - _build_eval_prompt: prompt structure by efficiency/skepticism level
-  - evaluate_completion: LLM approval, rejection, fail-open (None/bad JSON)
+  - _build_eval_prompt: prompt structure by efficiency/skepticism level (preserved function)
+  - evaluate_completion: LLM approval, rejection, fail-open (None/bad JSON/exception)
   - Parametrized efficiency levels
 
-LLM is mocked via @patch("agent.evaluator.call_llm_raw").
-EvalVerdict is constructed via the conftest.py BaseModel stub.
+LLM is mocked via @patch("agent.dspy_lm.call_llm_raw").
+DSPy 3.x expects JSON responses with output field names as keys:
+  {"reasoning": "...", "approved_str": "yes/no", "issues_str": "...", "correction_hint": "..."}
 """
 import json
 import types
@@ -37,8 +38,29 @@ def _make_report(outcome="OUTCOME_OK", message="Done", steps=None, done_ops=None
     )
 
 
+def _approved_json(**extra) -> str:
+    """Return a DSPy-parseable JSON string for an approved verdict."""
+    return json.dumps({
+        "reasoning": "Task is completed correctly.",
+        "approved_str": "yes",
+        "issues_str": "",
+        "correction_hint": "",
+        **extra,
+    })
+
+
+def _rejected_json(issues: str, hint: str) -> str:
+    """Return a DSPy-parseable JSON string for a rejected verdict."""
+    return json.dumps({
+        "reasoning": "There is a problem with the outcome.",
+        "approved_str": "no",
+        "issues_str": issues,
+        "correction_hint": hint,
+    })
+
+
 # ---------------------------------------------------------------------------
-# _build_eval_prompt — structure tests (no LLM)
+# _build_eval_prompt — structure tests (no LLM, function preserved)
 # ---------------------------------------------------------------------------
 
 def test_build_prompt_contains_task_and_outcome():
@@ -165,14 +187,15 @@ def test_build_prompt_inbox_evidence_mid():
     assert "supplier@co.com" in user_msg
 
 
-@patch("agent.evaluator.call_llm_raw")
+# ---------------------------------------------------------------------------
+# evaluate_completion — mock agent.dspy_lm.call_llm_raw
+# DSPy 3.x expects JSON with output field names
+# ---------------------------------------------------------------------------
+
+@patch("agent.dspy_lm.call_llm_raw")
 def test_evaluate_completion_approval(mock_llm):
-    """LLM returns approved=true → EvalVerdict.approved is True."""
-    mock_llm.return_value = json.dumps({
-        "approved": True,
-        "issues": [],
-        "correction_hint": "",
-    })
+    """LLM returns approved_str=yes → EvalVerdict.approved is True."""
+    mock_llm.return_value = _approved_json()
     fn = _evaluate()
     verdict = fn(
         task_text="summarize the file",
@@ -186,14 +209,13 @@ def test_evaluate_completion_approval(mock_llm):
     assert verdict.approved is True
 
 
-@patch("agent.evaluator.call_llm_raw")
+@patch("agent.dspy_lm.call_llm_raw")
 def test_evaluate_completion_rejection_with_issues(mock_llm):
-    """LLM returns approved=false + issues → verdict carries them."""
-    mock_llm.return_value = json.dumps({
-        "approved": False,
-        "issues": ["Task says 'all' but only 1 operation completed"],
-        "correction_hint": "OUTCOME_NONE_CLARIFICATION",
-    })
+    """LLM returns approved_str=no + issues → verdict carries them."""
+    mock_llm.return_value = _rejected_json(
+        issues="only 1 operation completed",
+        hint="OUTCOME_NONE_CLARIFICATION",
+    )
     fn = _evaluate()
     verdict = fn(
         task_text="delete all threads",
@@ -209,9 +231,9 @@ def test_evaluate_completion_rejection_with_issues(mock_llm):
     assert verdict.correction_hint == "OUTCOME_NONE_CLARIFICATION"
 
 
-@patch("agent.evaluator.call_llm_raw")
+@patch("agent.dspy_lm.call_llm_raw")
 def test_evaluate_completion_none_response_fail_open(mock_llm):
-    """LLM returns None → fail-open, approved=True."""
+    """LLM returns None → DSPy parse fails → fail-open, approved=True."""
     mock_llm.return_value = None
     fn = _evaluate()
     verdict = fn(
@@ -226,9 +248,9 @@ def test_evaluate_completion_none_response_fail_open(mock_llm):
     assert verdict.approved is True
 
 
-@patch("agent.evaluator.call_llm_raw")
+@patch("agent.dspy_lm.call_llm_raw")
 def test_evaluate_completion_empty_string_fail_open(mock_llm):
-    """LLM returns empty string → fail-open, approved=True."""
+    """LLM returns empty string → DSPy parse fails → fail-open, approved=True."""
     mock_llm.return_value = ""
     fn = _evaluate()
     verdict = fn(
@@ -243,9 +265,9 @@ def test_evaluate_completion_empty_string_fail_open(mock_llm):
     assert verdict.approved is True
 
 
-@patch("agent.evaluator.call_llm_raw")
+@patch("agent.dspy_lm.call_llm_raw")
 def test_evaluate_completion_bad_json_fail_open(mock_llm):
-    """LLM returns garbage with no JSON → fail-open, approved=True."""
+    """LLM returns garbage → DSPy parse fails → fail-open, approved=True."""
     mock_llm.return_value = "Sorry, I cannot evaluate this task right now."
     fn = _evaluate()
     verdict = fn(
@@ -260,26 +282,7 @@ def test_evaluate_completion_bad_json_fail_open(mock_llm):
     assert verdict.approved is True
 
 
-@patch("agent.evaluator.call_llm_raw")
-def test_evaluate_completion_bracket_fallback(mock_llm):
-    """LLM wraps JSON in text → bracket-extraction fallback succeeds."""
-    mock_llm.return_value = (
-        'Here is my verdict: {"approved": true, "issues": [], "correction_hint": ""}'
-    )
-    fn = _evaluate()
-    verdict = fn(
-        task_text="test",
-        task_type="default",
-        report=_make_report(),
-        done_ops=[],
-        digest_str="",
-        model="test-model",
-        cfg={},
-    )
-    assert verdict.approved is True
-
-
-@patch("agent.evaluator.call_llm_raw")
+@patch("agent.dspy_lm.call_llm_raw")
 def test_evaluate_completion_exception_fail_open(mock_llm):
     """LLM raises exception → fail-open, approved=True."""
     mock_llm.side_effect = ConnectionError("network failure")

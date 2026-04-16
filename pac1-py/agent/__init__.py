@@ -10,8 +10,11 @@ from .prephase import run_prephase
 from .prompt import build_system_prompt
 from .prompt_builder import build_dynamic_addendum
 
-_PROMPT_BUILDER_ENABLED = os.getenv("PROMPT_BUILDER_ENABLED", "0") == "1"
-_PROMPT_BUILDER_MAX_TOKENS = int(os.getenv("PROMPT_BUILDER_MAX_TOKENS", "2000"))
+_PROMPT_BUILDER_ENABLED = os.getenv("PROMPT_BUILDER_ENABLED", "1") == "1"
+try:
+    _PROMPT_BUILDER_MAX_TOKENS = int(os.getenv("PROMPT_BUILDER_MAX_TOKENS", "300"))
+except ValueError:
+    _PROMPT_BUILDER_MAX_TOKENS = 300
 
 
 def run_agent(router: ModelRouter, harness_url: str, task_text: str) -> dict:
@@ -25,9 +28,9 @@ def run_agent(router: ModelRouter, harness_url: str, task_text: str) -> dict:
        context (single LLM call or regex fast-path), then selects the appropriate model.
     3. build_system_prompt(task_type) — assembles a task-type specific system prompt
        from modular blocks (FIX-NNN step 1: always).
-    4. build_dynamic_addendum() — if PROMPT_BUILDER_ENABLED=1 and task type is in
-       _NEEDS_BUILDER, calls a lightweight LLM to generate task-specific guidance
-       (FIX-NNN step 2: optional, for ambiguous types only).
+    4. build_dynamic_addendum() — calls a lightweight LLM to generate task-specific
+       guidance (enabled by default; override with PROMPT_BUILDER_ENABLED=0).
+       Token budget: PROMPT_BUILDER_MAX_TOKENS (default 300).
     5. run_loop() — executes up to 30 agent steps: LLM → tool dispatch → stall detection,
        compacting the log as needed. Ends when report_completion is called or steps run out.
 
@@ -45,7 +48,7 @@ def run_agent(router: ModelRouter, harness_url: str, task_text: str) -> dict:
     # FIX-NNN step 1: modular prompt assembly — always, zero extra latency
     base_prompt = build_system_prompt(task_type)
 
-    # FIX-NNN step 2: LLM-based addendum — only for ambiguous/complex task types
+    # FIX-NNN step 2: LLM-based addendum — task-specific guidance for all task types
     addendum = ""
     builder_in_tok = builder_out_tok = 0
     if _PROMPT_BUILDER_ENABLED:
@@ -87,4 +90,5 @@ def run_agent(router: ModelRouter, harness_url: str, task_text: str) -> dict:
     stats["builder_used"] = bool(addendum)
     stats["builder_in_tok"] = builder_in_tok
     stats["builder_out_tok"] = builder_out_tok
+    stats["builder_addendum"] = addendum  # captured for dspy_examples.record_example()
     return stats

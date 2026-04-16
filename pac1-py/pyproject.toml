@@ -12,6 +12,7 @@ dependencies = [
     "pydantic>=2.12.5",
     "annotated-types>=0.7.0",
     "anthropic>=0.86.0",
+    "dspy-ai>=2.5",
 ]
 
 [tool.pytest.ini_options]

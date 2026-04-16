@@ -111,6 +111,7 @@ from connectrpc.errors import ConnectError
 
 from agent import run_agent
 from agent.classifier import ModelRouter
+from agent.dspy_examples import record_example as _record_dspy_example
 
 BITGN_URL = os.getenv("BENCHMARK_HOST") or "https://api.bitgn.com"
 BENCHMARK_ID = os.getenv("BENCHMARK_ID") or "bitgn/pac1-dev"
@@ -212,6 +213,14 @@ def _run_single_task(trial_id: str, task_filter: list, router: ModelRouter) -> t
         result = client.end_trial(EndTrialRequest(trial_id=trial.trial_id))
         score = result.score
         detail = list(result.score_detail)
+        # Variant 4: record (task, addendum, score) for DSPy COPRO optimisation
+        if token_stats.get("builder_used") and token_stats.get("builder_addendum"):
+            _record_dspy_example(
+                task_text=trial.instruction,
+                task_type=token_stats.get("task_type", "default"),
+                addendum=token_stats["builder_addendum"],
+                score=float(score),
+            )
         style = CLI_GREEN if score == 1 else CLI_RED
         in_t   = token_stats.get("input_tokens", 0)
         out_t  = token_stats.get("output_tokens", 0)

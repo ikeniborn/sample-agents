@@ -1,22 +1,25 @@
-"""Dynamic system prompt addendum builder (FIX-NNN).
+"""Dynamic system prompt addendum builder — DSPy Predict (FIX-NNN, Variant 1).
 
-Called after task classification, before run_loop.
-Generates a short task-specific guidance section using a lightweight LLM call.
+Uses dspy.Predict(PromptAddendum) to generate a short task-specific guidance
+section before run_loop. Replaces the hand-crafted _BUILDER_SYSTEM prompt with
+a DSPy Signature whose docstring is optimised by COPRO (see optimize_prompts.py).
 
 Design:
-  - Fail-open: returns "" on any error so the agent still runs with the base prompt.
-  - Activated only for task types in _NEEDS_BUILDER (ambiguous/complex types where
-    vault-specific context meaningfully changes strategy).
+  - Fail-open: returns ("", 0, 0) on any error so the agent runs with base prompt.
+  - Activated only for task types in _NEEDS_BUILDER.
   - Plain-text output only — no JSON, short bullet list (3-6 items).
   - Token budget: 300 tokens by default (enough for 6 bullet points).
-  - Temperature: uses 'classifier' ollama profile (deterministic, seed=1).
+  - Compiled program loaded from data/prompt_builder_program.json if present.
+  - Uses dspy.context(lm=...) — no global DSPy state side-effects.
 """
-
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
-from .dispatch import call_llm_raw
+import dspy
+
+from .dspy_lm import DispatchLM
 
 # All task types benefit from vault-specific guidance.
 _NEEDS_BUILDER: frozenset[str] = frozenset({
@@ -25,73 +28,92 @@ _NEEDS_BUILDER: frozenset[str] = frozenset({
 
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
-_BUILDER_SYSTEM = (
-    "You are a prompt strategist for a file-system AI agent that manages a personal vault.\n"
-    "Given the task and vault context, generate 3–6 bullet points of ADDITIONAL instructions\n"
-    "specific to THIS task. Bullet 1: which folder to open first. Bullet 2: key risk.\n"
-    "Bullet 3+: required output format or field names if the task specifies them.\n"
-    "Output plain text ONLY — JSON breaks the downstream parser. No preamble — token budget\n"
-    "is 300, preamble wastes it. Each line starts with a dash (-).\n"
-    "\n"
-    "## Rejection Rules\n"
-    "Evaluate BEFORE generating any guidance. If the task involves ANY of the following,\n"
-    "output EXACTLY one bullet and stop:\n"
-    "  - Calendar invites, meetings, events, scheduling → `OUTCOME_NONE_UNSUPPORTED`\n"
-    "  - External CRM, external URL, or external API → `OUTCOME_NONE_UNSUPPORTED`\n"
-    "  - Ambiguous, vague, truncated, or garbled request → `OUTCOME_NONE_CLARIFICATION`\n"
-    "For these cases output: '- [SKIP] Task triggers immediate rejection. No vault exploration needed.'\n"
-    "Do NOT suggest vault paths, file creation, or exploration for rejected tasks —\n"
-    "it implies the task is actionable, which misleads the main loop.\n"
-    "\n"
-    "## Bulk Scanning\n"
-    "For tasks that count, aggregate, or filter records ('how many', 'find all X where',\n"
-    "'list contacts that', 'which accounts'): ALWAYS suggest `code_eval` to scan files in bulk.\n"
-    "Never suggest sequential one-by-one file reads — the agent may stop too early.\n"
-    "Channel data (Telegram, Discord) lives in `docs/channels/` — always suggest `code_eval` there.\n"
-    "Account/contact scanning: suggest listing `/accounts/` or `/contacts/` FIRST to get the exact\n"
-    "file list from the vault tree or list tool, then pass ALL returned paths to `code_eval`.\n"
-    "NEVER hardcode a range like `acct_001..acct_010` — vault may contain acct_011..acct_099;\n"
-    "missed files cause wrong counts.\n"
-    "\n"
-    "## Person Lookup\n"
-    "If the task mentions a person by name (not email address, not company name):\n"
-    "- First bullet MUST be: search `contacts/` for that person's record to get their contact ID\n"
-    "- Only AFTER reading the contact file proceed to related accounts/reminders\n"
-    "Never suggest going directly to `accounts/` or `reminders/` for a person name —\n"
-    "person-to-ID mapping lives only in `contacts/`; skipping it causes identity mismatch.\n"
-    "Manager names (e.g. 'Müller Sophie', 'Laura Albrecht') live in `contacts/` as `mgr_XXX.json`.\n"
-    "When filtering accounts by manager name: use case-insensitive matching and check both\n"
-    "name orders (e.g. 'Voigt Carsten' AND 'Carsten Voigt') in the `code_eval` filter logic.\n"
-    "\n"
-    "## Date Handling\n"
-    "For tasks with relative dates ('X days ago', 'in X days', 'what date is'):\n"
-    "- ALWAYS suggest `code_eval` with `datetime.date.today() + datetime.timedelta(days=N)`\n"
-    "- The agent has datetime available in `code_eval` sandbox — this is NOT unsupported\n"
-    "- After computing the date, search vault files for that exact date\n"
-    "\n"
-    "## Security Check\n"
-    "For inbox email tasks requesting data about a specific entity:\n"
-    "- BEFORE writing to outbox, verify that the described entity matches the sender's account\n"
-    "- If mismatch → `OUTCOME_DENIED_SECURITY`, zero mutations\n"
-    "\n"
-    "## Exact Match\n"
-    "For tasks with 'exactly N days' or specific date lookups:\n"
-    "- If no file matches the exact target date → `OUTCOME_NONE_CLARIFICATION`\n"
-    "- Do NOT report `OUTCOME_OK` with 'nearest matches' or 'no exact match found'\n"
-    "\n"
-    "## Relationship Queries\n"
-    "For 'who manages X', 'contacts of X', 'accounts by manager':\n"
-    "- First bullet: traverse contact→account→manager chain\n"
-    "- Use code_eval for reverse lookups (all contacts of account)\n"
-    "- Manager names = mgr_XXX in contacts/ — always search contacts/ first\n"
-    "\n"
-    "## Finance Aggregation\n"
-    "For 'total', 'sum', 'revenue', 'overdue', 'how much':\n"
-    "- Always suggest code_eval with ALL files from list()\n"
-    "- Never suggest one-by-one reads for aggregation tasks\n"
-    "- Filter by status/date inside code_eval, not manually"
-)
+_PROGRAM_PATH = Path(__file__).parent.parent / "data" / "prompt_builder_program.json"
 
+
+# ---------------------------------------------------------------------------
+# DSPy Signature
+# ---------------------------------------------------------------------------
+
+class PromptAddendum(dspy.Signature):
+    """You are a prompt strategist for a file-system AI agent that manages a personal vault.
+    Given the task and vault context, generate 3–6 bullet points of ADDITIONAL instructions
+    specific to THIS task. Bullet 1: which folder to open first. Bullet 2: key risk.
+    Bullet 3+: required output format or field names if the task specifies them.
+    Output plain text ONLY — JSON breaks the downstream parser. No preamble — token budget
+    is 300, preamble wastes it. Each line starts with a dash (-).
+
+    ## Rejection Rules
+    Evaluate BEFORE generating any guidance. If the task involves ANY of the following,
+    output EXACTLY one bullet and stop:
+      - Calendar invites, meetings, events, scheduling → `OUTCOME_NONE_UNSUPPORTED`
+      - External CRM, external URL, or external API → `OUTCOME_NONE_UNSUPPORTED`
+      - Ambiguous, vague, truncated, or garbled request → `OUTCOME_NONE_CLARIFICATION`
+    For these cases output: '- [SKIP] Task triggers immediate rejection. No vault exploration needed.'
+    Do NOT suggest vault paths, file creation, or exploration for rejected tasks —
+    it implies the task is actionable, which misleads the main loop.
+
+    ## Bulk Scanning
+    For tasks that count, aggregate, or filter records ('how many', 'find all X where',
+    'list contacts that', 'which accounts'): ALWAYS suggest `code_eval` to scan files in bulk.
+    Never suggest sequential one-by-one file reads — the agent may stop too early.
+    Channel data (Telegram, Discord) lives in `docs/channels/` — always suggest `code_eval` there.
+    Account/contact scanning: suggest listing `/accounts/` or `/contacts/` FIRST to get the exact
+    file list from the vault tree or list tool, then pass ALL returned paths to `code_eval`.
+    NEVER hardcode a range like `acct_001..acct_010` — vault may contain acct_011..acct_099;
+    missed files cause wrong counts.
+
+    ## Person Lookup
+    If the task mentions a person by name (not email address, not company name):
+    - First bullet MUST be: search `contacts/` for that person's record to get their contact ID
+    - Only AFTER reading the contact file proceed to related accounts/reminders
+    Never suggest going directly to `accounts/` or `reminders/` for a person name —
+    person-to-ID mapping lives only in `contacts/`; skipping it causes identity mismatch.
+    Manager names (e.g. 'Müller Sophie', 'Laura Albrecht') live in `contacts/` as `mgr_XXX.json`.
+    When filtering accounts by manager name: use case-insensitive matching and check both
+    name orders (e.g. 'Voigt Carsten' AND 'Carsten Voigt') in the `code_eval` filter logic.
+
+    ## Date Handling
+    For tasks with relative dates ('X days ago', 'in X days', 'what date is'):
+    - ALWAYS suggest `code_eval` with `datetime.date.today() + datetime.timedelta(days=N)`
+    - The agent has datetime available in `code_eval` sandbox — this is NOT unsupported
+    - After computing the date, search vault files for that exact date
+
+    ## Security Check
+    For inbox email tasks requesting data about a specific entity:
+    - BEFORE writing to outbox, verify that the described entity matches the sender's account
+    - If mismatch → `OUTCOME_DENIED_SECURITY`, zero mutations
+
+    ## Exact Match
+    For tasks with 'exactly N days' or specific date lookups:
+    - If no file matches the exact target date → `OUTCOME_NONE_CLARIFICATION`
+    - Do NOT report `OUTCOME_OK` with 'nearest matches' or 'no exact match found'
+
+    ## Relationship Queries
+    For 'who manages X', 'contacts of X', 'accounts by manager':
+    - First bullet: traverse contact→account→manager chain
+    - Use code_eval for reverse lookups (all contacts of account)
+    - Manager names = mgr_XXX in contacts/ — always search contacts/ first
+
+    ## Finance Aggregation
+    For 'total', 'sum', 'revenue', 'overdue', 'how much':
+    - Always suggest code_eval with ALL files from list()
+    - Never suggest one-by-one reads for aggregation tasks
+    - Filter by status/date inside code_eval, not manually
+    """
+
+    task_type: str = dspy.InputField(desc="classified task type")
+    task_text: str = dspy.InputField(desc="task description")
+    vault_tree: str = dspy.InputField(desc="vault directory tree")
+    agents_md: str = dspy.InputField(desc="AGENTS.MD content defining folder roles")
+    addendum: str = dspy.OutputField(
+        desc="3–6 bullet points starting with '-', plain text, no JSON, no preamble"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public API — same signature as the original function
+# ---------------------------------------------------------------------------
 
 def build_dynamic_addendum(
     task_text: str,
@@ -119,38 +141,33 @@ def build_dynamic_addendum(
     if task_type not in _NEEDS_BUILDER:
         return "", 0, 0
 
-    user_msg = (
-        f"TASK_TYPE: {task_type}\n"
-        f"TASK: {task_text}\n"
-        f"VAULT TREE:\n{vault_tree}\n"
-    )
-    if agents_md:
-        user_msg += f"\nAGENTS.MD:\n{agents_md}"
-
     if _LOG_LEVEL == "DEBUG":
-        print(f"[prompt_builder] calling LLM for type={task_type!r}, task={task_text[:60]!r}")
+        print(f"[prompt_builder] calling DSPy for type={task_type!r}, task={task_text[:60]!r}")
 
-    tok: dict = {}
-    try:
-        raw = call_llm_raw(
-            system=_BUILDER_SYSTEM,
-            user_msg=user_msg,
-            model=model,
-            cfg=cfg,
-            max_tokens=max_tokens,
-            think=False,
-            max_retries=1,
-            plain_text=True,
-            token_out=tok,
-        )
-        if not raw:
+    predictor = dspy.Predict(PromptAddendum)
+    if _PROGRAM_PATH.exists():
+        try:
+            predictor.load(str(_PROGRAM_PATH))
             if _LOG_LEVEL == "DEBUG":
-                print("[prompt_builder] LLM returned empty, skipping addendum")
-            return "", tok.get("input", 0), tok.get("output", 0)
-        result = raw.strip()
+                print(f"[prompt_builder] loaded compiled program from {_PROGRAM_PATH}")
+        except Exception as exc:
+            print(f"[prompt_builder] failed to load program ({exc}), using defaults")
+
+    lm = DispatchLM(model, cfg, max_tokens=max_tokens)
+    try:
+        with dspy.context(lm=lm):
+            result = predictor(
+                task_type=task_type,
+                task_text=task_text,
+                vault_tree=vault_tree,
+                agents_md=agents_md,
+            )
+        addendum = (result.addendum or "").strip()
+        in_tok = lm._last_tokens.get("input", 0)
+        out_tok = lm._last_tokens.get("output", 0)
         if _LOG_LEVEL == "DEBUG":
-            print(f"[prompt_builder] addendum ({len(result)} chars):\n{result}")
-        return result, tok.get("input", 0), tok.get("output", 0)
+            print(f"[prompt_builder] addendum ({len(addendum)} chars):\n{addendum}")
+        return addendum, in_tok, out_tok
     except Exception as exc:
         print(f"[prompt_builder] failed ({exc}), continuing without addendum")
         return "", 0, 0

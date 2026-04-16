@@ -3,51 +3,19 @@ import sys
 import types
 from unittest.mock import MagicMock
 
-# Stub out heavy external modules before any agent imports
+# Stub out heavy external modules before any agent imports.
+# pydantic, annotated_types, and openai are real installed dependencies — NOT mocked.
+# openai must NOT be mocked: dspy → litellm → openai._models imports it at module level.
 _STUB_MODULES = [
     "google", "google.protobuf", "google.protobuf.json_format",
     "connectrpc", "connectrpc.errors",
-    "anthropic", "openai", "pydantic", "annotated_types",
+    "anthropic",
     "bitgn", "bitgn.vm", "bitgn.vm.pcm_connect", "bitgn.vm.pcm_pb2",
 ]
 
 for mod_name in _STUB_MODULES:
     if mod_name not in sys.modules:
         sys.modules[mod_name] = MagicMock()
-
-# Provide annotated_types stubs
-_at = sys.modules["annotated_types"]
-_at.Ge = lambda x: None
-_at.Le = lambda x: None
-_at.MaxLen = lambda x: None
-_at.MinLen = lambda x: None
-
-# Provide minimal Pydantic BaseModel so models.py can define its classes.
-# Supports keyword-arg construction and model_validate() needed by evaluator.py.
-import json as _json
-
-def _base_model_init(self, **kwargs):
-    for k, v in kwargs.items():
-        setattr(self, k, v)
-
-def _base_model_validate(cls, data: dict):
-    obj = cls.__new__(cls)
-    for k, v in data.items():
-        setattr(obj, k, v)
-    return obj
-
-def _base_model_validate_json(cls, s: str):
-    return cls.model_validate(_json.loads(s))
-
-_pydantic = sys.modules["pydantic"]
-_pydantic.BaseModel = type("BaseModel", (), {
-    "__init_subclass__": classmethod(lambda cls, **kw: None),
-    "__init__": _base_model_init,
-    "model_validate": classmethod(_base_model_validate),
-    "model_validate_json": classmethod(_base_model_validate_json),
-})
-_pydantic.Field = lambda *a, **kw: None
-_pydantic.field_validator = lambda *a, **kw: lambda fn: fn
 
 # Provide Outcome enum stub
 _pcm_pb2 = sys.modules["bitgn.vm.pcm_pb2"]
@@ -61,9 +29,6 @@ _pcm_pb2.Outcome = types.SimpleNamespace(
 _pcm_pb2.AnswerRequest = MagicMock
 _pcm_pb2.ListRequest = MagicMock
 _pcm_pb2.ReadRequest = MagicMock
-
-# Provide ValidationError stub
-_pydantic.ValidationError = type("ValidationError", (Exception,), {})
 
 # Provide MessageToDict stub
 sys.modules["google.protobuf.json_format"].MessageToDict = lambda x: {}
