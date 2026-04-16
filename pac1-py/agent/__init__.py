@@ -90,5 +90,7 @@ def run_agent(router: ModelRouter, harness_url: str, task_text: str) -> dict:
     stats["builder_used"] = bool(addendum)
     stats["builder_in_tok"] = builder_in_tok
     stats["builder_out_tok"] = builder_out_tok
-    stats["builder_addendum"] = addendum  # captured for dspy_examples.record_example()
+    stats["builder_addendum"] = addendum        # captured for dspy_examples.record_example()
+    stats["builder_vault_tree"] = pre.vault_tree_text   # for COPRO vault-specific optimisation
+    stats["builder_agents_md"] = pre.agents_md_content  # for COPRO vault-specific optimisation
     return stats

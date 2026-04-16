@@ -192,6 +192,8 @@ class _LoopState:
     _inbox_cross_account_detected: bool = False
     # FIX-276: email inbox flag — From: header without Channel: header
     _inbox_is_email: bool = False
+    # DSPy Variant 4: last evaluator call inputs for example collection
+    eval_last_call: dict = field(default_factory=dict)
     # FIX-251: pre-write JSON snapshot for unicode fidelity check
     _pre_write_snapshot: dict | None = None
     # FIX-259: format-gate fired flag — hard-enforces CLARIFICATION outcome + evaluator bypass
@@ -777,6 +779,7 @@ def _st_to_result(st: _LoopState) -> dict:
         "evaluator_calls": st.evaluator_call_count,  # FIX-218
         "evaluator_rejections": st.eval_rejections,
         "evaluator_ms": st.evaluator_total_ms,
+        "eval_last_call": st.eval_last_call or None,  # DSPy Variant 4
     }
 
 
@@ -1967,9 +1970,10 @@ def _run_step(
                 if _sf.kind == "read" and "inbox/" in _sf.path:
                     _inbox_evidence = f"file={_sf.path} content={_sf.summary}"
         _eval_start = time.time()
+        _eval_done_ops = _filter_superseded_ops(st.done_ops)
         verdict = evaluate_completion(
             task_text=st.task_text, task_type=task_type,
-            report=job.function, done_ops=_filter_superseded_ops(st.done_ops),  # FIX-223
+            report=job.function, done_ops=_eval_done_ops,  # FIX-223
             digest_str=_digest,
             model=st.evaluator_model, cfg=st.evaluator_cfg,
             skepticism=_EVAL_SKEPTICISM, efficiency=_EVAL_EFFICIENCY,
@@ -1980,6 +1984,22 @@ def _run_step(
         st.evaluator_call_count += 1
         st.evaluator_total_ms += _eval_ms
         st.llm_call_count += 1
+        # DSPy Variant 4: capture call inputs for example collection in main.py
+        _steps_list = getattr(job.function, "completed_steps_laconic", []) or []
+        _steps_str = "\n".join(f"- {s}" for s in _steps_list)
+        if _acct_evidence:
+            _steps_str += f"\n[ACCOUNT_DATA] {_acct_evidence}"
+        if _inbox_evidence:
+            _steps_str += f"\n[INBOX_MESSAGE] {_inbox_evidence}"
+        st.eval_last_call = {
+            "task_text": st.task_text,
+            "task_type": task_type,
+            "proposed_outcome": getattr(job.function, "outcome", ""),
+            "agent_message": getattr(job.function, "message", ""),
+            "done_ops": "\n".join(f"- {op}" for op in _eval_done_ops) or "(none)",
+            "completed_steps": _steps_str or "(none)",
+            "skepticism_level": _EVAL_SKEPTICISM,
+        }
         _tracer.emit("evaluator_call", st.step_count, {
             "approved": verdict.approved,
             "issues": verdict.issues if verdict.issues else [],

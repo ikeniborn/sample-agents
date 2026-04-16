@@ -49,12 +49,33 @@ import dspy
 from dspy.teleprompt import COPRO
 
 from agent.dspy_lm import DispatchLM
-from agent.dspy_examples import get_trainset
+from agent.dspy_examples import get_trainset, get_eval_trainset
 from agent.prompt_builder import PromptAddendum
 from agent.evaluator import EvaluateCompletion
 
 _BUILDER_PROGRAM_PATH = _BASE / "data" / "prompt_builder_program.json"
 _EVAL_PROGRAM_PATH = _BASE / "data" / "evaluator_program.json"
+
+# ---------------------------------------------------------------------------
+# COPRO hyper-parameters — overridable via env
+# ---------------------------------------------------------------------------
+
+def _int_env(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+def _float_env(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+_COPRO_BREADTH     = _int_env("COPRO_BREADTH", 4)
+_COPRO_DEPTH       = _int_env("COPRO_DEPTH", 2)
+_COPRO_TEMPERATURE = _float_env("COPRO_TEMPERATURE", 0.9)
+_COPRO_THREADS     = _int_env("COPRO_THREADS", 1)
 
 
 # ---------------------------------------------------------------------------
@@ -131,7 +152,13 @@ def _evaluator_metric(example: dspy.Example, prediction, _trace=None) -> float:
 # ---------------------------------------------------------------------------
 
 def _builder_trainset(min_score: float = 0.7) -> list[dspy.Example]:
-    """Build DSPy Examples for prompt_builder optimisation."""
+    """Build DSPy Examples for prompt_builder optimisation.
+
+    vault_tree and agents_md are read from collected examples when present.
+    Examples collected after the vault_tree/agents_md fix include them;
+    older examples fall back to empty strings (COPRO still works, just without
+    vault-specific context).
+    """
     raw = get_trainset(min_score=min_score)
     examples = []
     for ex in raw:
@@ -139,8 +166,8 @@ def _builder_trainset(min_score: float = 0.7) -> list[dspy.Example]:
             dspy.Example(
                 task_type=ex.get("task_type", "default"),
                 task_text=ex.get("task_text", ""),
-                vault_tree="",   # not available in collected examples; builder adapts
-                agents_md="",
+                vault_tree=ex.get("vault_tree", ""),
+                agents_md=ex.get("agents_md", ""),
                 addendum=ex.get("addendum", ""),
                 score=ex.get("score", 1.0),
             ).with_inputs("task_type", "task_text", "vault_tree", "agents_md")
@@ -149,14 +176,37 @@ def _builder_trainset(min_score: float = 0.7) -> list[dspy.Example]:
 
 
 def _evaluator_trainset() -> list[dspy.Example]:
-    """Build DSPy Examples for evaluator optimisation from synthetic data.
+    """Build DSPy Examples for evaluator optimisation.
 
-    A minimal evaluator dataset: approved + rejected cases derived from
-    synthetic examples. Real evaluator labelling requires manual annotation
-    and is outside the scope of automatic collection.
+    Uses real examples from data/dspy_eval_examples.jsonl if ≥ EVAL_THRESHOLD
+    are available (collected automatically by main.py runs).
+    Falls back to 4 hardcoded bootstrap examples otherwise.
+
+    Ground truth: expected_approved_str = "yes" if score == 1.0 else "no".
     """
-    # Approved examples (agent completed task correctly)
-    approved_cases = [
+    real = get_eval_trainset()
+    if real:
+        print(f"[optimize] Evaluator trainset: {len(real)} real examples from data/dspy_eval_examples.jsonl")
+        return [
+            dspy.Example(
+                task_text=ex["task_text"],
+                task_type=ex["task_type"],
+                proposed_outcome=ex["proposed_outcome"],
+                agent_message=ex["agent_message"],
+                done_ops=ex["done_ops"],
+                completed_steps=ex["completed_steps"],
+                skepticism_level=ex["skepticism_level"],
+                approved_str=ex["expected_approved_str"],
+                issues_str="",
+                correction_hint="",
+            ).with_inputs("task_text", "task_type", "proposed_outcome", "agent_message",
+                          "done_ops", "completed_steps", "skepticism_level")
+            for ex in real
+        ]
+
+    print("[optimize] Evaluator: using hardcoded bootstrap examples (run main.py to collect real ones)")
+    # Bootstrap fallback: 2 approved + 2 rejected
+    return [
         dspy.Example(
             task_text="Send an email to John Smith about the project update",
             task_type="email",
@@ -183,9 +233,6 @@ def _evaluator_trainset() -> list[dspy.Example]:
             correction_hint="",
         ).with_inputs("task_text", "task_type", "proposed_outcome", "agent_message",
                       "done_ops", "completed_steps", "skepticism_level"),
-    ]
-    # Rejected examples (agent outcome incorrect)
-    rejected_cases = [
         dspy.Example(
             task_text="Delete all processed items from the archive folder",
             task_type="longContext",
@@ -213,7 +260,6 @@ def _evaluator_trainset() -> list[dspy.Example]:
         ).with_inputs("task_text", "task_type", "proposed_outcome", "agent_message",
                       "done_ops", "completed_steps", "skepticism_level"),
     ]
-    return approved_cases + rejected_cases
 
 
 # ---------------------------------------------------------------------------
@@ -234,12 +280,17 @@ def optimize_builder(model: str, cfg: dict, min_score: float = 0.8) -> None:
     dspy.configure(lm=lm)
 
     program = dspy.Predict(PromptAddendum)
-    teleprompter = COPRO(metric=_builder_metric, breadth=4, depth=2, init_temperature=0.9)
+    teleprompter = COPRO(
+        metric=_builder_metric,
+        breadth=_COPRO_BREADTH,
+        depth=_COPRO_DEPTH,
+        init_temperature=_COPRO_TEMPERATURE,
+    )
 
     compiled = teleprompter.compile(
         program,
         trainset=trainset,
-        eval_kwargs={"num_threads": 1, "display_progress": True, "display_table": 0},
+        eval_kwargs={"num_threads": _COPRO_THREADS, "display_progress": True, "display_table": 0},
     )
 
     _BUILDER_PROGRAM_PATH.parent.mkdir(exist_ok=True)
@@ -257,12 +308,17 @@ def optimize_evaluator(model: str, cfg: dict) -> None:
     dspy.configure(lm=lm)
 
     program = dspy.ChainOfThought(EvaluateCompletion)
-    teleprompter = COPRO(metric=_evaluator_metric, breadth=4, depth=2, init_temperature=0.9)
+    teleprompter = COPRO(
+        metric=_evaluator_metric,
+        breadth=_COPRO_BREADTH,
+        depth=_COPRO_DEPTH,
+        init_temperature=_COPRO_TEMPERATURE,
+    )
 
     compiled = teleprompter.compile(
         program,
         trainset=trainset,
-        eval_kwargs={"num_threads": 1, "display_progress": True, "display_table": 0},
+        eval_kwargs={"num_threads": _COPRO_THREADS, "display_progress": True, "display_table": 0},
     )
 
     _EVAL_PROGRAM_PATH.parent.mkdir(exist_ok=True)
