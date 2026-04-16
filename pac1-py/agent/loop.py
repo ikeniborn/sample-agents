@@ -47,8 +47,8 @@ _ROUTER_FALLBACK_RAW = os.environ.get("ROUTER_FALLBACK", "CLARIFY").upper()
 _ROUTER_FALLBACK = _ROUTER_FALLBACK_RAW if _ROUTER_FALLBACK_RAW in ("CLARIFY", "EXECUTE") else "CLARIFY"  # FIX-204
 _ROUTER_MAX_RETRIES = int(os.environ.get("ROUTER_MAX_RETRIES", "2"))  # FIX-219
 
-# FIX-218: Evaluator/critic configuration
-_EVALUATOR_ENABLED = os.environ.get("EVALUATOR_ENABLED", "0") == "1"
+# FIX-218: Evaluator/critic configuration — enabled by default; override with EVALUATOR_ENABLED=0
+_EVALUATOR_ENABLED = os.environ.get("EVALUATOR_ENABLED", "1") == "1"
 _EVAL_SKEPTICISM = os.environ.get("EVAL_SKEPTICISM", "mid").lower()
 if _EVAL_SKEPTICISM not in ("low", "mid", "high"):
     _EVAL_SKEPTICISM = "mid"

@@ -112,8 +112,8 @@ Resets on any successful write/delete/move/mkdir.
 - `longContext` → core + delete workflow
 - `default` → full prompt (all blocks, safe fallback)
 
-Optional LLM addendum via `prompt_builder.py` (`PROMPT_BUILDER_ENABLED=1`):
-activated for `default`/`think`/`longContext` types only.
+LLM addendum via `prompt_builder.py` (enabled by default, `PROMPT_BUILDER_ENABLED=0` to disable):
+activated for all task types.
 
 **Discovery-first**: zero hardcoded vault paths. Agent discovers folder roles from:
 1. Pre-loaded AGENTS.MD (from prephase)
@@ -151,12 +151,12 @@ Key env vars:
 - `OLLAMA_BASE_URL`, `OLLAMA_MODEL` — local Ollama overrides
 - `LOG_LEVEL` — logging verbosity: `INFO` (default) or `DEBUG` (logs full think blocks + full RAW)
 - `MODEL_EVALUATOR` — model for evaluator/critic (default: `MODEL_DEFAULT`)
-- `EVALUATOR_ENABLED` — enable evaluator: `1` = on, `0` = off (default: `0`)
+- `EVALUATOR_ENABLED` — enable evaluator: `1` = on, `0` = off (default: `1`)
 - `EVAL_SKEPTICISM` — evaluator strictness: `low`, `mid` (default), `high`
 - `EVAL_EFFICIENCY` — evaluator context depth: `low`, `mid` (default), `high`
 - `EVAL_MAX_REJECTIONS` — max evaluator rejections before forced approval (default: `2`)
 - `ROUTER_MAX_RETRIES` — max retry attempts for router empty response (default: `2`)
-- `PROMPT_BUILDER_ENABLED` — enable dynamic prompt addendum: `1` = on, `0` = off (default: `0`)
+- `PROMPT_BUILDER_ENABLED` — enable dynamic prompt addendum: `1` = on, `0` = off (default: `1`)
 - `MODEL_PROMPT_BUILDER` — model for prompt builder (default: uses `MODEL_CLASSIFIER`)
 - `PROMPT_BUILDER_MAX_TOKENS` — token budget for addendum (default: `300`)
 

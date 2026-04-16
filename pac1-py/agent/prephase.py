@@ -115,10 +115,21 @@ def run_prephase(
         tree_txt = f"(tree failed: {e})"
         print(f"{CLI_YELLOW}failed: {e}{CLI_CLR}")
 
-    # Step 2: read AGENTS.MD — source of truth for vault semantics and folder roles
+    # Step 2: read AGENTS.MD — source of truth for vault semantics and folder roles.
+    # Discovery-first: check standard root paths, then scan first-level dirs from tree.
+    # No vault-specific paths hardcoded — works for any vault layout.
     agents_md_content = ""
     agents_md_path = ""
-    for candidate in ["/AGENTS.MD", "/AGENTS.md", "/02_distill/AGENTS.md"]:
+    # Standard candidates (root-level, case variants)
+    _agents_md_standard = ["/AGENTS.MD", "/AGENTS.md"]
+    # Dynamic candidates: first-level directories from tree (e.g. /docs/AGENTS.md, /02_notes/AGENTS.md)
+    _agents_md_dynamic: list[str] = []
+    if tree_result is not None:
+        for _entry in tree_result.root.children:
+            if _entry.children:  # directory
+                for _variant in ("AGENTS.MD", "AGENTS.md"):
+                    _agents_md_dynamic.append(f"/{_entry.name}/{_variant}")
+    for candidate in _agents_md_standard + _agents_md_dynamic:
         try:
             r = vm.read(ReadRequest(path=candidate))
             if r.content:
