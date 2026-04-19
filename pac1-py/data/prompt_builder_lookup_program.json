@@ -1,0 +1,38 @@
+{
+  "traces": [],
+  "train": [],
+  "demos": [],
+  "signature": {
+    "instructions": "REJECTION GATE (check first): If task involves calendar/events, external CRM/API/URL, or is ambiguous/garbled, output EXACTLY:\n- [SKIP] Task triggers immediate rejection. No vault exploration needed.\nThen STOP. Do not suggest any vault paths.\n\nFor valid tasks, generate 3–6 bullets (- prefix, no preamble, 300 token max):\n- Bullet 1: Entry folder (contacts/ for person names; docs/channels/ for Telegram/Discord; list /accounts/ or /contacts/ first for bulk scans)\n- Bullet 2: Critical constraint (security verification, exact match requirement, date calculation, or key risk)\n- Bullets 3+: Output format, filename rules, field names, or specific tool parameters\n\nMANDATORY PATTERNS:\n- Person names: ALWAYS search contacts/ first to get contact ID before accounts/reminders. Managers = mgr_XXX.json in contacts/.\n- Bulk operations: Use code_eval with ALL files from list(). Never hardcode ranges (e.g., acct_001..010). Never read sequentially for counts/filters.\n- Date math: Use code_eval(datetime.date.today() ± timedelta(days=N)) for relative dates, then search exact computed date. No matches → OUTCOME_NONE_CLARIFICATION.\n- Security: For inbox email tasks, verify entity matches sender before writing to outbox. Mismatch → OUTCOME_DENIED_SECURITY.\n- Outbox naming: Use code_eval(datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%SZ')) for filename timestamp. For batch/NORA tasks, use inbox task's received_at as queue_batch_timestamp.\n- Relationships: Traverse contact→account→manager. Use code_eval for reverse lookups with case-insensitive matching (check both \"First Last\" and \"Last First\").\n- Finance: Always code_eval across complete file sets for sums/aggregations.",
+    "fields": [
+      {
+        "prefix": "Task Type:",
+        "description": "classified task type"
+      },
+      {
+        "prefix": "Task Text:",
+        "description": "task description"
+      },
+      {
+        "prefix": "Vault Tree:",
+        "description": "vault directory tree"
+      },
+      {
+        "prefix": "Agents Md:",
+        "description": "AGENTS.MD content defining folder roles"
+      },
+      {
+        "prefix": "-",
+        "description": "3–6 bullet points starting with '-', plain text, no JSON, no preamble"
+      }
+    ]
+  },
+  "lm": null,
+  "metadata": {
+    "dependency_versions": {
+      "python": "3.12",
+      "dspy": "3.1.3",
+      "cloudpickle": "3.1"
+    }
+  }
+}

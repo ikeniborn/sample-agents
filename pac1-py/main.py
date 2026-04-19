@@ -129,7 +129,9 @@ _profiles: dict[str, dict] = _raw.get("_profiles", {})  # FIX-119: named paramet
 MODEL_CONFIGS: dict[str, dict] = {k: v for k, v in _raw.items() if not k.startswith("_")}
 # FIX-119: resolve profile name references in ollama_options fields (string → dict)
 for _cfg in MODEL_CONFIGS.values():
-    for _fname in ("ollama_options", "ollama_options_think", "ollama_options_longContext", "ollama_options_classifier", "ollama_options_coder", "ollama_options_evaluator"):
+    for _fname in ("ollama_options", "ollama_options_classifier",
+                   "ollama_options_evaluator", "ollama_options_queue", "ollama_options_capture",
+                   "ollama_options_crm", "ollama_options_temporal"):
         if isinstance(_cfg.get(_fname), str):
             _cfg[_fname] = _profiles.get(_cfg[_fname], {})
 
@@ -143,45 +145,100 @@ def _require_env(name: str) -> str:
 
 _model_classifier = _require_env("MODEL_CLASSIFIER")
 _model_default    = _require_env("MODEL_DEFAULT")
-_model_think      = _require_env("MODEL_THINK")
-_model_long_ctx   = _require_env("MODEL_LONG_CONTEXT")
 
-# Unit 8: optional per-type overrides (fall back to default/think if not set)
-_model_email   = os.getenv("MODEL_EMAIL")   or _model_default
-_model_lookup  = os.getenv("MODEL_LOOKUP")  or _model_default
-_model_inbox   = os.getenv("MODEL_INBOX")   or _model_think
-_model_coder   = os.getenv("MODEL_CODER")   or _model_default
-_model_evaluator = os.getenv("MODEL_EVALUATOR") or _model_default  # FIX-218
-_model_prompt_builder = os.getenv("MODEL_PROMPT_BUILDER") or ""  # FIX-NNN: "" = use classifier
+# Optional per-type overrides — fall back to default if not set
+_model_email    = os.getenv("MODEL_EMAIL")    or _model_default
+_model_lookup   = os.getenv("MODEL_LOOKUP")   or _model_default
+_model_inbox    = os.getenv("MODEL_INBOX")    or _model_default
+_model_queue    = os.getenv("MODEL_QUEUE")    or _model_inbox
+_model_capture  = os.getenv("MODEL_CAPTURE")  or _model_default
+_model_crm      = os.getenv("MODEL_CRM")      or _model_default
+_model_temporal = os.getenv("MODEL_TEMPORAL") or _model_lookup
+_model_preject  = os.getenv("MODEL_PREJECT")  or _model_default
+_model_evaluator      = os.getenv("MODEL_EVALUATOR")      or _model_default
+_model_prompt_builder = os.getenv("MODEL_PROMPT_BUILDER") or ""  # "" = use classifier
+_model_codegen        = os.getenv("MODEL_CODEGEN")        or ""  # "" = use task-type model
 
-# FIX-88: always use ModelRouter — classification runs for every task,
-# logs always show [MODEL_ROUTER] lines, stats always show Тип/Модель columns.
 EFFECTIVE_MODEL: ModelRouter = ModelRouter(
     default=_model_default,
-    think=_model_think,
-    long_context=_model_long_ctx,
     classifier=_model_classifier,
     email=_model_email,
     lookup=_model_lookup,
     inbox=_model_inbox,
-    coder=_model_coder,
+    queue=_model_queue,
+    capture=_model_capture,
+    crm=_model_crm,
+    temporal=_model_temporal,
+    preject=_model_preject,
+    codegen=_model_codegen,
     evaluator=_model_evaluator,
     prompt_builder=_model_prompt_builder,
     configs=MODEL_CONFIGS,
 )
 print(
     f"[MODEL_ROUTER] Multi-model mode:\n"
-    f"  classifier      = {_model_classifier}\n"
-    f"  default         = {_model_default}\n"
-    f"  think           = {_model_think}\n"
-    f"  longContext      = {_model_long_ctx}\n"
-    f"  email           = {_model_email}\n"
-    f"  lookup          = {_model_lookup}\n"
-    f"  inbox           = {_model_inbox}\n"
-    f"  coder           = {_model_coder}\n"
-    f"  evaluator       = {_model_evaluator}\n"
-    f"  prompt_builder  = {_model_prompt_builder or '(uses classifier)'}"
+    f"  classifier  = {_model_classifier}\n"
+    f"  default     = {_model_default}\n"
+    f"  email       = {_model_email}\n"
+    f"  lookup      = {_model_lookup}\n"
+    f"  inbox       = {_model_inbox}\n"
+    f"  queue       = {_model_queue}\n"
+    f"  capture     = {_model_capture}\n"
+    f"  crm         = {_model_crm}\n"
+    f"  temporal    = {_model_temporal}\n"
+    f"  preject     = {_model_preject}\n"
+    f"  codegen     = {_model_codegen or '(uses task-type model)'}\n"
+    f"  evaluator   = {_model_evaluator}\n"
+    f"  builder     = {_model_prompt_builder or '(uses classifier)'}"
 )
+
+def _print_run_params() -> None:
+    """Print structured run parameters to main.log for cross-run comparison."""
+    _g = os.getenv
+    sep = "─" * 56
+
+    _base = Path(__file__).parent
+    builder_prog = _base / "data" / "prompt_builder_program.json"
+    eval_prog    = _base / "data" / "evaluator_program.json"
+    builder_status = "[loaded]" if builder_prog.exists() else "[missing]"
+    eval_status    = "[loaded]" if eval_prog.exists() else "[missing]"
+
+    cli_tasks  = " ".join(sys.argv[1:]) or "(all)"
+    tz_val     = _g("TZ", "") or "(system)"
+    eval_on    = _g("EVALUATOR_ENABLED", "1") == "1"
+    pb_on      = _g("PROMPT_BUILDER_ENABLED", "1") == "1"
+
+    print(
+        f"\n[RUN_PARAMS] {'═' * 56}\n"
+        f"  cli_tasks        = {cli_tasks}\n"
+        f"  benchmark_id     = {BENCHMARK_ID}\n"
+        f"  benchmark_host   = {BITGN_URL}\n"
+        f"  run_name         = {_base_run_name or '(not set)'}\n"
+        f"  parallel_tasks   = {_g('PARALLEL_TASKS', '1')}\n"
+        f"  task_timeout_s   = {_g('TASK_TIMEOUT_S', '300')}\n"
+        f"  log_level        = {_g('LOG_LEVEL', 'INFO')}\n"
+        f"  tz               = {tz_val}\n"
+        f"  {sep}\n"
+        f"  router_fallback  = {_g('ROUTER_FALLBACK', 'CLARIFY')}\n"
+        f"  router_retries   = {_g('ROUTER_MAX_RETRIES', '2')}\n"
+        f"  {sep}\n"
+        f"  evaluator        = {'on' if eval_on else 'off'}"
+        f" | skepticism={_g('EVAL_SKEPTICISM', 'mid')}"
+        f" | efficiency={_g('EVAL_EFFICIENCY', 'mid')}"
+        f" | max_rejections={_g('EVAL_MAX_REJECTIONS', '2')}\n"
+        f"  eval_program     = {eval_status}\n"
+        f"  {sep}\n"
+        f"  prompt_builder   = {'on' if pb_on else 'off'}"
+        f" | max_tokens={_g('PROMPT_BUILDER_MAX_TOKENS', '500')}\n"
+        f"  builder_program  = {builder_status}\n"
+        f"  dspy_collect     = {_g('DSPY_COLLECT', '1')}\n"
+        f"  {sep}\n"
+        f"  python           = {sys.version.split()[0]}\n"
+        f"[RUN_PARAMS] {'═' * 56}"
+    )
+
+
+_print_run_params()
 
 CLI_RED = "\x1B[31m"
 CLI_GREEN = "\x1B[32m"

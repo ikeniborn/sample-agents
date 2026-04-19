@@ -12,22 +12,28 @@ def _types():
     return classifier
 
 
-def test_bulk_keywords_longcontext():
+def test_bulk_keywords_default():
     c = _classify()
-    assert c("delete all threads from the vault") == "longContext"
-    assert c("remove all cards and threads") == "longContext"
+    assert c("delete all threads from the vault") == "default"
+    assert c("remove all cards and threads") == "default"
 
 
-def test_three_paths_longcontext():
+def test_three_paths_default():
     c = _classify()
-    assert c("compare /a/x.md /b/y.md /c/z.md") == "longContext"
+    assert c("compare /a/x.md /b/y.md /c/z.md") == "default"
 
 
 def test_inbox_keywords():
     c = _classify()
-    assert c("process the inbox") == "inbox"
     assert c("check inbox for new messages") == "inbox"
-    assert c("handle the inbox") == "inbox"
+    assert c("review the inbox") == "inbox"
+
+
+def test_queue_keywords():
+    c = _classify()
+    assert c("process the inbox") == "queue"
+    assert c("handle the inbox") == "queue"
+    assert c("work through the pending items") == "queue"
 
 
 def test_email_keywords():
@@ -48,10 +54,10 @@ def test_count_query_lookup():
     assert c("count all entries in telegram") == "lookup"
 
 
-def test_think_keywords():
+def test_analyze_routes_default():
     c = _classify()
-    assert c("analyze the trends in the data") == "think"
-    assert c("summarize the main points") == "think"
+    assert c("analyze the trends in the data") == "default"
+    assert c("summarize the main points") == "default"
 
 
 def test_distill_keywords():
@@ -62,7 +68,7 @@ def test_distill_keywords():
 
 def test_default_fallback():
     c = _classify()
-    assert c("reschedule the follow-up by 2 weeks") == "default"
+    assert c("reschedule the follow-up by 2 weeks") == "crm"
     assert c("create an invoice for the order") == "default"
 
 

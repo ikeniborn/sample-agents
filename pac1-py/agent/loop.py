@@ -1729,8 +1729,6 @@ def _run_step(
     model: str,
     cfg: dict,
     task_type: str,
-    coder_model: str,
-    coder_cfg: "dict | None",
     max_tokens: int,
     task_start: float,
     st: _LoopState,
@@ -2012,14 +2010,15 @@ def _run_step(
             print(f"{CLI_RED}[evaluator] REJECTED ({st.eval_rejections}/{_MAX_EVAL_REJECTIONS}): {_issues}{CLI_CLR}")
             st.log.append({"role": "user", "content": (
                 f"[EVALUATOR] Your proposed completion was rejected. Issues: {_issues}. "
-                f"{_hint} Re-evaluate and either fix issues or choose a different outcome."
+                f"Suggested correction: {_hint} "
+                "IMPORTANT: Verify this suggestion independently against vault evidence — "
+                "do NOT change your outcome solely because the evaluator suggested it."
             )})
             return False
         print(f"{CLI_GREEN}[evaluator] APPROVED ({_eval_ms}ms){CLI_CLR}")
 
     try:
-        result = dispatch(vm, job.function,  # FIX-163: pass coder sub-agent params
-                         coder_model=coder_model or model, coder_cfg=coder_cfg or cfg)
+        result = dispatch(vm, job.function)
         # code_eval returns a plain str; all other tools return protobuf messages
         if isinstance(result, str):
             txt = result
@@ -2137,17 +2136,8 @@ def _run_step(
 
 def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
              pre: PrephaseResult, cfg: dict, task_type: str = "default",
-             coder_model: str = "", coder_cfg: "dict | None" = None,
-             evaluator_model: str = "", evaluator_cfg: "dict | None" = None) -> dict:  # FIX-163, FIX-218
-    """Run main agent loop. Returns token usage stats dict.
-
-    task_type: classifier result; drives per-type loop strategies (Unit 8):
-      - lookup: read-only guard — blocks write/delete/move/mkdir
-      - inbox: hints after >1 inbox/ files read to process one message at a time
-      - email: post-write outbox verify via EmailOutbox schema when available
-      - distill: hint to update thread file after writing a card
-    coder_model/coder_cfg: FIX-163 — passed to dispatch() for Req_CodeEval sub-agent calls.
-    """
+             evaluator_model: str = "", evaluator_cfg: "dict | None" = None) -> dict:
+    """Run main agent loop. Returns token usage stats dict."""
     # FIX-195: run_loop() is now a thin orchestrator — logic lives in:
     #   _run_pre_route() — injection detection + semantic routing (pre-loop)
     #   _run_step()      — one iteration of the 30-step loop
@@ -2175,8 +2165,7 @@ def run_loop(vm: PcmRuntimeClientSync, model: str, _task_text: str,
 
     # Main loop — up to 30 steps
     for i in range(30):
-        if _run_step(i, vm, model, cfg, task_type, coder_model, coder_cfg,
-                     max_tokens, task_start, st):
+        if _run_step(i, vm, model, cfg, task_type, max_tokens, task_start, st):
             break
 
     result = _st_to_result(st)

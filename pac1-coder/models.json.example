@@ -1,0 +1,104 @@
+{
+  "_comment": "Model capability configs. Key = model ID (must match MODEL_* env vars). Copy to models.json.",
+  "_fields": {
+    "max_completion_tokens":        "Max tokens the model may generate per step",
+    "thinking_budget":              "Token budget for extended thinking (Anthropic only); omit to disable",
+    "response_format_hint":         "Hint for OpenRouter tier: 'json_object' or 'json_schema'",
+    "ollama_think":                 "Enable <think> blocks for Ollama models that support reasoning",
+    "ollama_options":               "Ollama options for default tasks (string = profile name from _profiles, or inline dict)",
+    "ollama_options_think":         "Ollama options override for TASK_THINK / TASK_DISTILL",
+    "ollama_options_longContext":   "Ollama options override for TASK_LONG_CONTEXT",
+    "ollama_options_classifier":    "Ollama options override for classifier LLM call (temperature=0.0 recommended)",
+    "ollama_options_coder":         "Ollama options override for TASK_CODER / MODEL_CODER (temperature=0.1 recommended)"
+  },
+
+  "_ollama_options_ref": {
+    "_doc": "All keys are optional. Passed as extra_body={options:{...}} to Ollama /v1/chat/completions. Source: https://docs.ollama.com/modelfile",
+
+    "_context": {
+      "num_ctx":     "int    | default: 2048  | Context window size in tokens. Set to 16384+ for long docs/AGENTS.MD",
+      "num_keep":    "int    | default: 0     | Tokens from initial prompt to always keep when context slides"
+    },
+
+    "_sampling": {
+      "temperature": "float  | default: 0.8   | Creativity/randomness. Lower=focused (0.0), higher=creative (1.0+). Use 0.0 for deterministic tasks",
+      "top_k":       "int    | default: 40    | Keep only top-K candidates per step. Lower=safer (10), higher=diverse (100)",
+      "top_p":       "float  | default: 0.9   | Nucleus sampling: cumulative prob cutoff. Works with top_k",
+      "min_p":       "float  | default: 0.0   | Min prob relative to top token. Alternative to top_p",
+      "seed":        "int    | default: 0     | Fixed seed for reproducible outputs (0=random)",
+      "num_predict": "int    | default: -1    | Max output tokens (-1=unlimited). Overrides max_completion_tokens for Ollama"
+    },
+
+    "_repetition": {
+      "repeat_penalty":   "float  | default: 1.1   | Penalise repeated tokens. 1.0=off, 1.1=mild, 1.5=strict",
+      "repeat_last_n":    "int    | default: 64    | How far back to scan for repeats. 0=off, -1=full context",
+      "presence_penalty": "float  | default: 0.0   | Extra penalty if token appeared at all in context",
+      "frequency_penalty":"float  | default: 0.0   | Extra penalty proportional to how often token appeared",
+      "penalize_newline": "bool   | default: true  | Include newline in repetition penalty calculation"
+    },
+
+    "_advanced_sampling": {
+      "tfs_z":       "float  | default: 1.0   | Tail-free sampling: removes low-prob tail. 1.0=off",
+      "typical_p":   "float  | default: 1.0   | Locally typical sampling. 1.0=off",
+      "mirostat":    "int    | default: 0     | Mirostat algo: 0=off, 1=v1, 2=v2 (auto-tunes perplexity)",
+      "mirostat_tau":"float  | default: 5.0   | Mirostat target entropy (higher=diverse)",
+      "mirostat_eta":"float  | default: 0.1   | Mirostat learning rate"
+    },
+
+    "_stop": {
+      "stop": "list[str] | default: []   | Stop sequences — generation halts on first match. Example: [\"\\n\", \"###\"]"
+    },
+
+    "_hardware": {
+      "num_gpu":    "int    | default: auto  | GPU layers to offload. 0=CPU only, -1=all",
+      "main_gpu":   "int    | default: 0     | Primary GPU index for multi-GPU setups",
+      "num_batch":  "int    | default: 512   | Prompt processing batch size (larger=faster, more VRAM)",
+      "num_thread": "int    | default: auto  | CPU threads. 0=auto-detect",
+      "low_vram":   "bool   | default: false | Reduce VRAM at cost of speed",
+      "use_mmap":   "bool   | default: true  | Memory-mapped model files (faster load)",
+      "use_mlock":  "bool   | default: false | Lock model weights in RAM (prevents swapping)",
+      "numa":       "bool   | default: false | NUMA memory optimisation for multi-socket CPUs"
+    },
+
+    "_examples": {
+      "deterministic_classifier": {"temperature": 0.0, "seed": 42, "num_ctx": 16384},
+      "creative_writer":          {"temperature": 1.0, "top_k": 80, "top_p": 0.95, "num_ctx": 8192},
+      "strict_no_repeat":         {"repeat_penalty": 1.3, "repeat_last_n": 128, "num_ctx": 16384},
+      "fast_cpu_only":            {"num_gpu": 0, "num_thread": 8, "num_ctx": 4096}
+    }
+  },
+
+  "_section_ollama_local": "--- Ollama local (OLLAMA_BASE_URL=http://localhost:11434/v1) ---",
+
+  "qwen3.5:0.8b":  {"max_completion_tokens": 2000, "ollama_think": false, "ollama_options": {"num_ctx": 16384}},
+  "qwen3.5:2b":    {"max_completion_tokens": 2000, "ollama_think": false, "ollama_options": {"num_ctx": 16384}},
+  "qwen3.5:4b":    {"max_completion_tokens": 4000, "ollama_think": false, "ollama_options": {"num_ctx": 16384}},
+  "qwen3.5:9b":    {"max_completion_tokens": 4000, "ollama_think": true,  "ollama_options": {"num_ctx": 16384}},
+  "qwen3.5:32b":   {"max_completion_tokens": 4000, "ollama_think": true,  "ollama_options": {"num_ctx": 16384}},
+
+  "llama3.2:3b":   {"max_completion_tokens": 4000, "ollama_think": false, "ollama_options": {"num_ctx": 16384}},
+  "llama3.3:70b":  {"max_completion_tokens": 4000, "ollama_think": false, "ollama_options": {"num_ctx": 16384}},
+
+  "deepseek-r1:7b":  {"max_completion_tokens": 4000, "ollama_think": true, "ollama_options": {"num_ctx": 16384}},
+  "deepseek-r1:14b": {"max_completion_tokens": 4000, "ollama_think": true, "ollama_options": {"num_ctx": 16384}},
+  "deepseek-r1:32b": {"max_completion_tokens": 4000, "ollama_think": true, "ollama_options": {"num_ctx": 16384}},
+
+  "_section_ollama_cloud": "--- Ollama cloud endpoint (OLLAMA_BASE_URL=https://your-cloud/v1) ---",
+  "_note_profiles": "ollama_options_* fields reference named profiles from _profiles in models.json (resolved at startup)",
+
+  "qwen3.5:cloud":            {"max_completion_tokens": 4000, "ollama_think": true,  "ollama_options": "default", "ollama_options_think": "think", "ollama_options_longContext": "long_ctx", "ollama_options_classifier": "classifier", "ollama_options_coder": "coder"},
+  "qwen3.5:397b-cloud":       {"max_completion_tokens": 4000, "ollama_think": true,  "ollama_options": "default", "ollama_options_think": "think", "ollama_options_longContext": "long_ctx", "ollama_options_classifier": "classifier", "ollama_options_coder": "coder"},
+  "deepseek-v3.1:671b-cloud": {"max_completion_tokens": 4000, "ollama_think": false, "ollama_options": "default", "ollama_options_think": "think", "ollama_options_longContext": "long_ctx", "ollama_options_classifier": "classifier", "ollama_options_coder": "coder"},
+  "deepseek-r1:671b-cloud":   {"max_completion_tokens": 4000, "ollama_think": true,  "ollama_options": "default", "ollama_options_think": "think", "ollama_options_longContext": "long_ctx", "ollama_options_classifier": "classifier", "ollama_options_coder": "coder"},
+
+  "_section_openrouter": "--- OpenRouter (OPENROUTER_API_KEY required) ---",
+
+  "qwen/qwen3.5-9b":                   {"max_completion_tokens": 4000, "response_format_hint": "json_object"},
+  "meta-llama/llama-3.3-70b-instruct": {"max_completion_tokens": 4000, "response_format_hint": "json_object"},
+
+  "_section_anthropic": "--- Anthropic (ANTHROPIC_API_KEY required) ---",
+
+  "anthropic/claude-haiku-4.5":  {"max_completion_tokens": 16384, "thinking_budget": 2000, "response_format_hint": "json_object"},
+  "anthropic/claude-sonnet-4.6": {"max_completion_tokens": 16384, "thinking_budget": 4000, "response_format_hint": "json_object"},
+  "anthropic/claude-opus-4.6":   {"max_completion_tokens": 16384, "thinking_budget": 8000, "response_format_hint": "json_object"}
+}

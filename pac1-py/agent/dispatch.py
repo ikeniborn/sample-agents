@@ -71,7 +71,7 @@ _SAFE_BUILTINS = {
 _SAFE_BUILTINS.update({"True": True, "False": False, "None": None})
 
 
-def _execute_code_safe(code: str, context_vars: dict, timeout_s: int = 5) -> str:
+def execute_code_safe(code: str, context_vars: dict, timeout_s: int = 5) -> str:
     """Run model-generated Python 3 code in a restricted sandbox.
 
     Allowed modules: datetime, json, re, math.
@@ -150,71 +150,6 @@ def _extract_code_block(text: str) -> str:
     m = re.search(r"```(?:python)?\s*(.*?)```", text, re.DOTALL)
     return m.group(1).strip() if m else text.strip()
 
-
-_CODER_TIMEOUT_S = 45  # FIX-164: hard cap on coder model call to prevent loop starvation
-
-
-def _call_coder_model(task: str, context_vars: dict, coder_model: str, coder_cfg: dict) -> str:
-    """Call MODEL_CODER with minimal context to generate Python 3 code for task.
-    Only passes task description and available variable names — no main-loop history.
-    Hard timeout: _CODER_TIMEOUT_S seconds (FIX-164)."""
-    import signal as _signal
-
-    _var_names = list(context_vars.keys())
-    system = (
-        "You are a Python 3 code generator for a restricted sandbox. Output ONLY runnable Python code "
-        "— no markdown fences, no explanation.\n"
-        "Sandbox rules:\n"
-        "- Modules available: datetime, json, re, math — use directly, NO import statements\n"
-        "- Builtins available: len, sorted, reversed, max, min, sum, abs, round, any, all, "
-        "filter, map, zip, enumerate, range, list, dict, set, tuple, str, int, float, bool, "
-        "isinstance, hasattr, print, repr, type, True, False, None\n"
-        "- context_vars are injected as GLOBAL VARIABLES — reference them by their exact name\n"
-        "- FORBIDDEN: eval(), exec(), globals(), locals(), open(), __import__, any import statement\n"
-        "- To process multiple variables, put their names in a list literal — do NOT use eval:\n"
-        "    for content in [var1, var2, var3]:  # reference variable names directly\n"
-        "        data = json.loads(content)\n"
-        "- Print the final answer with print()\n"
-        "Example task: find accounts where account_manager == 'Alice'\n"
-        "Example variables: ['accounts__acct_001_json', 'accounts__acct_002_json']\n"
-        "Example output:\n"
-        "results = []\n"
-        "for content in [accounts__acct_001_json, accounts__acct_002_json]:\n"
-        "    d = json.loads(content)\n"
-        "    if d.get('account_manager') == 'Alice':\n"
-        "        results.append(d['name'])\n"
-        "print('\\n'.join(sorted(results)))"
-    )
-    user_msg = f"Task: {task}\nAvailable variables: {_var_names}"
-
-    def _coder_timeout(_sig, _frame):
-        raise TimeoutError(f"coder model timed out after {_CODER_TIMEOUT_S}s")
-
-    # signal.alarm only works in the main thread; skip timeout in worker threads
-    _in_main = threading.current_thread() is threading.main_thread()
-    old_handler = None
-    if _in_main:
-        old_handler = _signal.signal(_signal.SIGALRM, _coder_timeout)
-        _signal.alarm(_CODER_TIMEOUT_S)
-    try:
-        raw = call_llm_raw(
-            system=system,
-            user_msg=user_msg,
-            model=coder_model,
-            cfg=coder_cfg,
-            max_tokens=256,  # FIX-164: short code only — was 512
-            think=False,
-            max_retries=1,   # FIX-164: 1 retry max — was 2 (3 attempts × slow model = starvation)
-            plain_text=True,  # FIX-181: coder must output Python, not JSON
-        )
-        return _extract_code_block(raw or "print('[coder] empty response')")
-    except TimeoutError as _te:
-        print(f"\033[33m[coder] {_te} — returning error stub\033[0m")
-        return "print('[error] coder model timeout')"
-    finally:
-        if _in_main:
-            _signal.alarm(0)
-            _signal.signal(_signal.SIGALRM, old_handler)
 
 
 # ---------------------------------------------------------------------------
@@ -671,8 +606,7 @@ _PROTECTED_PREFIX = ("/docs/channels/",)
 _OTP_PATH = "/docs/channels/otp.txt"
 
 
-def dispatch(vm: PcmRuntimeClientSync, cmd: BaseModel,  # FIX-163: coder sub-agent params
-             coder_model: str = "", coder_cfg: "dict | None" = None):
+def dispatch(vm: PcmRuntimeClientSync, cmd: BaseModel):
     # FIX-205: code-level write scope enforcement
     if isinstance(cmd, (Req_Write, Req_Delete, Req_Move)):
         _target = getattr(cmd, "path", None) or getattr(cmd, "to_name", "")
@@ -737,11 +671,7 @@ def dispatch(vm: PcmRuntimeClientSync, cmd: BaseModel,  # FIX-163: coder sub-age
         )
 
     if isinstance(cmd, Req_CodeEval):
-        # FIX-163: delegate code generation to MODEL_CODER; only task+vars passed (no loop history)
-        # FIX-166: auto-read vault paths via vm.read(); inject content as context_vars so coder
-        # model never needs to embed file contents in context — paths keep context_vars compact.
         # FIX-177 guard: check model-provided context_vars BEFORE path injection.
-        # Path-injected content is legitimate and may be large; model-embedded content is not.
         _direct_total = sum(len(str(v)) for v in cmd.context_vars.values())
         if _direct_total > 2000:
             return f"[code_eval rejected] context_vars too large ({_direct_total} chars). Use 'paths' field for vault files instead of embedding content in context_vars."
@@ -753,7 +683,7 @@ def dispatch(vm: PcmRuntimeClientSync, cmd: BaseModel,  # FIX-163: coder sub-age
                 ctx[_key] = MessageToDict(_raw).get("content", "")
             except Exception as _e:
                 ctx[_key] = f"[read error: {_e}]"
-        code = _call_coder_model(cmd.task, ctx, coder_model or "", coder_cfg or {})
-        return _execute_code_safe(code, ctx)
+        code = _extract_code_block(cmd.task)
+        return execute_code_safe(code, ctx)
 
     raise ValueError(f"Unknown command: {cmd}")

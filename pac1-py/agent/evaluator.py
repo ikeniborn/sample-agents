@@ -20,6 +20,7 @@ from .dispatch import CLI_CLR, CLI_YELLOW
 from .dspy_lm import DispatchLM
 
 _EVAL_PROGRAM_PATH = Path(__file__).parent.parent / "data" / "evaluator_program.json"
+_CODE_EVAL_PROGRAM_PATH = Path(__file__).parent.parent / "data" / "code_evaluator_program.json"
 
 
 class EvalVerdict(BaseModel):
@@ -127,6 +128,107 @@ class EvaluateCompletion(dspy.Signature):
     )
     correction_hint: str = dspy.OutputField(
         desc="OUTCOME_CODE correction suggestion if not approved, empty string if approved"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Code review signature (pre-execution check)
+# ---------------------------------------------------------------------------
+
+class EvaluateCode(dspy.Signature):
+    """You are a code reviewer for a sandbox executor.
+    Check whether the Python code correctly addresses the task and is safe to run.
+
+    Sandbox rules: no os/sys/subprocess/open/eval/exec. Modules datetime/json/re/math/time are pre-loaded.
+    Code must end with print(). Code must print JSON: {"outcome":"OUTCOME_OK","message":"...","writes":[...],"grounding_refs":[]}.
+
+    APPROVE if: code logically addresses the task, uses available vars, will produce valid output.
+    REJECT if: code references undefined variables, has logic errors, or cannot produce the expected JSON.
+
+    Fail-open: when in doubt, approve.
+    """
+    code: str = dspy.InputField(desc="Python code to review")
+    task_text: str = dspy.InputField()
+    task_type: str = dspy.InputField()
+    available_vars: str = dspy.InputField(desc="comma-separated variable names available in sandbox")
+    skepticism_level: str = dspy.InputField(desc="low | mid | high")
+
+    approved_str: str = dspy.OutputField(desc="'yes' or 'no'")
+    issues_str: str = dspy.OutputField(desc="comma-separated list of issues, empty string if approved")
+
+
+def evaluate_code(
+    code: str,
+    task_text: str,
+    task_type: str,
+    context_keys: list[str],
+    model: str,
+    cfg: dict,
+    skepticism: str = "low",
+) -> EvalVerdict:
+    """Pre-execution code review via DSPy. Fail-open: approves on any error."""
+    from .dspy_lm import DispatchLM
+    max_tok = _EFFICIENCY_MAX_TOKENS.get("low", 256)
+    available_vars = ", ".join(context_keys) if context_keys else "(none)"
+
+    predictor = dspy.ChainOfThought(EvaluateCode)
+    if _CODE_EVAL_PROGRAM_PATH.exists():
+        try:
+            predictor.load(str(_CODE_EVAL_PROGRAM_PATH))
+        except Exception as exc:
+            print(f"{CLI_YELLOW}[evaluate_code] failed to load program ({exc}), using defaults{CLI_CLR}")
+
+    lm = DispatchLM(model, cfg, max_tokens=max_tok)
+    try:
+        with dspy.context(lm=lm, adapter=dspy.JSONAdapter()):
+            result = predictor(
+                code=code,
+                task_text=task_text,
+                task_type=task_type,
+                available_vars=available_vars,
+                skepticism_level=skepticism,
+            )
+        approved_str_clean = (result.approved_str or "").strip().lower()
+        if approved_str_clean in ("yes", "true", "1"):
+            return EvalVerdict(approved=True)
+        elif approved_str_clean in ("no", "false", "0"):
+            raw_issues = (result.issues_str or "").strip()
+            issues = [s.strip() for s in raw_issues.split(",") if s.strip()] if raw_issues else ["code review failed"]
+            return EvalVerdict(approved=False, issues=issues)
+        print(f"{CLI_YELLOW}[evaluate_code] Unrecognisable approved_str={approved_str_clean!r} — auto-approve{CLI_CLR}")
+        return EvalVerdict(approved=True)
+    except Exception as e:
+        print(f"{CLI_YELLOW}[evaluate_code] Error ({e}) — auto-approve{CLI_CLR}")
+        return EvalVerdict(approved=True)
+
+
+def evaluate_result(
+    output: str,
+    task_text: str,
+    task_type: str,
+    model: str,
+    cfg: dict,
+    skepticism: str = "mid",
+    efficiency: str = "mid",
+) -> EvalVerdict:
+    """Post-execution result check — reuses EvaluateCompletion with code_eval context."""
+
+    class _FakeReport:
+        outcome = "OUTCOME_OK"
+        message = output
+        done_operations: list = []
+        completed_steps_laconic = [f"code_eval → {output[:120]}"]
+
+    return evaluate_completion(
+        task_text=task_text,
+        task_type=task_type,
+        report=_FakeReport(),
+        done_ops=["(code_eval)"],
+        digest_str="",
+        model=model,
+        cfg=cfg,
+        skepticism=skepticism,
+        efficiency=efficiency,
     )
 
 
@@ -273,7 +375,7 @@ def evaluate_completion(
 
     lm = DispatchLM(model, cfg, max_tokens=max_tok)
     try:
-        with dspy.context(lm=lm):
+        with dspy.context(lm=lm, adapter=dspy.JSONAdapter()):
             result = predictor(
                 task_text=task_text,
                 task_type=task_type,

@@ -8,6 +8,9 @@ Saves compiled programs to:
   data/prompt_builder_program.json  — loaded by agent/prompt_builder.py at startup
   data/evaluator_program.json       — loaded by agent/evaluator.py at startup
 
+Optimization run logs are appended to:
+  data/optimize_runs.jsonl          — one JSON event per line (run_start, lm_call, metric_eval, run_end)
+
 Usage:
     uv run python optimize_prompts.py --target builder
     uv run python optimize_prompts.py --target evaluator
@@ -20,8 +23,12 @@ Environment requirements (same as main.py — loaded from .env / .secrets):
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
+import threading
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -50,11 +57,19 @@ from dspy.teleprompt import COPRO
 
 from agent.dspy_lm import DispatchLM
 from agent.dspy_examples import get_trainset, get_eval_trainset
+from agent.dispatch import anthropic_client as _ant_client, openrouter_client as _or_client
 from agent.prompt_builder import PromptAddendum
 from agent.evaluator import EvaluateCompletion
 
 _BUILDER_PROGRAM_PATH = _BASE / "data" / "prompt_builder_program.json"
 _EVAL_PROGRAM_PATH = _BASE / "data" / "evaluator_program.json"
+_OPTIMIZE_LOG_PATH = _BASE / "data" / "optimize_runs.jsonl"
+
+
+def _type_program_path(task_type: str) -> Path:
+    """Return path for a per-task_type builder program file."""
+    return _BASE / "data" / f"prompt_builder_{task_type}_program.json"
+
 
 # ---------------------------------------------------------------------------
 # COPRO hyper-parameters — overridable via env
@@ -76,6 +91,106 @@ _COPRO_BREADTH     = _int_env("COPRO_BREADTH", 4)
 _COPRO_DEPTH       = _int_env("COPRO_DEPTH", 2)
 _COPRO_TEMPERATURE = _float_env("COPRO_TEMPERATURE", 0.9)
 _COPRO_THREADS     = _int_env("COPRO_THREADS", 1)
+_COPRO_MIN_PER_TYPE = _int_env("COPRO_MIN_PER_TYPE", 3)
+
+
+# ---------------------------------------------------------------------------
+# Optimization run logger
+# ---------------------------------------------------------------------------
+
+class OptimizeLogger:
+    """Append-only JSONL logger for optimization runs. Fail-open."""
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self._fh = path.open("a", encoding="utf-8", buffering=1)
+        except OSError:
+            self._fh = None
+
+    def emit(self, event: str, data: dict) -> None:
+        if self._fh is None:
+            return
+        record = {
+            "event": event,
+            "timestamp": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            **data,
+        }
+        line = json.dumps(record, ensure_ascii=False) + "\n"
+        try:
+            with self._lock:
+                self._fh.write(line)
+        except Exception:
+            pass
+
+    def close(self) -> None:
+        try:
+            if self._fh:
+                self._fh.close()
+        except Exception:
+            pass
+
+
+# Module-level logger instance, initialised in main()
+_logger: OptimizeLogger | None = None
+
+
+def _emit(event: str, data: dict) -> None:
+    if _logger is not None:
+        _logger.emit(event, data)
+
+
+# ---------------------------------------------------------------------------
+# Logging LM wrapper
+# ---------------------------------------------------------------------------
+
+class _LoggingDispatchLM(DispatchLM):
+    """DispatchLM subclass that logs every forward() call to OptimizeLogger."""
+
+    def __init__(self, model: str, cfg: dict, max_tokens: int, target: str, json_mode: bool = True) -> None:
+        super().__init__(model, cfg, max_tokens, json_mode=json_mode)
+        self._target = target
+        self._call_num = 0
+        self._call_num_lock = threading.Lock()
+
+    def forward(self, prompt=None, messages=None, **kwargs):
+        with self._call_num_lock:
+            self._call_num += 1
+            call_num = self._call_num
+
+        # Reconstruct user message preview for logging (same logic as parent)
+        user_parts: list[str] = []
+        system = ""
+        for m in messages or []:
+            role = m.get("role", "")
+            content = m.get("content", "") or ""
+            if role == "system":
+                system = content
+            elif role in ("user", "human"):
+                user_parts.append(content)
+        user_msg = prompt or "\n\n".join(user_parts)
+
+        t0 = time.monotonic()
+        response = super().forward(prompt=prompt, messages=messages, **kwargs)
+        elapsed = round(time.monotonic() - t0, 3)
+
+        tok = self._last_tokens
+        resp_text = response.choices[0].message.content if response.choices else ""
+
+        _emit("lm_call", {
+            "target": self._target,
+            "call_num": call_num,
+            "elapsed_s": elapsed,
+            "input_tokens": tok.get("input", 0),
+            "output_tokens": tok.get("output", 0),
+            "system_len": len(system),
+            "user_len": len(user_msg),
+            "response_len": len(resp_text),
+            "response_preview": resp_text[:300],
+        })
+        return response
 
 
 # ---------------------------------------------------------------------------
@@ -88,8 +203,6 @@ def _get_optimizer_model() -> tuple[str, dict]:
     Prefers MODEL_CLASSIFIER (fast, low-temperature) → MODEL_DEFAULT fallback.
     Loads full config from models.json.
     """
-    import json
-
     models_path = _BASE / "models.json"
     with models_path.open() as fh:
         models_raw: dict = json.load(fh)
@@ -120,7 +233,7 @@ def _get_optimizer_model() -> tuple[str, dict]:
 
 
 # ---------------------------------------------------------------------------
-# Metrics
+# Metrics (with logging wrappers)
 # ---------------------------------------------------------------------------
 
 def _builder_metric(example: dspy.Example, prediction, _trace=None) -> float:
@@ -131,40 +244,60 @@ def _builder_metric(example: dspy.Example, prediction, _trace=None) -> float:
     """
     source_score: float = getattr(example, "score", 1.0)
     if source_score < 0.8:
-        return 0.0
-    # Penalise empty or very short addendum (< 3 bullet points)
-    addendum: str = getattr(prediction, "addendum", "") or ""
-    bullet_count = sum(1 for line in addendum.splitlines() if line.strip().startswith("-"))
-    if bullet_count < 2:
-        return 0.5
-    return 1.0
+        result = 0.0
+    else:
+        addendum: str = getattr(prediction, "addendum", "") or ""
+        bullet_count = sum(1 for line in addendum.splitlines() if line.strip().startswith("-"))
+        result = 0.5 if bullet_count < 2 else 1.0
+
+    _emit("metric_eval", {
+        "target": "builder",
+        "task_type": getattr(example, "task_type", ""),
+        "source_score": source_score,
+        "metric_result": result,
+    })
+    return result
 
 
 def _evaluator_metric(example: dspy.Example, prediction, _trace=None) -> float:
     """Score evaluator prediction against expected approved_str label."""
     expected: str = getattr(example, "approved_str", "yes")
     predicted: str = (getattr(prediction, "approved_str", "") or "").strip().lower()
-    return 1.0 if predicted == expected.lower() else 0.0
+    result = 1.0 if predicted == expected.lower() else 0.0
+
+    _emit("metric_eval", {
+        "target": "evaluator",
+        "task_type": getattr(example, "task_type", ""),
+        "expected": expected,
+        "predicted": predicted,
+        "metric_result": result,
+    })
+    return result
 
 
 # ---------------------------------------------------------------------------
 # Training set builders
 # ---------------------------------------------------------------------------
 
-def _builder_trainset(min_score: float = 0.7) -> list[dspy.Example]:
+def _builder_trainset(
+    min_score: float = 0.7,
+    task_type: str | None = None,
+) -> list[dspy.Example]:
     """Build DSPy Examples for prompt_builder optimisation.
 
-    vault_tree and agents_md are read from collected examples when present.
-    Examples collected after the vault_tree/agents_md fix include them;
-    older examples fall back to empty strings (COPRO still works, just without
-    vault-specific context).
+    Args:
+        min_score: Minimum task score to include.
+        task_type: If given, return only examples for that task type.
     """
     raw = get_trainset(min_score=min_score)
     examples = []
     for ex in raw:
+        tt = ex.get("task_type", "default")
+        if task_type is not None and tt != task_type:
+            continue
         examples.append(
             dspy.Example(
-                task_type=ex.get("task_type", "default"),
+                task_type=tt,
                 task_text=ex.get("task_text", ""),
                 vault_tree=ex.get("vault_tree", ""),
                 agents_md=ex.get("agents_md", ""),
@@ -173,6 +306,16 @@ def _builder_trainset(min_score: float = 0.7) -> list[dspy.Example]:
             ).with_inputs("task_type", "task_text", "vault_tree", "agents_md")
         )
     return examples
+
+
+def _builder_task_types(min_score: float = 0.7) -> dict[str, int]:
+    """Return {task_type: count} for all types present in the trainset."""
+    raw = get_trainset(min_score=min_score)
+    counts: dict[str, int] = {}
+    for ex in raw:
+        tt = ex.get("task_type", "default")
+        counts[tt] = counts.get(tt, 0) + 1
+    return counts
 
 
 def _evaluator_trainset() -> list[dspy.Example]:
@@ -235,7 +378,7 @@ def _evaluator_trainset() -> list[dspy.Example]:
                       "done_ops", "completed_steps", "skepticism_level"),
         dspy.Example(
             task_text="Delete all processed items from the archive folder",
-            task_type="longContext",
+            task_type="default",
             proposed_outcome="OUTCOME_OK",
             agent_message="Done",
             done_ops="(none)",
@@ -266,18 +409,30 @@ def _evaluator_trainset() -> list[dspy.Example]:
 # Optimisation runners
 # ---------------------------------------------------------------------------
 
-def optimize_builder(model: str, cfg: dict, min_score: float = 0.8) -> None:
-    """Run COPRO on the PromptAddendum Signature and save compiled program."""
-    trainset = _builder_trainset(min_score=min_score)
-    if not trainset:
-        print("[optimize] No training examples found. Run main.py first to collect examples.")
-        sys.exit(1)
+def _run_copro_builder(
+    model: str,
+    cfg: dict,
+    trainset: list,
+    save_path: Path,
+    log_label: str,
+) -> None:
+    """Run one COPRO pass on trainset and save to save_path."""
+    _emit("run_start", {
+        "target": log_label,
+        "model": model,
+        "trainset_size": len(trainset),
+        "copro": {
+            "breadth": _COPRO_BREADTH,
+            "depth": _COPRO_DEPTH,
+            "temperature": _COPRO_TEMPERATURE,
+            "threads": _COPRO_THREADS,
+        },
+    })
 
-    print(f"[optimize] Builder trainset: {len(trainset)} examples")
-    print(f"[optimize] Model: {model}")
-
-    lm = DispatchLM(model, cfg, max_tokens=400)
-    dspy.configure(lm=lm)
+    _ollama_only = _ant_client is None and _or_client is None
+    _adapter = dspy.ChatAdapter() if _ollama_only else dspy.JSONAdapter()
+    lm = _LoggingDispatchLM(model, cfg, max_tokens=400, target=log_label, json_mode=not _ollama_only)
+    dspy.configure(lm=lm, adapter=_adapter)
 
     program = dspy.Predict(PromptAddendum)
     teleprompter = COPRO(
@@ -287,15 +442,63 @@ def optimize_builder(model: str, cfg: dict, min_score: float = 0.8) -> None:
         init_temperature=_COPRO_TEMPERATURE,
     )
 
-    compiled = teleprompter.compile(
-        program,
-        trainset=trainset,
-        eval_kwargs={"num_threads": _COPRO_THREADS, "display_progress": True, "display_table": 0},
-    )
+    t0 = time.monotonic()
+    status = "ok"
+    try:
+        compiled = teleprompter.compile(
+            program,
+            trainset=trainset,
+            eval_kwargs={"num_threads": _COPRO_THREADS, "display_progress": True, "display_table": 0},
+        )
+    except KeyboardInterrupt:
+        status = "interrupted"
+        raise
+    except Exception as exc:
+        status = f"error: {exc}"
+        raise
+    finally:
+        _emit("run_end", {
+            "target": log_label,
+            "duration_s": round(time.monotonic() - t0, 2),
+            "total_lm_calls": lm._call_num,
+            "status": status,
+        })
 
-    _BUILDER_PROGRAM_PATH.parent.mkdir(exist_ok=True)
-    compiled.save(str(_BUILDER_PROGRAM_PATH))
-    print(f"[optimize] Builder program saved → {_BUILDER_PROGRAM_PATH}")
+    save_path.parent.mkdir(exist_ok=True)
+    compiled.save(str(save_path))
+    print(f"[optimize] Builder program saved → {save_path}")
+
+
+def optimize_builder(model: str, cfg: dict, min_score: float = 0.8) -> None:
+    """Run COPRO on PromptAddendum: global pass + per-task_type passes.
+
+    Global pass uses all examples and saves to prompt_builder_program.json.
+    Per-type passes save to prompt_builder_{task_type}_program.json for each
+    task type with at least COPRO_MIN_PER_TYPE examples.
+    """
+    all_trainset = _builder_trainset(min_score=min_score)
+    if not all_trainset:
+        print("[optimize] No training examples found. Run main.py first to collect examples.")
+        sys.exit(1)
+
+    print(f"[optimize] Builder trainset: {len(all_trainset)} examples total, model: {model}")
+
+    # Global pass — fallback for task types without enough data
+    _run_copro_builder(model, cfg, all_trainset, _BUILDER_PROGRAM_PATH, "builder/global")
+
+    # Per-type passes
+    type_counts = _builder_task_types(min_score=min_score)
+    eligible = {tt: n for tt, n in type_counts.items() if n >= _COPRO_MIN_PER_TYPE}
+    skipped = {tt: n for tt, n in type_counts.items() if n < _COPRO_MIN_PER_TYPE}
+
+    if skipped:
+        print(f"[optimize] Per-type skipped (< {_COPRO_MIN_PER_TYPE} examples): "
+              + ", ".join(f"{tt}({n})" for tt, n in skipped.items()))
+
+    for tt, n in sorted(eligible.items()):
+        print(f"[optimize] Per-type: {tt!r} — {n} examples")
+        type_trainset = _builder_trainset(min_score=min_score, task_type=tt)
+        _run_copro_builder(model, cfg, type_trainset, _type_program_path(tt), f"builder/{tt}")
 
 
 def optimize_evaluator(model: str, cfg: dict) -> None:
@@ -304,8 +507,22 @@ def optimize_evaluator(model: str, cfg: dict) -> None:
     print(f"[optimize] Evaluator trainset: {len(trainset)} examples")
     print(f"[optimize] Model: {model}")
 
-    lm = DispatchLM(model, cfg, max_tokens=600)
-    dspy.configure(lm=lm)
+    _emit("run_start", {
+        "target": "evaluator",
+        "model": model,
+        "trainset_size": len(trainset),
+        "copro": {
+            "breadth": _COPRO_BREADTH,
+            "depth": _COPRO_DEPTH,
+            "temperature": _COPRO_TEMPERATURE,
+            "threads": _COPRO_THREADS,
+        },
+    })
+
+    _ollama_only = _ant_client is None and _or_client is None
+    _adapter = dspy.ChatAdapter() if _ollama_only else dspy.JSONAdapter()
+    lm = _LoggingDispatchLM(model, cfg, max_tokens=600, target="evaluator", json_mode=not _ollama_only)
+    dspy.configure(lm=lm, adapter=_adapter)
 
     program = dspy.ChainOfThought(EvaluateCompletion)
     teleprompter = COPRO(
@@ -315,11 +532,27 @@ def optimize_evaluator(model: str, cfg: dict) -> None:
         init_temperature=_COPRO_TEMPERATURE,
     )
 
-    compiled = teleprompter.compile(
-        program,
-        trainset=trainset,
-        eval_kwargs={"num_threads": _COPRO_THREADS, "display_progress": True, "display_table": 0},
-    )
+    t0 = time.monotonic()
+    status = "ok"
+    try:
+        compiled = teleprompter.compile(
+            program,
+            trainset=trainset,
+            eval_kwargs={"num_threads": _COPRO_THREADS, "display_progress": True, "display_table": 0},
+        )
+    except KeyboardInterrupt:
+        status = "interrupted"
+        raise
+    except Exception as exc:
+        status = f"error: {exc}"
+        raise
+    finally:
+        _emit("run_end", {
+            "target": "evaluator",
+            "duration_s": round(time.monotonic() - t0, 2),
+            "total_lm_calls": lm._call_num,
+            "status": status,
+        })
 
     _EVAL_PROGRAM_PATH.parent.mkdir(exist_ok=True)
     compiled.save(str(_EVAL_PROGRAM_PATH))
@@ -331,6 +564,8 @@ def optimize_evaluator(model: str, cfg: dict) -> None:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
+    global _logger
+
     parser = argparse.ArgumentParser(
         description="DSPy COPRO optimizer for pac1-py prompt_builder and evaluator."
     )
@@ -348,15 +583,24 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    model, cfg = _get_optimizer_model()
+    _logger = OptimizeLogger(_OPTIMIZE_LOG_PATH)
+    print(f"[optimize] Logging to {_OPTIMIZE_LOG_PATH}")
 
-    if args.target in ("builder", "all"):
-        optimize_builder(model, cfg, min_score=args.min_score)
+    try:
+        model, cfg = _get_optimizer_model()
 
-    if args.target in ("evaluator", "all"):
-        optimize_evaluator(model, cfg)
+        if args.target in ("builder", "all"):
+            optimize_builder(model, cfg, min_score=args.min_score)
 
-    print("[optimize] Done.")
+        if args.target in ("evaluator", "all"):
+            optimize_evaluator(model, cfg)
+
+        print("[optimize] Done.")
+    except KeyboardInterrupt:
+        print("\n[optimize] Interrupted by user.")
+        sys.exit(130)
+    finally:
+        _logger.close()
 
 
 if __name__ == "__main__":

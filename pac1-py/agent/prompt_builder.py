@@ -21,14 +21,22 @@ import dspy
 
 from .dspy_lm import DispatchLM
 
-# All task types benefit from vault-specific guidance.
+# preject skipped — single-step immediate rejection, no vault guidance needed.
 _NEEDS_BUILDER: frozenset[str] = frozenset({
-    "default", "think", "longContext", "lookup", "email", "inbox", "distill", "coder",
+    "default", "queue", "capture", "crm", "temporal",
+    "lookup", "email", "inbox", "distill",
 })
 
 _LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
-_PROGRAM_PATH = Path(__file__).parent.parent / "data" / "prompt_builder_program.json"
+_DATA = Path(__file__).parent.parent / "data"
+_PROGRAM_PATH = _DATA / "prompt_builder_program.json"
+
+
+def _get_program_path(task_type: str) -> Path:
+    """Return per-type program path if it exists, else global fallback."""
+    per_type = _DATA / f"prompt_builder_{task_type}_program.json"
+    return per_type if per_type.exists() else _PROGRAM_PATH
 
 
 # ---------------------------------------------------------------------------
@@ -40,8 +48,7 @@ class PromptAddendum(dspy.Signature):
     Given the task and vault context, generate 3–6 bullet points of ADDITIONAL instructions
     specific to THIS task. Bullet 1: which folder to open first. Bullet 2: key risk.
     Bullet 3+: required output format or field names if the task specifies them.
-    Output plain text ONLY — JSON breaks the downstream parser. No preamble — token budget
-    is 300, preamble wastes it. Each line starts with a dash (-).
+    No preamble — token budget is 300, preamble wastes it. Each bullet starts with a dash (-).
 
     ## Rejection Rules
     Evaluate BEFORE generating any guidance. If the task involves ANY of the following,
@@ -88,6 +95,18 @@ class PromptAddendum(dspy.Signature):
     For tasks with 'exactly N days' or specific date lookups:
     - If no file matches the exact target date → `OUTCOME_NONE_CLARIFICATION`
     - Do NOT report `OUTCOME_OK` with 'nearest matches' or 'no exact match found'
+
+    ## Email Outbox Timestamp
+    For inbox tasks writing an outbound email to `60_outbox/outbox/`:
+    - The outbox filename timestamp MUST be the current UTC time via
+      `code_eval(datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%SZ'))` — NOT `received_at`
+      or `created_at` from the source inbox message.
+    - Wrong: `eml_2026-03-23T12-00-00Z.md` (copied from source received_at)
+    - Correct: `eml_2026-04-17T14-35-00Z.md` (current runtime UTC)
+    - First bullet MUST remind agent: "Use code_eval(datetime.utcnow()) for outbox filename, not received_at"
+    For batch/migration tasks (NORA queue, bulk processing frontmatter):
+    - `queue_batch_timestamp` = the inbox task's own `received_at` timestamp (NOT current time)
+    - This preserves the original task submission time for idempotent batch processing.
 
     ## Relationship Queries
     For 'who manages X', 'contacts of X', 'accounts by manager':
@@ -145,17 +164,18 @@ def build_dynamic_addendum(
         print(f"[prompt_builder] calling DSPy for type={task_type!r}, task={task_text[:60]!r}")
 
     predictor = dspy.Predict(PromptAddendum)
-    if _PROGRAM_PATH.exists():
+    program_path = _get_program_path(task_type)
+    if program_path.exists():
         try:
-            predictor.load(str(_PROGRAM_PATH))
+            predictor.load(str(program_path))
             if _LOG_LEVEL == "DEBUG":
-                print(f"[prompt_builder] loaded compiled program from {_PROGRAM_PATH}")
+                print(f"[prompt_builder] loaded compiled program from {program_path}")
         except Exception as exc:
             print(f"[prompt_builder] failed to load program ({exc}), using defaults")
 
     lm = DispatchLM(model, cfg, max_tokens=max_tokens)
     try:
-        with dspy.context(lm=lm):
+        with dspy.context(lm=lm, adapter=dspy.JSONAdapter()):
             result = predictor(
                 task_type=task_type,
                 task_text=task_text,

@@ -1,0 +1,38 @@
+{
+  "traces": [],
+  "train": [],
+  "demos": [],
+  "signature": {
+    "instructions": "Generate 3–6 tactical bullets for the specific vault task.\n\n**STEP 1 — MANDATORY REJECTION SCREEN** (Evaluate before any other logic):\nIf the task involves calendar/scheduling, external APIs/URLs/CRMs, or is ambiguous/garbled → output EXACTLY one bullet:\n`- [SKIP] Task triggers immediate rejection. No vault exploration needed.`\nThen STOP. Do not suggest vault paths or exploration for rejected tasks.\n\n**STEP 2 — PATTERN-BASED STRATEGY** (Only if passed Step 1):\n- **BULK/Aggregate** (count, filter, \"how many\", \"find all\", \"sum\"): MUST use `code_eval` scanning ALL files returned by `list()`. NEVER suggest sequential one-by-one reads. NEVER hardcode numeric ranges (e.g., `acct_001..010` risks missing `acct_011+`). Channel data (Telegram/Discord) lives in `docs/channels/` — always use `code_eval` there.\n- **PERSON NAME** (not email/company): MUST search `contacts/` FIRST to resolve name→contact ID. Only then access related accounts/reminders. Managers (e.g., \"Müller Sophie\", \"Voigt Carsten\") stored as `mgr_XXX.json` in contacts/.\n- **RELATIVE DATE** (\"X days ago\", \"in X days\"): Use `code_eval` with `datetime.date.today() + datetime.timedelta(days=N)`.\n- **EXACT DATE match required**: If no file matches target date exactly → `OUTCOME_NONE_CLARIFICATION`. Do NOT return nearest matches.\n- **INBOX EMAIL** (writing to `60_outbox/`): (a) Verify entity matches sender BEFORE mutations (mismatch → `OUTCOME_DENIED_SECURITY`). (b) Outbox filename MUST use current UTC via `code_eval(datetime.utcnow().strftime('%Y-%m-%dT%H-%M-%SZ'))`, NOT `received_at` from source. (c) Batch/migration tasks: use the inbox task's own `received_at` as `queue_batch_timestamp`.\n- **FINANCE** (\"total\", \"overdue\", \"revenue\"): Aggregate via `code_eval` over complete file list, filtering inside the code block.\n\n**BULLET STRUCTURE**:\n- Bullet 1: Entry point (specific folder or `code_eval` with file list from `list()`).\n- Bullet 2: Critical risk or constraint (security verification, exact match rule, timestamp requirement).\n- Bullets 3+: Output format/field names, traversal chains (contact→account→manager), or filtering logic (use case-insensitive matching for manager names; check both name orders).\n\nConstraints: No preamble. Max 6 bullets. Each starts with `- `.",
+    "fields": [
+      {
+        "prefix": "Task Type:",
+        "description": "classified task type"
+      },
+      {
+        "prefix": "Task Text:",
+        "description": "task description"
+      },
+      {
+        "prefix": "Vault Tree:",
+        "description": "vault directory tree"
+      },
+      {
+        "prefix": "Agents Md:",
+        "description": "AGENTS.MD content defining folder roles"
+      },
+      {
+        "prefix": "-",
+        "description": "3–6 bullet points starting with '-', plain text, no JSON, no preamble"
+      }
+    ]
+  },
+  "lm": null,
+  "metadata": {
+    "dependency_versions": {
+      "python": "3.12",
+      "dspy": "3.1.3",
+      "cloudpickle": "3.1"
+    }
+  }
+}

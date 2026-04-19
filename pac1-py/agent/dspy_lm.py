@@ -3,9 +3,9 @@
 DispatchLM subclasses dspy.BaseLM (required by DSPy 3.x) and delegates all
 LLM calls to the existing 3-tier routing infrastructure (Anthropic → OpenRouter → Ollama).
 
-DSPy 3.x uses JSON adapters: it formats prompts with [[ ## field ## ]] markers and
-expects the LM to respond with a JSON object containing the output fields. The prompt
-instructions already guide the model — no response_format override needed.
+DSPy 3.x uses JSONAdapter: it formats prompts asking the model to respond with a JSON
+object containing the output fields. For Ollama backends, response_format=json_object
+is enabled to enforce valid JSON output.
 
 Usage:
     from agent.dspy_lm import DispatchLM
@@ -17,9 +17,33 @@ Usage:
 """
 from __future__ import annotations
 
+import json as _json
+import re as _re
+
 import dspy
 
 from .dispatch import call_llm_raw
+
+# JSONAdapter single-field trailer: "Respond with a JSON object in the following order of fields: `fieldname`."
+_JSONADAPTER_SINGLE_RE = _re.compile(
+    r'Respond with a JSON object in the following order of fields: `(\w+)`\.\s*$',
+    _re.MULTILINE,
+)
+
+
+def _coerce_to_json(raw: str, user_msg: str) -> str:
+    """Wrap plain-text response as JSON when JSONAdapter expects a single output field.
+
+    kimi-k2.5:cloud ignores response_format=json_object and returns plain text.
+    For single-field signatures (e.g. PromptAddendum → addendum), wrap the content
+    so DSPy JSONAdapter can parse it. Multi-field signatures are left unchanged.
+    """
+    if not raw or raw.strip().startswith("{"):
+        return raw
+    m = _JSONADAPTER_SINGLE_RE.search(user_msg)
+    if m:
+        return _json.dumps({m.group(1): raw})
+    return raw
 
 
 # ---------------------------------------------------------------------------
@@ -73,7 +97,7 @@ class DispatchLM(dspy.BaseLM):
     each forward call for the caller to retrieve.
     """
 
-    def __init__(self, model: str, cfg: dict, max_tokens: int = 512) -> None:
+    def __init__(self, model: str, cfg: dict, max_tokens: int = 512, json_mode: bool = True) -> None:
         super().__init__(
             model=model,
             cache=False,        # disable DSPy cache — agent handles retries itself
@@ -81,6 +105,7 @@ class DispatchLM(dspy.BaseLM):
         )
         self._dispatch_cfg = cfg
         self._last_tokens: dict = {"input": 0, "output": 0}
+        self._json_mode = json_mode
 
     def forward(
         self,
@@ -117,9 +142,10 @@ class DispatchLM(dspy.BaseLM):
             cfg=self._dispatch_cfg,
             max_tokens=self.kwargs.get("max_tokens", 512),
             think=False,
-            plain_text=True,
             token_out=tok,
+            plain_text=not self._json_mode,
         )
+        raw = _coerce_to_json(raw or "", user_msg)
         self._last_tokens = tok
         return _Response(
             content=raw or "",
